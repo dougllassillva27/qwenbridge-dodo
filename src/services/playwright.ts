@@ -218,13 +218,32 @@ export async function initPlaywrightForAccount(
       headless,
       channel,
       userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       ignoreDefaultArgs: ["--enable-automation"],
       args: [
         "--disable-blink-features=AutomationControlled",
         "--disable-features=IsolateOrigins,site-per-process",
         "--no-sandbox",
+        "--disable-extensions",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--mute-audio",
+        "--no-default-browser-check",
+        "--no-first-run",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-dev-shm-usage",
+        "--js-flags=--max-old-space-size=256"
       ],
+    });
+
+    // Bloqueia recursos pesados/não essenciais para economizar RAM e banda em background
+    await acctContext.route("**/*.{png,jpg,jpeg,gif,webp,svg,mp4,webm,ogg,mp3,woff,woff2,ttf,otf,css}", route => {
+      route.abort();
     });
 
     // Additional stealth scripts
