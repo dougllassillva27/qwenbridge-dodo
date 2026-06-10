@@ -681,27 +681,44 @@ async function tryCreateStreamWithRetry(
       return { success: false, error: err };
     }
 
-    // Anti-bot error: refresh Playwright headers if available
+    // Anti-bot error: refresh Playwright headers if available.
+    // Se já fizemos refresh e ainda deu anti-bot, rotacionar para outra conta
+    // colocando esta em cooldown temporário (30s) em vez de ficar em loop.
     const isAntiBot =
       err.message?.includes("anti-bot") ||
       err.message?.includes("FAIL_SYS_USER_VALIDATE") ||
       err.message?.includes("RGV587_ERROR");
 
-    if (isAntiBot && config.playwright.enabled) {
-      try {
-        const { refreshHeaders, isPlaywrightInitialized } =
-          await import("../../services/playwright.ts");
-        if (isPlaywrightInitialized(accountId)) {
-          console.log(
-            `[Playwright] Refreshing headers for ${accountEmail} due to anti-bot...`,
+    if (isAntiBot) {
+      if (config.playwright.enabled) {
+        try {
+          const { refreshHeaders, isPlaywrightInitialized } =
+            await import("../../services/playwright.ts");
+          if (isPlaywrightInitialized(accountId)) {
+            console.log(
+              `[Playwright] Refreshing headers for ${accountEmail} due to anti-bot...`,
+            );
+            await refreshHeaders(accountId);
+            // Deu anti-bot mesmo com Playwright ativo — cooldown curto e rotaciona
+            console.warn(
+              `[Chat] Anti-bot persisted after header refresh for ${accountEmail}. ` +
+              `Applying 30s cooldown and rotating to next account.`,
+            );
+            markAccountRateLimited(accountId, 30_000, "AntiBotCooldown");
+            return { success: false, error: err };
+          }
+        } catch (refreshErr) {
+          console.warn(
+            `[Playwright] Header refresh failed: ${refreshErr instanceof Error ? refreshErr.message : refreshErr}`,
           );
-          await refreshHeaders(accountId);
         }
-      } catch (refreshErr) {
-        console.warn(
-          `[Playwright] Header refresh failed: ${refreshErr instanceof Error ? refreshErr.message : refreshErr}`,
-        );
       }
+      // Playwright desabilitado ou não inicializado: cooldown curto e rotaciona
+      console.warn(
+        `[Chat] Anti-bot for ${accountEmail} without Playwright. Applying 30s cooldown.`,
+      );
+      markAccountRateLimited(accountId, 30_000, "AntiBotCooldown");
+      return { success: false, error: err };
     }
 
     console.warn(
