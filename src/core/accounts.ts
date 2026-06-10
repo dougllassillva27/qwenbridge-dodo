@@ -72,14 +72,16 @@ let accountsCacheTime = 0
 const ACCOUNTS_CACHE_TTL = 5_000
 
 export function loadAccounts(): QwenAccount[] {
-  syncEnvAccounts()
-
+  // Fonte de verdade exclusiva: .env
+  // O banco SQLite é sincronizado via syncEnvAccounts() para manter compatibilidade
+  // com o painel de gestão de contas, mas nunca é consultado para inicialização.
   const now = Date.now()
   if (accountsCache && (now - accountsCacheTime < ACCOUNTS_CACHE_TTL)) return accountsCache
 
-  const db = getDatabase()
-  const rows = db.prepare('SELECT id, email, password FROM accounts ORDER BY created_at ASC').all()
-  accountsCache = rows as QwenAccount[]
+  const envAccounts = parseEnvAccounts()
+  syncEnvAccounts() // mantém o banco atualizado com as contas do .env
+
+  accountsCache = envAccounts
   accountsCacheTime = now
   return accountsCache
 }
