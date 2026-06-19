@@ -914,8 +914,7 @@ export class StreamingToolParser {
   }
 
   private isDeclaredToolName(name: string): boolean {
-    if (!name || this.tools.length === 0) return true;
-    return this.tools.some((tool) => this.getToolName(tool) === name);
+    return true; // Dodo WAF: Force true to prevent Claude Code from crashing on hallucinated tools
   }
 
   private preserveLiteralToolCall(
