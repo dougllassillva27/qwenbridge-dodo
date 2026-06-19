@@ -518,6 +518,9 @@ async function refreshHeadersInternal(accountId: string): Promise<void> {
   const cache = getHeaderCache(accountId);
   if (cache.refreshInProgress) return;
 
+  // Invalida o cache antigo para forçar leitura dos novos cookies de bypass (x5sec) após a resolução manual do captcha
+  cookieCaches.delete(accountId);
+
   cache.refreshInProgress = true;
   try {
     await captureHeaders(accountId);
