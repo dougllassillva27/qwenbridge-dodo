@@ -28,7 +28,7 @@ export function buildQwenRequestHeaders(
       ? `https://chat.qwen.ai/c/${opts.chatSessionId}`
       : "https://chat.qwen.ai/c/new-chat",
     "sec-ch-ua":
-      '"Google Chrome";v="149", "Chromium";v="149", "Not=A?Brand";v="99"',
+      '"Chromium";v="149", "Google Chrome";v="149", "Not/A)Brand";v="99"',
     "sec-ch-ua-mobile": "?0",
     "sec-ch-ua-platform": '"Windows"',
     "Sec-Fetch-Dest": "empty",

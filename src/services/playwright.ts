@@ -441,98 +441,88 @@ async function captureHeaders(accountId: string): Promise<void> {
   const cache = getHeaderCache(accountId);
 
   return new Promise<void>((resolve) => {
+    let captured = false;
+
     const timeout = setTimeout(() => {
       console.warn(`[Playwright] Header capture timeout for ${accountId}`);
+      page.removeListener("request", requestListener);
       resolve();
     }, 30000);
 
-    const routeHandler = async (route: any, request: any) => {
-      clearTimeout(timeout);
-
-      const reqHeaders = request.headers();
-      cache.headers = {
-        cookie: reqHeaders["cookie"] || "",
-        "bx-ua": reqHeaders["bx-ua"] || "",
-        "bx-umidtoken": reqHeaders["bx-umidtoken"] || "",
-        "bx-v": reqHeaders["bx-v"] || "2.5.36",
-        "user-agent": reqHeaders["user-agent"] || "",
-      };
-      cache.lastRefresh = Date.now();
-
-      console.log(`[Playwright] Headers captured for ${accountId}`);
-
-      await route.abort("aborted");
-      await page.unroute("**/api/v2/chat/completions*", routeHandler);
-      resolve();
-    };
-
-    page.route("**/api/v2/chat/completions*", routeHandler).then(async () => {
-      // Navigate to Qwen and trigger a request
-      await page.goto("https://chat.qwen.ai/", {
-        waitUntil: "domcontentloaded",
-      });
-      await sleep(2000);
-
-      const hasEarlyCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]').first().isVisible().catch(() => false);
-      if (hasEarlyCaptcha) {
-        console.log(`[Playwright] Captcha detected early for ${accountId}, attempting auto-solve...`);
-        const solved = await solveBaxiaCaptcha(page);
-        if (solved) {
-          console.log(`[Playwright] Captcha auto-solved natively for ${accountId}! Returning control...`);
-          resolve();
-          return;
+    const requestListener = (request: any) => {
+      if (request.url().includes("/api/v2/chat/completions")) {
+        const reqHeaders = request.headers();
+        if (reqHeaders["bx-ua"]) {
+          cache.headers = {
+            cookie: reqHeaders["cookie"] || "",
+            "bx-ua": reqHeaders["bx-ua"] || "",
+            "bx-umidtoken": reqHeaders["bx-umidtoken"] || "",
+            "bx-v": reqHeaders["bx-v"] || "2.5.36",
+            "user-agent": reqHeaders["user-agent"] || "",
+          };
+          cache.lastRefresh = Date.now();
+          captured = true;
+          console.log(`[Playwright] Latest headers captured for ${accountId}`);
         }
       }
+    };
 
-      // Type something and send to trigger header capture
-      const inputSelector =
-        'textarea:visible, [contenteditable="true"]:visible';
+    page.on("request", requestListener);
+
+    (async () => {
       try {
+        // Navigate to Qwen and trigger a request
+        await page.goto("https://chat.qwen.ai/", {
+          waitUntil: "domcontentloaded",
+        });
+        await sleep(2000);
+
+        const hasEarlyCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]').first().isVisible().catch(() => false);
+        if (hasEarlyCaptcha) {
+          console.log(`[Playwright] Captcha detected early for ${accountId}, attempting auto-solve...`);
+          await solveBaxiaCaptcha(page);
+          await sleep(2000);
+        }
+
+        // Type something and send to trigger header capture
+        const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
         await page.focus(inputSelector);
         await page.fill(inputSelector, "");
         await page.type(inputSelector, "a", { delay: 100 });
-        await sleep(1000);
-
-        // Try to click send button
-        const sendSelectors = [
-          ".message-input-right-button-send .send-button",
-          ".chat-prompt-send-button",
-          "button.send-button",
-        ];
-
-        for (const selector of sendSelectors) {
-          try {
-            const btn = await page.$(selector);
-            if (btn && (await btn.isVisible())) {
-              await btn.click({ force: true, delay: 50 });
-              break;
-            }
-          } catch {
-            // Try next selector
-          }
-        }
-
-        // Fallback to Enter key
+        await sleep(500);
         await page.keyboard.press("Enter");
+        
+        // Wait to see if a captcha appears after sending
         await sleep(2000);
-
+        
         const hasCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]').first().isVisible().catch(() => false);
         if (hasCaptcha) {
-          console.log(`[Playwright] Captcha detected for ${accountId}, attempting auto-solve...`);
+          console.log(`[Playwright] Captcha detected after Enter for ${accountId}, attempting auto-solve...`);
           const solved = await solveBaxiaCaptcha(page);
           if (solved) {
-            console.log(`[Playwright] Captcha auto-solved natively for ${accountId}! Returning control...`);
-            resolve();
-            return;
+            console.log(`[Playwright] Captcha auto-solved! Retrying request to capture fresh headers...`);
+            await sleep(2000);
+            await page.focus(inputSelector);
+            await page.fill(inputSelector, "");
+            await page.type(inputSelector, "b", { delay: 100 });
+            await page.keyboard.press("Enter");
+            await sleep(2000);
           } else {
             console.warn(`[Playwright] Auto-solve failed for ${accountId}, waiting remaining time for manual/microservice fallback...`);
           }
+        } else if (!captured) {
+           // If no captcha and not captured, just wait a bit more
+           await sleep(2000);
         }
+        
       } catch (err) {
-        console.warn(`[Playwright] Error triggering request: ${err}`);
+        console.warn(`[Playwright] Error in capture flow for ${accountId}: ${err}`);
+      } finally {
+        clearTimeout(timeout);
+        page.removeListener("request", requestListener);
         resolve();
       }
-    });
+    })();
   });
 }
 
