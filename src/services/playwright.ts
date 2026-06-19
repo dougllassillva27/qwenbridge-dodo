@@ -487,12 +487,7 @@ async function captureHeaders(accountId: string): Promise<void> {
         const hasEarlyIframe = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]').first().isVisible().catch(() => false);
         const hasEarlySlider = await page.locator('#nc_1_n1z, .btn_slide').first().isVisible().catch(() => false);
         if (hasEarlyIframe || hasEarlySlider) {
-          console.log(`[Playwright] Captcha detected early for ${accountId}, attempting auto-solve...`);
-          const solved = await solveBaxiaCaptcha(page);
-          if (solved) {
-            await page.waitForSelector('textarea:visible, [contenteditable="true"]:visible', { state: 'visible', timeout: 10000 }).catch(() => {});
-          }
-          await sleep(2000);
+          console.log(`[Playwright] Captcha detected early for ${accountId}. Waiting 30s for external captchaResolve microservice/manual intervention...`);
         }
 
         // Type something and send to trigger header capture
@@ -509,20 +504,7 @@ async function captureHeaders(accountId: string): Promise<void> {
         const hasIframeCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]').first().isVisible().catch(() => false);
         const hasSliderCaptcha = await page.locator('#nc_1_n1z, .btn_slide').first().isVisible().catch(() => false);
         if (hasIframeCaptcha || hasSliderCaptcha) {
-          console.log(`[Playwright] Captcha detected after Enter for ${accountId}, attempting auto-solve...`);
-          const solved = await solveBaxiaCaptcha(page);
-          if (solved) {
-            console.log(`[Playwright] Captcha auto-solved! Retrying request to capture fresh headers...`);
-            await page.waitForSelector(inputSelector, { state: 'visible', timeout: 10000 }).catch(() => {});
-            await sleep(2000);
-            await page.focus(inputSelector);
-            await page.fill(inputSelector, "");
-            await page.type(inputSelector, "b", { delay: 100 });
-            await page.keyboard.press("Enter");
-            await sleep(2000);
-          } else {
-            console.warn(`[Playwright] Auto-solve failed for ${accountId}, waiting remaining time for manual/microservice fallback...`);
-          }
+          console.log(`[Playwright] Captcha detected after Enter for ${accountId}. Waiting remaining time for external captchaResolve microservice/manual intervention...`);
         } else if (!captured) {
            // If no captcha and not captured, just wait a bit more
            await sleep(2000);
@@ -621,119 +603,6 @@ export function getPlaywrightStatus(): Record<
 /**
  * Solves the Baxia slidein captcha inside an iframe on the page.
  */
-export async function solveBaxiaCaptcha(page: Page): Promise<boolean> {
-  const iframeSelector = 'iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]';
-  const sliderSelector = '#nc_1_n1z, .btn_slide';
-  const trackSelector = '#nc_1_n1t, .nc_scale';
-
-  let isIframe = false;
-  let locatorContext: Page | FrameLocator = page;
-
-  // Check if captcha is in iframe
-  const iframeLocator = page.locator(iframeSelector).first();
-  if (await iframeLocator.isVisible().catch(() => false)) {
-    isIframe = true;
-    locatorContext = page.frameLocator(iframeSelector);
-    console.log('[Captcha] Baxia captcha iframe detected. Attempting to solve...');
-  } else {
-    // Check if captcha is directly in the main document
-    const mainDocSlider = page.locator(sliderSelector).first();
-    if (await mainDocSlider.isVisible().catch(() => false)) {
-      console.log('[Captcha] Baxia captcha detected on main document. Attempting to solve...');
-    } else {
-      return false; // No captcha detected
-    }
-  }
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const slider = locatorContext.locator(sliderSelector).first();
-
-      // Wait for the slider element to be visible
-      await slider.waitFor({ state: 'visible', timeout: 5000 });
-
-      const sliderBox = await slider.boundingBox();
-      if (!sliderBox) {
-        console.warn(`[Captcha] Attempt ${attempt}: Slider bounding box not found.`);
-        await sleep(1000);
-        continue;
-      }
-
-      const track = locatorContext.locator(trackSelector).first();
-      const trackBox = await track.boundingBox();
-      const dragDistance = trackBox ? (trackBox.width - sliderBox.width) : 260;
-
-      const startX = sliderBox.x + sliderBox.width / 2;
-      const startY = sliderBox.y + sliderBox.height / 2;
-
-      console.log(`[Captcha] Attempt ${attempt}: Dragging slider from x=${startX}, y=${startY} by ${dragDistance}px`);
-      
-      // Move mouse to slider center, hover for a moment
-      await page.mouse.move(startX, startY, { steps: 5 });
-      await sleep(150 + Math.floor(Math.random() * 150));
-      
-      // Press down
-      await page.mouse.down();
-      await sleep(100 + Math.floor(Math.random() * 100));
-
-      // Ease-in-out dragging simulation to mimic human acceleration & deceleration
-      const steps = 25;
-      for (let i = 1; i <= steps; i++) {
-        const t = i / steps;
-        // Cubic ease-in-out formula
-        const progress = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-        
-        const x = startX + dragDistance * progress + (Math.random() * 2 - 1);
-        // Add subtle vertical jitter
-        const y = startY + (Math.random() * 2 - 1);
-        
-        await page.mouse.move(x, y, { steps: 2 });
-        await sleep(15 + Math.floor(Math.random() * 20));
-      }
-
-      // Pause at the end before releasing the mouse button
-      await sleep(200 + Math.floor(Math.random() * 200));
-      await page.mouse.up();
-
-      // Wait a moment for the page to register success and close the dialog
-      await sleep(2000);
-
-      // Verify if the captcha is solved: the iframe should be hidden/gone, or we see a success element
-      if (isIframe) {
-        const isGone = !(await iframeLocator.isVisible().catch(() => false));
-        if (isGone) {
-          console.log('[Captcha] Baxia captcha solved successfully (iframe closed).');
-          return true;
-        }
-      } else {
-        // If inline, verify if slider is gone or ok element is visible
-        const isSliderGone = !(await locatorContext.locator(sliderSelector).first().isVisible().catch(() => false));
-        if (isSliderGone) {
-          console.log('[Captcha] Baxia captcha solved successfully (slider disappeared).');
-          return true;
-        }
-      }
-
-      const okElement = locatorContext.locator('.btn_ok, .nc_ok, div#nc-loading-circle').first();
-      const isOkVisible = await okElement.isVisible().catch(() => false);
-      if (isOkVisible) {
-        console.log('[Captcha] Baxia captcha solved successfully (OK state detected).');
-        await sleep(1500); // Wait for transition
-        return true;
-      }
-
-      console.warn(`[Captcha] Attempt ${attempt} did not solve the captcha. Retrying...`);
-      await sleep(1000);
-    } catch (err: any) {
-      console.error(`[Captcha] Error during attempt ${attempt}:`, err.message);
-      await sleep(1000);
-    }
-  }
-
-  console.error('[Captcha] Failed to solve Baxia captcha after 3 attempts.');
-  return false;
-}
-
 // ─── Stealth Script ──────────────────────────────────────────────────────────
 
 export function getStealthScript(): string {
