@@ -16,6 +16,7 @@ data/
 *.db-shm
 accounts.json
 accounts.json.bak
+qwen_profiles/
 
 # Logs
 *.log
