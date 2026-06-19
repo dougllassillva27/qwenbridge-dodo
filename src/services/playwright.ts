@@ -242,8 +242,13 @@ export async function initPlaywrightForAccount(
     });
 
     // Bloqueia recursos pesados/não essenciais para economizar RAM e banda em background
-    await acctContext.route("**/*.{png,jpg,jpeg,gif,webp,svg,mp4,webm,ogg,mp3,woff,woff2,ttf,otf,css}", route => {
-      route.abort();
+    await acctContext.route("**/*.{png,jpg,jpeg,gif,webp,svg,mp4,webm,ogg,mp3}", route => {
+      const url = route.request().url();
+      if (url.includes('captcha') || url.includes('alicdn') || url.includes('aliyun') || url.includes('_____tmd_____')) {
+        route.continue();
+      } else {
+        route.abort();
+      }
     });
 
     // Additional stealth scripts
