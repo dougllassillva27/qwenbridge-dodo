@@ -978,6 +978,5 @@ export function getStealthScript(): string {
         });
       };
     })();
-  \`;
+  `;
 }
-
