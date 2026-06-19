@@ -1,5 +1,12 @@
 import crypto from "crypto";
 import {
+  getPlaywrightStatus,
+  isPlaywrightInitialized,
+  refreshHeaders,
+  getPageForAccount,
+} from "./playwright.js";
+import { browserStreamFetch } from "./stream-bridge.js";
+import {
   getQwenHeaders,
   getBasicHeaders,
   isAuthMockEnabled,
@@ -1282,17 +1289,40 @@ export async function createQwenStream(
   const timeoutId = setTimeout(() => controller.abort(), dynamicTimeoutMs);
   let response: Response;
   try {
-    response = await fetch(url, {
-      method: "POST",
-      headers: buildCapturedQwenHeaders(headers, {
-        chatSessionId,
-        extra: {
-          "x-accel-buffering": "no",
-        },
-      }),
-      body: payloadJson,
-      signal: controller.signal,
-    });
+    const page = accountId ? getPageForAccount(accountId) : undefined;
+    const requestHeaders = buildCapturedQwenHeaders(headers, {
+      chatSessionId: chatSessionId || null,
+      extra: {
+        "x-accel-buffering": "no",
+      },
+    }) as Record<string, string>;
+
+    if (page) {
+      const bResp = await browserStreamFetch(page, url, {
+        method: "POST",
+        headers: requestHeaders,
+        body: payloadJson,
+        timeoutMs: dynamicTimeoutMs,
+      });
+      
+      const resHeaders = new Headers();
+      for (const [k, v] of Object.entries(bResp.headers)) {
+        resHeaders.set(k, v);
+      }
+      
+      response = new Response(bResp.stream, {
+        status: bResp.status,
+        statusText: bResp.statusText,
+        headers: resHeaders,
+      });
+    } else {
+      response = await fetch(url, {
+        method: "POST",
+        headers: requestHeaders,
+        body: payloadJson,
+        signal: controller.signal,
+      });
+    }
   } catch (error) {
     throw withCreatedChatMetadata(
       error instanceof Error ? error : new Error(String(error)),

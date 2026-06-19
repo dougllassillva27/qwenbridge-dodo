@@ -462,12 +462,19 @@ async function captureHeaders(accountId: string): Promise<void> {
           };
           cache.lastRefresh = Date.now();
           captured = true;
-          console.log(`[Playwright] Latest headers captured for ${accountId}`);
+          console.log(`[Playwright] Latest headers captured for ${accountId} (bx-ua starts with ${reqHeaders["bx-ua"].substring(0, 10)})`);
         }
       }
     };
 
+    const responseListener = (response: any) => {
+      if (response.url().includes("/api/v2/chat/completions")) {
+        console.log(`[Playwright] Completions response for ${accountId}: HTTP ${response.status()}`);
+      }
+    };
+
     page.on("request", requestListener);
+    page.on("response", responseListener);
 
     (async () => {
       try {
@@ -520,6 +527,7 @@ async function captureHeaders(accountId: string): Promise<void> {
       } finally {
         clearTimeout(timeout);
         page.removeListener("request", requestListener);
+        page.removeListener("response", responseListener);
         resolve();
       }
     })();
@@ -578,6 +586,10 @@ export async function closeAllPlaywright(): Promise<void> {
 }
 
 // ─── Status ───────────────────────────────────────────────────────────────────
+
+export function getPageForAccount(accountId: string): Page | undefined {
+  return accountPages.get(accountId);
+}
 
 export function isPlaywrightInitialized(accountId: string): boolean {
   return accountPages.has(accountId);
