@@ -739,13 +739,13 @@ export class StreamingToolParser {
     );
     const toolProperties = this.getToolProperties(matchingTool);
     if (
-      Object.keys(args).length === 1 &&
       Object.prototype.hasOwnProperty.call(args, "arguments") &&
       typeof (args as any).arguments === "object" &&
       (args as any).arguments !== null &&
       !Object.prototype.hasOwnProperty.call(toolProperties, "arguments")
     ) {
-      return (args as any).arguments as Record<string, unknown>;
+      const { arguments: innerArgs, ...rest } = args as any;
+      return { ...innerArgs, ...rest } as Record<string, unknown>;
     }
 
     return args;
