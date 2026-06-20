@@ -1259,7 +1259,7 @@ export async function createQwenStream(
   });
 
   // Dynamic timeout based on payload size
-  const BASE_TIMEOUT_MS = 120000;
+  const BASE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes to match Node.js limits
   const TIMEOUT_PER_MB = 30000;
   const MAX_PAYLOAD_SIZE = 10 * 1024 * 1024; // 10MB
 
