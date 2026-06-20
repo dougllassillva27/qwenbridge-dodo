@@ -132,6 +132,11 @@ export function robustParseJSON(str: string): any {
   }
 
   let currentJson = jsonPart.replace(
+    /("(?:name|tool_name|tool)"\s*:\s*"[^"]+"\s*,\s*)(\{)/g,
+    '$1"arguments": $2'
+  );
+
+  currentJson = currentJson.replace(
     /([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)/g,
     '$1"$2"$3',
   );
