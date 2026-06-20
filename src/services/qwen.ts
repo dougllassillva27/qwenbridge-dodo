@@ -4,6 +4,7 @@ import {
   isPlaywrightInitialized,
   refreshHeaders,
   getPageForAccount,
+  solveBaxiaWithMicroservice,
 } from "./playwright.js";
 import { browserStreamFetch } from "./stream-bridge.js";
 import {
@@ -1298,6 +1299,16 @@ export async function createQwenStream(
     }) as Record<string, string>;
 
     if (page) {
+      // Proactively check and solve captcha if it's blocking the page
+      // before attempting to stream fetch
+      if (accountId) {
+        const hasCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"], #nc_1_n1z, .btn_slide').first().isVisible().catch(() => false);
+        if (hasCaptcha) {
+          logger.info(`[Qwen] Captcha detected before streaming for ${accountId}. Requesting external captchaResolve microservice...`);
+          await solveBaxiaWithMicroservice(page, accountId);
+        }
+      }
+
       const bResp = await browserStreamFetch(page, url, {
         method: "POST",
         headers: requestHeaders,

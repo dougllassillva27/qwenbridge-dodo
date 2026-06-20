@@ -463,6 +463,8 @@ async function captureHeaders(accountId: string): Promise<void> {
           cache.lastRefresh = Date.now();
           captured = true;
           console.log(`[Playwright] Latest headers captured for ${accountId} (bx-ua starts with ${reqHeaders["bx-ua"].substring(0, 10)})`);
+          // Note: we DO NOT resolve() here anymore. We let the async flow finish
+          // checking for captchas before resolving, to ensure the page is left clean.
         }
       }
     };
@@ -477,6 +479,17 @@ async function captureHeaders(accountId: string): Promise<void> {
     page.on("response", responseListener);
 
     (async () => {
+      let resolveCalled = false;
+      const safeResolve = () => {
+        if (!resolveCalled) {
+          resolveCalled = true;
+          clearTimeout(timeout);
+          page.removeListener("request", requestListener);
+          page.removeListener("response", responseListener);
+          resolve();
+        }
+      };
+
       try {
         // Navigate to Qwen and trigger a request
         await page.goto("https://chat.qwen.ai/", {
@@ -531,10 +544,7 @@ async function captureHeaders(accountId: string): Promise<void> {
       } catch (err) {
         console.warn(`[Playwright] Error in capture flow for ${accountId}: ${err}`);
       } finally {
-        clearTimeout(timeout);
-        page.removeListener("request", requestListener);
-        page.removeListener("response", responseListener);
-        resolve();
+        safeResolve();
       }
     })();
   });
