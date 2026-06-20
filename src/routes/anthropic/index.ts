@@ -3,7 +3,7 @@ import { Hono, type Context } from "hono";
 import { stream as honoStream } from "hono/streaming";
 import { config } from "../../core/config.js";
 import { validateAnthropicRequest } from "./validation.js";
-import { Agent } from "undici";
+import { Agent, fetch as undiciFetch } from "undici";
 import {
   translateAnthropicToOpenAI,
   translateOpenAIToAnthropic,
@@ -257,7 +257,7 @@ app.post("/v1/messages", async (c) => {
         try {
           // Make the actual request to Qwen
           const controller = new AbortController();
-          const response = await fetch(
+          const response = await undiciFetch(
             `http://127.0.0.1:${config.server.port}/v1/chat/completions`,
             {
               method: "POST",
@@ -267,8 +267,8 @@ app.post("/v1/messages", async (c) => {
               },
               body: JSON.stringify({ ...openaiRequest, stream: true }),
               signal: controller.signal,
-              dispatcher: fetchDispatcher as any,
-            } as RequestInit,
+              dispatcher: fetchDispatcher,
+            } as any,
           );
 
           if (!response.ok) {
@@ -346,7 +346,7 @@ app.post("/v1/messages", async (c) => {
       });
     } else {
       // Non-streaming mode
-      const response = await fetch(
+      const response = await undiciFetch(
         `http://127.0.0.1:${config.server.port}/v1/chat/completions`,
         {
           method: "POST",
@@ -355,8 +355,8 @@ app.post("/v1/messages", async (c) => {
             Authorization: `Bearer ${process.env.API_KEY || config.apiKey || ""}`,
           },
           body: JSON.stringify(openaiRequest),
-          dispatcher: fetchDispatcher as any,
-        } as RequestInit,
+          dispatcher: fetchDispatcher,
+        } as any,
       );
 
       if (!response.ok) {
@@ -367,7 +367,7 @@ app.post("/v1/messages", async (c) => {
         return anthropicError(c, "api_error", "Upstream service error", 502);
       }
 
-      const openaiResponse: OpenAIResponse = await response.json();
+      const openaiResponse: OpenAIResponse = (await response.json()) as OpenAIResponse;
       const anthropicResponse = translateOpenAIToAnthropic(
         openaiResponse,
         requestModel,
