@@ -3,12 +3,18 @@ import { Hono, type Context } from "hono";
 import { stream as honoStream } from "hono/streaming";
 import { config } from "../../core/config.js";
 import { validateAnthropicRequest } from "./validation.js";
+import { Agent } from "undici";
 import {
   translateAnthropicToOpenAI,
   translateOpenAIToAnthropic,
   translateStreamChunk,
 } from "./translate.js";
 import type { AnthropicRequest, OpenAIResponse } from "./types.js";
+
+const fetchDispatcher = new Agent({
+  headersTimeout: 30 * 60 * 1000, // 30 minutes
+  bodyTimeout: 30 * 60 * 1000,
+});
 
 const app = new Hono();
 
@@ -261,7 +267,8 @@ app.post("/v1/messages", async (c) => {
               },
               body: JSON.stringify({ ...openaiRequest, stream: true }),
               signal: controller.signal,
-            },
+              dispatcher: fetchDispatcher as any,
+            } as RequestInit,
           );
 
           if (!response.ok) {
@@ -348,7 +355,8 @@ app.post("/v1/messages", async (c) => {
             Authorization: `Bearer ${process.env.API_KEY || config.apiKey || ""}`,
           },
           body: JSON.stringify(openaiRequest),
-        },
+          dispatcher: fetchDispatcher as any,
+        } as RequestInit,
       );
 
       if (!response.ok) {

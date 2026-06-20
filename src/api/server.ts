@@ -405,6 +405,12 @@ export async function startServer(options?: {
       hostname: config.server.host,
     });
 
+    // Override default Node.js HTTP timeouts (default 5m) for massive reasoning prompts
+    server.setTimeout(30 * 60 * 1000);
+    server.keepAliveTimeout = 30 * 60 * 1000;
+    server.headersTimeout = 30 * 60 * 1000;
+    server.requestTimeout = 30 * 60 * 1000;
+
     if (options?.installSignalHandlers !== false) {
       installSignalHandlers();
     }
