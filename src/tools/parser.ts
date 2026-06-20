@@ -1828,8 +1828,13 @@ export class StreamingToolParser {
       parsed.function?.arguments ||
       parsed.args ||
       parsed.parameters ||
-      parsed.input ||
-      {};
+      parsed.input;
+
+    if (args === undefined) {
+      // Handle flat JSON where Qwen puts arguments at the root: {"name": "Read", "file_path": "..."}
+      const { name: _n, id: _i, tool_call_id: _t, type: _ty, function: _f, ...rest } = parsed;
+      args = rest;
+    }
     if (typeof args === "string") {
       try {
         args = JSON.parse(args);
