@@ -126,6 +126,10 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
   const lowerToolStart = TOOL_START_LITERAL.toLowerCase();
 
   for (let i = 0; i < buffer.length; ) {
+    if (buffer[i] === "\n" && delimiterLength > 0 && delimiterLength < 3) {
+      delimiterLength = 0;
+    }
+
     if (buffer[i] === "`") {
       let runLength = 1;
       while (i + runLength < buffer.length && buffer[i + runLength] === "`") {
