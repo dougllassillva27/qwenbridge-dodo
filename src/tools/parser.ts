@@ -52,6 +52,11 @@ function advanceMarkdownCodeState(
 
   for (let i = 0; i < text.length; ) {
     if (text[i] !== "`") {
+      // Auto-close inline code blocks (1 or 2 backticks) on newline
+      // to prevent unbalanced backticks from breaking tool calls for the rest of the stream
+      if (text[i] === "\n" && delimiterLength > 0 && delimiterLength < 3) {
+        delimiterLength = 0;
+      }
       i++;
       continue;
     }
@@ -80,6 +85,10 @@ function findNextToolOpenTagOutsideMarkdownCode(
   let delimiterLength = initialDelimiterLength;
 
   for (let i = 0; i < buffer.length; ) {
+    if (buffer[i] === "\n" && delimiterLength > 0 && delimiterLength < 3) {
+      delimiterLength = 0;
+    }
+
     if (buffer[i] === "`") {
       let runLength = 1;
       while (i + runLength < buffer.length && buffer[i + runLength] === "`") {
