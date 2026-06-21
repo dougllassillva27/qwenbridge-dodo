@@ -644,27 +644,31 @@ export async function solveBaxiaWithMicroservice(page: Page, accountId: string):
   let isIframe = false;
   let locatorContext: Page | FrameLocator = page;
 
-  // Search for the actual visible captcha elements
-  let foundMain = false;
-  let foundIframe = false;
-
-  const mainWrapper = page.locator(wrapperSelector).first();
-  const mainSlider = page.locator(sliderSelector).first();
-  
-  if (await mainWrapper.isVisible().catch(() => false) || await mainSlider.isVisible().catch(() => false)) {
-    foundMain = true;
+  async function findVisible(loc: Locator): Promise<Locator | null> {
+    const count = await loc.count().catch(() => 0);
+    for (let i = 0; i < count; i++) {
+      if (await loc.nth(i).isVisible().catch(() => false)) {
+        return loc.nth(i);
+      }
+    }
+    return null;
   }
+
+  // Search for the actual visible captcha elements
+  let targetWrapper: Locator | null = await findVisible(page.locator(wrapperSelector));
+  let targetSlider: Locator | null = await findVisible(page.locator(sliderSelector));
+  let foundMain = !!(targetWrapper || targetSlider);
+  let foundIframe = false;
 
   if (!foundMain) {
     const iframeLocators = page.locator(iframeSelector);
-    const iframeCount = await iframeLocators.count();
+    const iframeCount = await iframeLocators.count().catch(() => 0);
     for (let i = 0; i < iframeCount; i++) {
-      const frameNode = iframeLocators.nth(i);
-      if (await frameNode.isVisible().catch(() => false)) {
+      if (await iframeLocators.nth(i).isVisible().catch(() => false)) {
         const frameCtx = page.frameLocator(iframeSelector).nth(i);
-        const fWrapper = frameCtx.locator(wrapperSelector).first();
-        const fSlider = frameCtx.locator(sliderSelector).first();
-        if (await fWrapper.isVisible().catch(() => false) || await fSlider.isVisible().catch(() => false)) {
+        targetWrapper = await findVisible(frameCtx.locator(wrapperSelector));
+        targetSlider = await findVisible(frameCtx.locator(sliderSelector));
+        if (targetWrapper || targetSlider) {
           foundIframe = true;
           isIframe = true;
           locatorContext = frameCtx;
@@ -676,7 +680,6 @@ export async function solveBaxiaWithMicroservice(page: Page, accountId: string):
 
   if (foundMain) {
     console.log(`[CaptchaResolve] Baxia captcha detected on main document for ${accountId}.`);
-    locatorContext = page;
     isIframe = false;
   } else if (foundIframe) {
     console.log(`[CaptchaResolve] Baxia captcha iframe detected for ${accountId}.`);
@@ -687,10 +690,11 @@ export async function solveBaxiaWithMicroservice(page: Page, accountId: string):
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const slider = locatorContext.locator(sliderSelector).first();
+      // Refresh locators dynamically to prevent stale elements
+      const slider = targetSlider || locatorContext.locator(sliderSelector).first();
       await slider.waitFor({ state: 'visible', timeout: 5000 });
 
-      const wrapper = locatorContext.locator(wrapperSelector).first();
+      const wrapper = targetWrapper || locatorContext.locator(wrapperSelector).first();
       await wrapper.waitFor({ state: 'visible', timeout: 5000 });
 
       // Take a screenshot of the captcha wrapper
