@@ -1302,20 +1302,36 @@ export async function createQwenStream(
       // Proactively check and solve captcha if it's blocking the page
       // before attempting to stream fetch
       if (accountId) {
-        const hasCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"], #nc_1_n1z, .btn_slide').first().isVisible().catch(() => false);
+        const hasCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"], #nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish').first().isVisible().catch(() => false);
         if (hasCaptcha) {
           logger.info(`[Qwen] Captcha detected before streaming for ${accountId}. Requesting external captchaResolve microservice...`);
           await solveBaxiaWithMicroservice(page, accountId);
         }
       }
 
-      const bResp = await browserStreamFetch(page, url, {
+      let fetchDone = false;
+      const fetchPromise = browserStreamFetch(page, url, {
         method: "POST",
         headers: requestHeaders,
         body: payloadJson,
         timeoutMs: dynamicTimeoutMs,
-      });
-      
+      }).finally(() => { fetchDone = true; });
+
+      if (accountId) {
+        (async () => {
+          while (!fetchDone) {
+            await new Promise(r => setTimeout(r, 1500));
+            if (fetchDone) break;
+            const hasLateCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"], #nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish').first().isVisible().catch(() => false);
+            if (hasLateCaptcha) {
+              logger.warn(`[Qwen] Captcha detected DURING stream fetch for ${accountId}! Attempting to solve...`);
+              await solveBaxiaWithMicroservice(page, accountId).catch(e => logger.error(`[Qwen] Failed to solve late captcha: ${e.message}`));
+            }
+          }
+        })();
+      }
+
+      const bResp = await fetchPromise;
       const resHeaders = new Headers();
       for (const [k, v] of Object.entries(bResp.headers)) {
         resHeaders.set(k, v);
