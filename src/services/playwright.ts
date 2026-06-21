@@ -644,20 +644,45 @@ export async function solveBaxiaWithMicroservice(page: Page, accountId: string):
   let isIframe = false;
   let locatorContext: Page | FrameLocator = page;
 
-  // Check if captcha is in iframe
-  const iframeLocator = page.locator(iframeSelector).first();
-  if (await iframeLocator.isVisible().catch(() => false)) {
-    isIframe = true;
-    locatorContext = page.frameLocator(iframeSelector);
+  // Search for the actual visible captcha elements
+  let foundMain = false;
+  let foundIframe = false;
+
+  const mainWrapper = page.locator(wrapperSelector).first();
+  const mainSlider = page.locator(sliderSelector).first();
+  
+  if (await mainWrapper.isVisible().catch(() => false) || await mainSlider.isVisible().catch(() => false)) {
+    foundMain = true;
+  }
+
+  if (!foundMain) {
+    const iframeLocators = page.locator(iframeSelector);
+    const iframeCount = await iframeLocators.count();
+    for (let i = 0; i < iframeCount; i++) {
+      const frameNode = iframeLocators.nth(i);
+      if (await frameNode.isVisible().catch(() => false)) {
+        const frameCtx = page.frameLocator(iframeSelector).nth(i);
+        const fWrapper = frameCtx.locator(wrapperSelector).first();
+        const fSlider = frameCtx.locator(sliderSelector).first();
+        if (await fWrapper.isVisible().catch(() => false) || await fSlider.isVisible().catch(() => false)) {
+          foundIframe = true;
+          isIframe = true;
+          locatorContext = frameCtx;
+          break;
+        }
+      }
+    }
+  }
+
+  if (foundMain) {
+    console.log(`[CaptchaResolve] Baxia captcha detected on main document for ${accountId}.`);
+    locatorContext = page;
+    isIframe = false;
+  } else if (foundIframe) {
     console.log(`[CaptchaResolve] Baxia captcha iframe detected for ${accountId}.`);
   } else {
-    // Check if captcha is directly in the main document
-    const mainDocSlider = page.locator(sliderSelector).first();
-    if (await mainDocSlider.isVisible().catch(() => false)) {
-      console.log(`[CaptchaResolve] Baxia captcha detected on main document for ${accountId}.`);
-    } else {
-      return false; // No captcha detected
-    }
+    console.log(`[CaptchaResolve] No VISIBLE captcha found for ${accountId} despite trigger.`);
+    return false; // No captcha detected
   }
 
   for (let attempt = 1; attempt <= 3; attempt++) {

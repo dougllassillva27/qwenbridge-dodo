@@ -1302,7 +1302,13 @@ export async function createQwenStream(
       // Proactively check and solve captcha if it's blocking the page
       // before attempting to stream fetch
       if (accountId) {
-        const hasCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"], #nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish').first().isVisible().catch(() => false);
+        const captchaLocators = page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"], #nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish');
+        let hasCaptcha = false;
+        for (let i = 0; i < await captchaLocators.count().catch(() => 0); i++) {
+          if (await captchaLocators.nth(i).isVisible().catch(() => false)) {
+            hasCaptcha = true; break;
+          }
+        }
         if (hasCaptcha) {
           logger.info(`[Qwen] Captcha detected before streaming for ${accountId}. Requesting external captchaResolve microservice...`);
           await solveBaxiaWithMicroservice(page, accountId);
@@ -1322,7 +1328,13 @@ export async function createQwenStream(
           while (!fetchDone) {
             await new Promise(r => setTimeout(r, 1500));
             if (fetchDone) break;
-            const hasLateCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"], #nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish').first().isVisible().catch(() => false);
+            const lateCaptchaLocators = page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"], #nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish');
+            let hasLateCaptcha = false;
+            for (let i = 0; i < await lateCaptchaLocators.count().catch(() => 0); i++) {
+              if (await lateCaptchaLocators.nth(i).isVisible().catch(() => false)) {
+                hasLateCaptcha = true; break;
+              }
+            }
             if (hasLateCaptcha) {
               logger.warn(`[Qwen] Captcha detected DURING stream fetch for ${accountId}! Attempting to solve...`);
               await solveBaxiaWithMicroservice(page, accountId).catch(e => logger.error(`[Qwen] Failed to solve late captcha: ${e.message}`));
