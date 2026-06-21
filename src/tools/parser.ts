@@ -106,7 +106,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
     }
 
     if (delimiterLength === 0) {
-      const match = buffer.substring(i).match(/^<tool_call\b[^>]*>/i);
+      const match = buffer.substring(i).match(/^<tool_calls?\b[^>]*>/i);
       if (match) {
         return { index: i, openTag: match[0] };
       }
@@ -151,7 +151,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
       if (tailLower.startsWith("<tool_call") && tailLower.indexOf(">") === -1) {
         return i;
       }
-      if (lowerToolStart.startsWith(tailLower)) {
+      if (lowerToolStart.startsWith(tailLower) || "<tool_calls>".startsWith(tailLower)) {
         return i;
       }
     }
@@ -241,7 +241,7 @@ function findPartialMissingOpenToolCallIndex(
   buffer: string,
   initialDelimiterLength = 0,
 ): number {
-  if (buffer.toLowerCase().includes(TOOL_END)) return -1;
+  if (buffer.match(/<\/tool_calls?>/i)) return -1;
 
   const candidateStarts = findCandidateStarts(buffer);
   for (const candidateStart of candidateStarts) {
@@ -267,7 +267,8 @@ function findRecoverableMissingOpenToolCall(
   initialDelimiterLength = 0,
 ): { textBefore: string; candidate: string; consumeLength: number } | null {
   const lower = buffer.toLowerCase();
-  const endIdx = lower.indexOf(TOOL_END);
+  const endMatch = lower.match(/<\/tool_calls?>/);
+  const endIdx = endMatch ? endMatch.index! : -1;
   if (endIdx === -1) return null;
 
   const beforeEnd = buffer.substring(0, endIdx);
@@ -291,7 +292,7 @@ function findRecoverableMissingOpenToolCall(
     return {
       textBefore: beforeEnd.substring(0, candidateStart),
       candidate,
-      consumeLength: endIdx + TOOL_END.length,
+      consumeLength: endIdx + endMatch![0].length,
     };
   }
 
@@ -1061,21 +1062,21 @@ export class StreamingToolParser {
           break;
         }
       } else {
-        // Inside tool: look for </tool_call>
-        const lowerBuffer = this.buffer.toLowerCase();
-        const endIdx = lowerBuffer.indexOf(TOOL_END);
-        if (endIdx !== -1) {
+        // Inside tool: look for </tool_call> or </tool_calls>
+        const endMatch = this.buffer.match(/<\/tool_calls?>/i);
+        if (endMatch) {
+          const endIdx = endMatch.index!;
           const content = this.buffer.substring(0, endIdx);
           if (isToolcallDebugEnabled()) {
             logger.debug("[parser] tool_call close tag detected", {
               contentLength: content.length,
               contentPreview: content.substring(0, 300),
               remainingBufferLength:
-                this.buffer.length - endIdx - TOOL_END.length,
+                this.buffer.length - endIdx - endMatch[0].length,
             });
           }
           this.emitIncrementalToolCallDeltas(content, result);
-          this.buffer = this.buffer.substring(endIdx + TOOL_END.length);
+          this.buffer = this.buffer.substring(endIdx + endMatch[0].length);
           this.processToolContent(content, result);
           this.insideTool = false;
           this.currentOpenTag = TOOL_START_LITERAL;
