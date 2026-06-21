@@ -750,18 +750,15 @@ export async function solveBaxiaWithMicroservice(page: Page, accountId: string):
       await page.mouse.up();
       await sleep(2000);
 
-      if (isIframe) {
-        const isGone = !(await iframeLocator.isVisible().catch(() => false));
-        if (isGone) {
-          console.log(`[CaptchaResolve] Captcha solved successfully for ${accountId} (iframe closed).`);
-          return true;
-        }
-      } else {
-        const isSliderGone = !(await locatorContext.locator(sliderSelector).first().isVisible().catch(() => false));
-        if (isSliderGone) {
-          console.log(`[CaptchaResolve] Captcha solved successfully for ${accountId} (slider disappeared).`);
-          return true;
-        }
+      const currentWrapper = targetWrapper || locatorContext.locator(wrapperSelector).first();
+      const currentSlider = targetSlider || locatorContext.locator(sliderSelector).first();
+      
+      const isWrapperGone = !(await currentWrapper.isVisible().catch(() => false));
+      const isSliderGone = !(await currentSlider.isVisible().catch(() => false));
+      
+      if (isWrapperGone || isSliderGone) {
+        console.log(`[CaptchaResolve] Captcha solved successfully for ${accountId} (wrapper or slider disappeared).`);
+        return true;
       }
 
       const okElement = locatorContext.locator('.btn_ok, .nc_ok, div#nc-loading-circle').first();
