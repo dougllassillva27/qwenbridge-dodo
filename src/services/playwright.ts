@@ -10,6 +10,7 @@ import { chromium, BrowserContext, Page, FrameLocator } from "playwright";
 import path from "path";
 import crypto from "crypto";
 import fs from "fs";
+import { solveBaxiaCaptcha } from "./captcha-solver.ts";
 import { QwenAccount } from "../core/accounts.ts";
 import { config } from "../core/config.ts";
 import { logger } from "../core/logger.ts";
@@ -547,7 +548,7 @@ async function captureHeaders(accountId: string): Promise<void> {
         
         if (isPunishPage || hasEarlyIframe || hasEarlySlider) {
           console.log(`[Playwright] Captcha detected early for ${accountId}. Requesting external captchaResolve microservice...`);
-          const solved = await solveBaxiaWithMicroservice(page, accountId);
+          const solved = await solveBaxiaCaptcha(page, accountId);
           if (solved) {
             await page.waitForSelector('textarea:visible, [contenteditable="true"]:visible', { state: 'visible', timeout: 10000 }).catch(() => {});
           }
@@ -570,7 +571,7 @@ async function captureHeaders(accountId: string): Promise<void> {
         const hasSliderCaptcha = await isVisible('#nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish');
         if (isLatePunishPage || hasIframeCaptcha || hasSliderCaptcha) {
           console.log(`[Playwright] Captcha detected after Enter for ${accountId}. Requesting external captchaResolve microservice...`);
-          const solved = await solveBaxiaWithMicroservice(page, accountId);
+          const solved = await solveBaxiaCaptcha(page, accountId);
           if (solved) {
             console.log(`[Playwright] Captcha solved via microservice! Retrying request to capture fresh headers...`);
             await page.waitForSelector(inputSelector, { state: 'visible', timeout: 10000 }).catch(() => {});
@@ -677,153 +678,6 @@ export function getPlaywrightStatus(): Record<
 }
 
 // ─── Native Captcha Solver ───────────────────────────────────────────────────
-
-/**
- * Solves the Baxia slidein captcha inside an iframe on the page.
- */
-export async function solveBaxiaWithMicroservice(page: Page, accountId: string): Promise<boolean> {
-  const iframeSelector = 'iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]';
-  const sliderSelector = '#nc_1_n1z, .btn_slide';
-  const wrapperSelector = '#nc_1_wrapper, .nc_wrapper, .baxia-punish';
-
-  let isIframe = false;
-  let locatorContext: Page | FrameLocator = page;
-
-  async function findVisible(loc: Locator): Promise<Locator | null> {
-    const count = await loc.count().catch(() => 0);
-    for (let i = 0; i < count; i++) {
-      if (await loc.nth(i).isVisible().catch(() => false)) {
-        return loc.nth(i);
-      }
-    }
-    return null;
-  }
-
-  // Search for the actual visible captcha elements
-  let targetWrapper: Locator | null = await findVisible(page.locator(wrapperSelector));
-  let targetSlider: Locator | null = await findVisible(page.locator(sliderSelector));
-  let foundMain = !!(targetWrapper || targetSlider);
-  let foundIframe = false;
-
-  if (!foundMain) {
-    const iframeLocators = page.locator(iframeSelector);
-    const iframeCount = await iframeLocators.count().catch(() => 0);
-    for (let i = 0; i < iframeCount; i++) {
-      if (await iframeLocators.nth(i).isVisible().catch(() => false)) {
-        const frameCtx = page.frameLocator(iframeSelector).nth(i);
-        targetWrapper = await findVisible(frameCtx.locator(wrapperSelector));
-        targetSlider = await findVisible(frameCtx.locator(sliderSelector));
-        if (targetWrapper || targetSlider) {
-          foundIframe = true;
-          isIframe = true;
-          locatorContext = frameCtx;
-          break;
-        }
-      }
-    }
-  }
-
-  if (foundMain) {
-    console.log(`[CaptchaResolve] Baxia captcha detected on main document for ${accountId}.`);
-    isIframe = false;
-  } else if (foundIframe) {
-    console.log(`[CaptchaResolve] Baxia captcha iframe detected for ${accountId}.`);
-  } else {
-    console.log(`[CaptchaResolve] No VISIBLE captcha found for ${accountId} despite trigger.`);
-    return false; // No captcha detected
-  }
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      // Refresh locators dynamically to prevent stale elements
-      const slider = targetSlider || locatorContext.locator(sliderSelector).first();
-      await slider.waitFor({ state: 'visible', timeout: 5000 });
-
-      const wrapper = targetWrapper || locatorContext.locator(wrapperSelector).first();
-      await wrapper.waitFor({ state: 'visible', timeout: 5000 });
-
-      // Take a screenshot of the captcha wrapper
-      const buffer = await wrapper.screenshot();
-      const base64Image = buffer.toString('base64');
-
-      console.log(`[CaptchaResolve] Attempt ${attempt}: Sending image to microservice...`);
-      
-      const response = await fetch('http://localhost:50006/resolve', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ image: base64Image, accountId })
-      });
-
-      if (!response.ok) {
-        throw new Error(`Microservice returned HTTP ${response.status}`);
-      }
-
-      const result = await response.json() as { success: boolean; x?: number; error?: string };
-      if (!result.success || result.x === undefined) {
-        throw new Error(`Microservice failed: ${result.error}`);
-      }
-
-      const dragDistance = result.x;
-      console.log(`[CaptchaResolve] Microservice returned x=${dragDistance}. Simulating drag...`);
-
-      const sliderBox = await slider.boundingBox();
-      if (!sliderBox) throw new Error('Slider bounding box not found');
-
-      const startX = sliderBox.x + sliderBox.width / 2;
-      const startY = sliderBox.y + sliderBox.height / 2;
-      
-      // Move mouse to slider center, hover for a moment
-      await page.mouse.move(startX, startY, { steps: 5 });
-      await sleep(150 + Math.floor(Math.random() * 150));
-      
-      // Press down
-      await page.mouse.down();
-      await sleep(100 + Math.floor(Math.random() * 100));
-
-      // Drag
-      const steps = 25;
-      for (let i = 1; i <= steps; i++) {
-        const t = i / steps;
-        const progress = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-        const x = startX + dragDistance * progress + (Math.random() * 2 - 1);
-        const y = startY + (Math.random() * 2 - 1);
-        await page.mouse.move(x, y, { steps: 2 });
-        await sleep(15 + Math.floor(Math.random() * 20));
-      }
-
-      await sleep(200 + Math.floor(Math.random() * 200));
-      await page.mouse.up();
-      await sleep(2000);
-
-      const currentWrapper = targetWrapper || locatorContext.locator(wrapperSelector).first();
-      const currentSlider = targetSlider || locatorContext.locator(sliderSelector).first();
-      
-      const isWrapperGone = !(await currentWrapper.isVisible().catch(() => false));
-      const isSliderGone = !(await currentSlider.isVisible().catch(() => false));
-      
-      if (isWrapperGone || isSliderGone) {
-        console.log(`[CaptchaResolve] Captcha solved successfully for ${accountId} (wrapper or slider disappeared).`);
-        return true;
-      }
-
-      const okElement = locatorContext.locator('.btn_ok, .nc_ok, div#nc-loading-circle').first();
-      if (await okElement.isVisible().catch(() => false)) {
-        console.log(`[CaptchaResolve] Captcha solved successfully for ${accountId} (OK state detected).`);
-        await sleep(1500);
-        return true;
-      }
-
-      console.warn(`[CaptchaResolve] Attempt ${attempt} failed. Retrying...`);
-      await sleep(1000);
-    } catch (err: any) {
-      console.error(`[CaptchaResolve] Error during attempt ${attempt}:`, err.message);
-      await sleep(1000);
-    }
-  }
-
-  console.error(`[CaptchaResolve] Failed to solve after 3 attempts.`);
-  return false;
-}
 
 // ─── Stealth Script ──────────────────────────────────────────────────────────
 
