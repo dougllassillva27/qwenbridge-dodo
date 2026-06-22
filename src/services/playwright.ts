@@ -498,8 +498,19 @@ async function captureHeaders(accountId: string): Promise<void> {
         await sleep(2000);
 
         const isPunishPage = page.url().includes("_____tmd_____");
-        const hasEarlyIframe = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]').first().isVisible().catch(() => false);
-        const hasEarlySlider = await page.locator('#nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish').first().isVisible().catch(() => false);
+
+        const isVisible = async (selector: string) => {
+          const locs = page.locator(selector);
+          const count = await locs.count().catch(() => 0);
+          for (let i = 0; i < count; i++) {
+            if (await locs.nth(i).isVisible().catch(() => false)) return true;
+          }
+          return false;
+        };
+
+        const hasEarlyIframe = await isVisible('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]');
+        const hasEarlySlider = await isVisible('#nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish');
+        
         if (isPunishPage || hasEarlyIframe || hasEarlySlider) {
           console.log(`[Playwright] Captcha detected early for ${accountId}. Requesting external captchaResolve microservice...`);
           const solved = await solveBaxiaWithMicroservice(page, accountId);
@@ -521,8 +532,8 @@ async function captureHeaders(accountId: string): Promise<void> {
         await sleep(2000);
         
         const isLatePunishPage = page.url().includes("_____tmd_____");
-        const hasIframeCaptcha = await page.locator('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]').first().isVisible().catch(() => false);
-        const hasSliderCaptcha = await page.locator('#nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish').first().isVisible().catch(() => false);
+        const hasIframeCaptcha = await isVisible('iframe#baxia-dialog-content, iframe[src*="_____tmd_____/punish"]');
+        const hasSliderCaptcha = await isVisible('#nc_1_n1z, #nc_2_n1z, .btn_slide, #nc_1_wrapper, .nc_wrapper, .baxia-punish');
         if (isLatePunishPage || hasIframeCaptcha || hasSliderCaptcha) {
           console.log(`[Playwright] Captcha detected after Enter for ${accountId}. Requesting external captchaResolve microservice...`);
           const solved = await solveBaxiaWithMicroservice(page, accountId);
