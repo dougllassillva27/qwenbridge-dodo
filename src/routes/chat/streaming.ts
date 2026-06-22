@@ -358,7 +358,7 @@ export async function processNonStreamingResponse(
                   foundStr = true;
                 }
               }
-            } else if (delta.phase === "answer") {
+            } else if (delta.phase === "answer" || delta.phase === undefined) {
               isThinkingChunk = false;
               if (delta.content !== undefined) {
                 const newContent = delta.content || "";
@@ -1059,7 +1059,7 @@ export async function processStreamingResponse(
                     foundStr = true;
                   }
                 }
-              } else if (delta.phase === "answer") {
+              } else if (delta.phase === "answer" || delta.phase === undefined) {
                 isThinkingChunk = false;
                 if (delta.content !== undefined) {
                   const newContent = delta.content || "";

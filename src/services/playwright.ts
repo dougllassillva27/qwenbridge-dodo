@@ -9,6 +9,7 @@
 import { chromium, BrowserContext, Page, FrameLocator } from "playwright";
 import path from "path";
 import crypto from "crypto";
+import fs from "fs";
 import { QwenAccount } from "../core/accounts.ts";
 import { config } from "../core/config.ts";
 import { logger } from "../core/logger.ts";
@@ -186,45 +187,21 @@ export async function getBasicHeaders(accountId: string): Promise<{
   }
 }
 
-export async function initPlaywrightForAccount(
-  account: QwenAccount,
-  headless = true,
-  browserType: BrowserType = "chromium",
-): Promise<void> {
-  if (accountPages.has(account.id)) {
-    console.log(`[Playwright] Already initialized for ${account.email}`);
-    return;
-  }
+let globalBrowser: import("playwright").Browser | null = null;
+const globalBrowserMutex = new Mutex();
 
-  const release = await getAccountMutex(account.id).acquire();
+async function getOrLaunchBrowser(headless: boolean, browserType: BrowserType) {
+  const release = await globalBrowserMutex.acquire();
   try {
-    // Double-check after acquiring lock
-    if (accountPages.has(account.id)) {
-      console.log(`[Playwright] Already initialized for ${account.email}`);
-      return;
-    }
+    if (globalBrowser) return globalBrowser;
 
-    const profilePath = path.resolve("data", "qwen_profiles", account.id);
     const { engine, channel } = resolveBrowserEngine(browserType);
-
-    console.log(
-      `[Playwright] Launching ${browserType} for ${account.email}...`,
-    );
-
-    // Use playwright-extra with stealth if available, otherwise regular chromium
     const engineToUse = chromiumWithStealth || engine;
 
-    const acctContext = await engineToUse.launchPersistentContext(profilePath, {
+    globalBrowser = await engineToUse.launch({
       headless,
       channel,
-      userAgent:
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       ignoreDefaultArgs: ["--enable-automation"],
-      extraHTTPHeaders: {
-        'sec-ch-ua': '"Chromium";v="149", "Google Chrome";v="149", "Not/A)Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-      },
       args: [
         "--disable-blink-features=AutomationControlled",
         "--disable-features=IsolateOrigins,site-per-process",
@@ -242,9 +219,63 @@ export async function initPlaywrightForAccount(
         "--disable-gpu",
         "--disable-software-rasterizer",
         "--disable-dev-shm-usage",
-        "--js-flags=--max-old-space-size=256"
+        "--js-flags=--max-old-space-size=256",
+        "--window-size=500,400"
       ],
     });
+    return globalBrowser;
+  } finally {
+    release();
+  }
+}
+
+export async function initPlaywrightForAccount(
+  account: QwenAccount,
+  headless = true,
+  browserType: BrowserType = "chromium",
+): Promise<void> {
+  if (process.env.TEST_MOCK_PLAYWRIGHT === 'true') {
+    return;
+  }
+
+  if (accountPages.has(account.id)) {
+    console.log(`[Playwright] Already initialized for ${account.email}`);
+    return;
+  }
+
+  const release = await getAccountMutex(account.id).acquire();
+  try {
+    if (accountPages.has(account.id)) {
+      return;
+    }
+
+    const stateDir = path.resolve("data", "qwen_profiles", account.id);
+    if (!fs.existsSync(stateDir)) {
+      fs.mkdirSync(stateDir, { recursive: true });
+    }
+    const statePath = path.join(stateDir, "_state.json");
+
+    console.log(`[Playwright] Launching shared ${browserType} context for ${account.email}...`);
+
+    const browser = await getOrLaunchBrowser(headless, browserType);
+    
+    const acctContext = await browser.newContext({
+      storageState: fs.existsSync(statePath) ? statePath : undefined,
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+      extraHTTPHeaders: {
+        'sec-ch-ua': '"Chromium";v="149", "Google Chrome";v="149", "Not/A)Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+      },
+    });
+
+    // Save state helper
+    const saveState = async () => {
+      try { await acctContext.storageState({ path: statePath }); } catch { /* ignore */ }
+    };
+    
+    acctContext.on('close', saveState);
 
     // Bloqueia recursos pesados/não essenciais para economizar RAM e banda em background
     await acctContext.route("**/*.{png,jpg,jpeg,gif,webp,svg,mp4,webm,ogg,mp3}", route => {
@@ -262,6 +293,9 @@ export async function initPlaywrightForAccount(
     const acctPage = await acctContext.newPage();
     accountContexts.set(account.id, acctContext);
     accountPages.set(account.id, acctPage);
+
+    // Salva cookies ao carregar
+    acctPage.on('load', saveState);
 
     // Check if already logged in
     const cookies = await acctContext.cookies();

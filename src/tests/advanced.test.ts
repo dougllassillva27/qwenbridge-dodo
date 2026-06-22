@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert";
 
 process.env.TEST_MOCK_QWEN_AUTH = "true";
+process.env.TEST_MOCK_PLAYWRIGHT = "true";
 
 import { app, setCacheForTesting } from "../api/server.js";
 import { MemoryCache } from "../cache/memory-cache.js";

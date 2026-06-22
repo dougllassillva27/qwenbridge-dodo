@@ -226,7 +226,7 @@ export async function anthropicMessages(c: Context) {
               
               if (delta.phase === 'thinking_summary' && delta.extra?.summary_thought?.content) {
                 fullReasoning += delta.extra.summary_thought.content.join('');
-              } else if (delta.phase === 'answer' && delta.content) {
+              } else if ((delta.phase === 'answer' || delta.phase === undefined) && delta.content) {
                 const incr = getIncrementalDelta(fullContent, delta.content);
                 fullContent += incr.delta;
               }
@@ -382,7 +382,7 @@ export async function anthropicMessages(c: Context) {
               }
 
               // End Thinking and Start Answer
-              if (delta.phase === 'answer' && isThinkingActive) {
+              if ((delta.phase === 'answer' || delta.phase === undefined) && isThinkingActive) {
                 await writeEvent('content_block_delta', { type: 'content_block_delta', index: blockIndex, delta: { type: 'signature_delta', signature: 'WaUjzkypQ2mUEVM' } });
                 await writeEvent('content_block_stop', { type: 'content_block_stop', index: blockIndex });
                 isThinkingActive = false;
@@ -390,7 +390,7 @@ export async function anthropicMessages(c: Context) {
               }
 
               // Handle Text/Tools
-              if (delta.phase === 'answer' && delta.content) {
+              if ((delta.phase === 'answer' || delta.phase === undefined) && delta.content) {
                 const diff = getIncrementalDelta(oldFullContent, delta.content);
                 oldFullContent += diff.delta;
 
