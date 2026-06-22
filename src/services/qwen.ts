@@ -4,8 +4,8 @@ import {
   isPlaywrightInitialized,
   refreshHeaders,
   getPageForAccount,
-  solveBaxiaWithMicroservice,
 } from "./playwright.js";
+import { solveBaxiaCaptcha } from "./captcha-solver.js";
 import { browserStreamFetch } from "./stream-bridge.js";
 import {
   getQwenHeaders,
@@ -1311,7 +1311,7 @@ export async function createQwenStream(
         }
         if (hasCaptcha) {
           logger.info(`[Qwen] Captcha detected before streaming for ${accountId}. Requesting external captchaResolve microservice...`);
-          await solveBaxiaWithMicroservice(page, accountId);
+          await solveBaxiaCaptcha(page, accountId);
         }
       }
 
@@ -1337,7 +1337,7 @@ export async function createQwenStream(
             }
             if (hasLateCaptcha) {
               logger.warn(`[Qwen] Captcha detected DURING stream fetch for ${accountId}! Attempting to solve...`);
-              await solveBaxiaWithMicroservice(page, accountId).catch(e => logger.error(`[Qwen] Failed to solve late captcha: ${e.message}`));
+              await solveBaxiaCaptcha(page, accountId).catch(e => logger.error(`[Qwen] Failed to solve late captcha: ${e.message}`));
             }
           }
         })();
