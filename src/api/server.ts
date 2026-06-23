@@ -150,6 +150,28 @@ app.get("/health", async (c) => {
   });
 });
 
+app.get("/metrics/accounts", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+  
+  const { loadAccounts } = await import("../core/accounts.js");
+  const accounts = loadAccounts();
+  const now = Date.now();
+  
+  return c.json({
+    total: accounts.length,
+    accounts: accounts.map(acc => {
+      const isCooldown = acc.cooldown_until ? acc.cooldown_until > now : false;
+      return {
+        id: acc.id,
+        email: acc.email,
+        status: isCooldown ? "cooldown" : "active",
+        cooldown_until: acc.cooldown_until
+      };
+    })
+  });
+});
+
 app.get("/metrics", (c) => {
   const error = verifyApiKey(c);
   if (error) return error;
