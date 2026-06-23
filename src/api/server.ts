@@ -163,11 +163,20 @@ app.get("/metrics/accounts", async (c) => {
 
   
   const { loadAccounts } = await import("../core/accounts.js");
+  const { metrics } = await import("../core/metrics.js");
   const accounts = loadAccounts();
   const now = Date.now();
   
+  const ramUsed = metrics.get("memory.heap.used")?.value || 0;
+  const ramMb = Math.round(ramUsed / 1024 / 1024);
+  const requestsTotal = metrics.get("requests.total")?.value || 0;
+  const streamErrors = metrics.get("streams.errors")?.value || 0;
+  
   return c.json({
     total: accounts.length,
+    ram_mb: ramMb,
+    requests: requestsTotal,
+    stream_errors: streamErrors,
     accounts: accounts.map(acc => {
       const isCooldown = acc.cooldown_until ? acc.cooldown_until > now : false;
       return {
