@@ -32,6 +32,11 @@ export class Metrics extends EventEmitter {
       ["requests.total", "counter", "Total requests processed"],
       ["requests.errors", "counter", "Total request errors"],
       ["latency.request", "histogram", "Request latency (ms)"],
+      
+      // Token metrics
+      ["tokens.prompt", "counter", "Total prompt tokens"],
+      ["tokens.completion", "counter", "Total completion tokens"],
+      ["tokens.total", "counter", "Total tokens used"],
 
       // Stream metrics
       ["streams.active", "gauge", "Active SSE streams"],

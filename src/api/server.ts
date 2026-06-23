@@ -179,11 +179,22 @@ app.get("/metrics/accounts", async (c) => {
     stream_errors: streamErrors,
     accounts: accounts.map(acc => {
       const isCooldown = acc.cooldown_until ? acc.cooldown_until > now : false;
+      
+      const labels = { account: acc.id };
+      const prompt = metrics.get("tokens.prompt", labels)?.value || 0;
+      const completion = metrics.get("tokens.completion", labels)?.value || 0;
+      const totalTokens = metrics.get("tokens.total", labels)?.value || 0;
+
       return {
         id: acc.id,
         email: acc.email,
         status: isCooldown ? "cooldown" : "active",
-        cooldown_until: acc.cooldown_until
+        cooldown_until: acc.cooldown_until,
+        tokens: {
+          prompt,
+          completion,
+          total: totalTokens
+        }
       };
     })
   });

@@ -16,6 +16,7 @@ import {
   QwenUpstreamError,
   RetryableQwenStreamError,
 } from "../../services/qwen.ts";
+import { metrics } from "../../core/metrics.js";
 import type { OpenAIRequest, Usage } from "../../utils/types.ts";
 import { StreamingToolParser } from "../../tools/parser.ts";
 import { StreamingReasoningTagSanitizer } from "../../utils/reasoning-tags.ts";
@@ -493,6 +494,13 @@ export async function processNonStreamingResponse(
     console.log(
       `[Chat] Response sent | ${usage.prompt_tokens} prompt / ${usage.completion_tokens} completion / ${usage.total_tokens} total tokens`,
     );
+    
+    if (activeAccountId) {
+      const labels = { account: activeAccountId };
+      metrics.increment("tokens.prompt", usage.prompt_tokens, labels);
+      metrics.increment("tokens.completion", usage.completion_tokens, labels);
+      metrics.increment("tokens.total", usage.total_tokens, labels);
+    }
 
     scheduleAssistantComplete(onAssistantComplete, {
       sessionId: logicalSessionId,
@@ -1346,6 +1354,13 @@ export async function processStreamingResponse(
         console.log(
           `[Chat] Response sent | ${usage.prompt_tokens} prompt / ${usage.completion_tokens} completion / ${usage.total_tokens} total tokens`,
         );
+
+        if (activeAccountId) {
+          const labels = { account: activeAccountId };
+          metrics.increment("tokens.prompt", usage.prompt_tokens, labels);
+          metrics.increment("tokens.completion", usage.completion_tokens, labels);
+          metrics.increment("tokens.total", usage.total_tokens, labels);
+        }
       } else {
         if (isToolcallDebugEnabled()) {
           logger.debug(
