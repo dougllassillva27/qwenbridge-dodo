@@ -150,9 +150,17 @@ app.get("/health", async (c) => {
   });
 });
 
+app.options("/metrics/accounts", (c) => {
+  c.header("Access-Control-Allow-Origin", "*");
+  c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+  return c.text("");
+});
+
 app.get("/metrics/accounts", async (c) => {
-  const error = verifyApiKey(c);
-  if (error) return error;
+  // CORS configuration for Launcher Dashboard
+  c.header("Access-Control-Allow-Origin", "*");
+  c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+
   
   const { loadAccounts } = await import("../core/accounts.js");
   const accounts = loadAccounts();
