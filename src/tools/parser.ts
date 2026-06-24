@@ -999,7 +999,15 @@ export class StreamingToolParser {
   }
 
   private isDeclaredToolName(name: string): boolean {
-    return true; // Dodo WAF: Force true to prevent Claude Code from crashing on hallucinated tools
+    // Permissive mode: accept any tool name to prevent crashes from model hallucinations.
+    // When strict validation is needed, pass an empty tools array or override this method.
+    if (this.tools.length === 0) return true;
+
+    // Accept if in the declared list OR if it looks like a generic placeholder name
+    const isGeneric = /^[a-z]\d+$|^t\d+$/i.test(name);
+    if (isGeneric) return true;
+
+    return this.tools.some((tool) => this.getToolName(tool) === name);
   }
 
   private preserveLiteralToolCall(

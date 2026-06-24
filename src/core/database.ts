@@ -106,6 +106,7 @@ function runMigrations(db: Database.Database): void {
       id TEXT PRIMARY KEY,
       email TEXT UNIQUE NOT NULL,
       password TEXT NOT NULL DEFAULT '',
+      cooldown_until INTEGER,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );

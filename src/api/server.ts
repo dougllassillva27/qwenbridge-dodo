@@ -163,22 +163,23 @@ app.get("/metrics/accounts", async (c) => {
 
   
   const { loadAccounts } = await import("../core/accounts.js");
+  const { getAccountCooldownInfo } = await import("../core/account-manager.js");
   const { metrics } = await import("../core/metrics.js");
   const accounts = loadAccounts();
-  const now = Date.now();
-  
+
   const ramUsed = metrics.get("memory.tree.used")?.value || metrics.get("memory.heap.used")?.value || 0;
   const ramMb = Math.round(ramUsed / 1024 / 1024);
   const requestsTotal = metrics.get("requests.total")?.value || 0;
   const streamErrors = metrics.get("streams.errors")?.value || 0;
-  
+
   return c.json({
     total: accounts.length,
     ram_mb: ramMb,
     requests: requestsTotal,
     stream_errors: streamErrors,
     accounts: accounts.map(acc => {
-      const isCooldown = acc.cooldown_until ? acc.cooldown_until > now : false;
+      const cooldownInfo = getAccountCooldownInfo(acc.id);
+      const isCooldown = cooldownInfo?.onCooldown ?? false;
       
       const labels = { account: acc.id };
       const prompt = metrics.get("tokens.prompt", labels)?.value || 0;
@@ -189,7 +190,7 @@ app.get("/metrics/accounts", async (c) => {
         id: acc.id,
         email: acc.email,
         status: isCooldown ? "cooldown" : "active",
-        cooldown_until: acc.cooldown_until,
+        cooldown_until: cooldownInfo?.onCooldown ? new Date(Date.now() + cooldownInfo.remainingMs).toISOString() : undefined,
         tokens: {
           prompt,
           completion,

@@ -16,7 +16,6 @@ import {
   QwenUpstreamError,
   RetryableQwenStreamError,
 } from "../../services/qwen.ts";
-import { metrics } from "../../core/metrics.js";
 import type { OpenAIRequest, Usage } from "../../utils/types.ts";
 import { StreamingToolParser } from "../../tools/parser.ts";
 import { StreamingReasoningTagSanitizer } from "../../utils/reasoning-tags.ts";

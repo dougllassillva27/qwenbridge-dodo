@@ -6,6 +6,7 @@ export interface QwenAccount {
   id: string
   email: string
   password: string
+  cooldown_until?: number
 }
 
 function generateId(email: string): string {
@@ -72,16 +73,21 @@ let accountsCacheTime = 0
 const ACCOUNTS_CACHE_TTL = 5_000
 
 export function loadAccounts(): QwenAccount[] {
-  // Fonte de verdade exclusiva: .env
-  // O banco SQLite é sincronizado via syncEnvAccounts() para manter compatibilidade
-  // com o painel de gestão de contas, mas nunca é consultado para inicialização.
   const now = Date.now()
   if (accountsCache && (now - accountsCacheTime < ACCOUNTS_CACHE_TTL)) return accountsCache
 
   const envAccounts = parseEnvAccounts()
   syncEnvAccounts() // mantém o banco atualizado com as contas do .env
 
-  accountsCache = envAccounts
+  // Se .env tem contas, usa elas; senão fallback para o banco
+  if (envAccounts.length > 0) {
+    accountsCache = envAccounts
+  } else {
+    // Fallback: lê do banco quando .env está vazio
+    const db = getDatabase()
+    const rows = db.prepare('SELECT id, email, password FROM accounts').all() as QwenAccount[]
+    accountsCache = rows
+  }
   accountsCacheTime = now
   return accountsCache
 }
