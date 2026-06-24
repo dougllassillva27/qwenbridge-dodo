@@ -36,3 +36,19 @@ Thumbs.db
 # IDE / Editor
 .kilo
 .roo
+.vscode/
+.idea/
+
+# Binários e executáveis
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Configurações locais
+launcher_config.json
+
+# Logs e dumps
+*.dump
+*.dmp
+crash_*/

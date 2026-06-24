@@ -1,5 +1,9 @@
 import { EventEmitter } from "events";
+import { exec } from "child_process";
+import util from "util";
 import { config } from "./config.js";
+
+const execAsync = util.promisify(exec);
 
 interface MetricPoint {
   value: number;
@@ -45,6 +49,7 @@ export class Metrics extends EventEmitter {
       // Memory metrics
       ["memory.heap.used", "gauge", "Heap memory used (bytes)"],
       ["memory.heap.total", "gauge", "Heap memory total (bytes)"],
+      ["memory.tree.used", "gauge", "Total memory used by process tree (bytes)"],
 
       // Cache metrics
       ["cache.set", "counter", "Cache set operations"],
@@ -183,14 +188,21 @@ export class Metrics extends EventEmitter {
     if (this.collectionInterval) return;
 
     this.collectionInterval = setInterval(() => {
-      this.collectSystemMetrics();
+      this.collectSystemMetrics().catch(() => {});
     }, config.metrics.interval);
   }
 
-  private collectSystemMetrics(): void {
+  private async collectSystemMetrics(): Promise<void> {
     const mem = process.memoryUsage();
     this.gauge("memory.heap.used", mem.heapUsed);
     this.gauge("memory.heap.total", mem.heapTotal);
+
+    try {
+      const treeMemory = await getTreeMemoryUsage();
+      this.gauge("memory.tree.used", treeMemory);
+    } catch (err) {
+      this.gauge("memory.tree.used", mem.rss);
+    }
   }
 
   get(name: string, labels?: Record<string, string>): MetricPoint | null {
@@ -234,3 +246,67 @@ export class Metrics extends EventEmitter {
 }
 
 export const metrics = new Metrics();
+
+async function getTreeMemoryUsage(): Promise<number> {
+  const currentPid = process.pid;
+  try {
+    if (process.platform === 'win32') {
+      const { stdout } = await execAsync(
+        'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, WorkingSetSize | ConvertTo-Json"'
+      );
+      if (!stdout || stdout.trim() === "") {
+        return process.memoryUsage().rss;
+      }
+      
+      let processes;
+      try {
+        processes = JSON.parse(stdout);
+      } catch (e) {
+        return process.memoryUsage().rss;
+      }
+      
+      const procList = Array.isArray(processes) ? processes : [processes];
+      
+      const adj: Record<number, { pid: number; parent: number; memory: number }[]> = {};
+      const selfMap: Record<number, { pid: number; parent: number; memory: number }> = {};
+      
+      for (const proc of procList) {
+        if (!proc || proc.ProcessId === undefined) continue;
+        const pid = proc.ProcessId;
+        const parent = proc.ParentProcessId;
+        const memory = proc.WorkingSetSize || 0;
+        
+        const item = { pid, parent, memory };
+        selfMap[pid] = item;
+        if (!adj[parent]) adj[parent] = [];
+        adj[parent].push(item);
+      }
+      
+      let totalMemory = 0;
+      const queue = [currentPid];
+      const visited = new Set<number>();
+      
+      while (queue.length > 0) {
+        const pid = queue.shift()!;
+        if (visited.has(pid)) continue;
+        visited.add(pid);
+        
+        const selfItem = selfMap[pid];
+        if (selfItem) {
+          totalMemory += selfItem.memory;
+        }
+        
+        const children = adj[pid];
+        if (children) {
+          for (const child of children) {
+            queue.push(child.pid);
+          }
+        }
+      }
+      return totalMemory;
+    }
+  } catch (err) {
+    // Fail silently to avoid clogging console logs
+  }
+  return process.memoryUsage().rss;
+}

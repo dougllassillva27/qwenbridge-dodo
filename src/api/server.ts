@@ -167,7 +167,7 @@ app.get("/metrics/accounts", async (c) => {
   const accounts = loadAccounts();
   const now = Date.now();
   
-  const ramUsed = metrics.get("memory.heap.used")?.value || 0;
+  const ramUsed = metrics.get("memory.tree.used")?.value || metrics.get("memory.heap.used")?.value || 0;
   const ramMb = Math.round(ramUsed / 1024 / 1024);
   const requestsTotal = metrics.get("requests.total")?.value || 0;
   const streamErrors = metrics.get("streams.errors")?.value || 0;

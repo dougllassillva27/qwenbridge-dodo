@@ -430,6 +430,49 @@ QwenBridge/
 
 ---
 
+## Blindagens Dodo (Customizações de Produção)
+
+Este fork inclui customizações exclusivas ("Blindagens Dodo") aplicadas sobre o upstream para garantir estabilidade, performance e resiliência em produção. Qualquer atualização do upstream deve preservar estas modificações.
+
+### Anti-Bot e Captcha (TMD)
+
+- **Resolvedor Modular de Captcha** (`src/services/captcha-solver.ts`) - Pipeline híbrido em 3 etapas: (1) heurística geométrica rápida, (2) fallback DeepSeek Vision via microserviço local `captchaResolve` na porta 50006, (3) alerta físico (beep + MessageBox Windows) após 3 falhas. Simulação humanizada de arraste com 15 passos progressivos e tremores verticais.
+- **Auto-Recuperação de TMD** (`src/services/qwen.ts`, `src/services/playwright.ts`) - Ao detectar `FAIL_SYS_USER_VALIDATE`, captura URL de punição, resolve captcha automaticamente via Playwright, atualiza headers e retenta o completions sem interromper o fluxo.
+- **Preservação de Bypass WAF** (`src/services/playwright.ts`) - `fs.rmSync` comentado em `resetPlaywrightProfile` para preservar cookies e sessões de bypass manual de captcha.
+- **Liberação de Imagens de Captcha** - Filtro de resource blocking adaptado para permitir imagens contendo `captcha`, `alicdn`, `aliyun` ou `_____tmd_____`, garantindo renderização correta dos puzzles.
+
+### Otimizações de Memória e Performance
+
+- **Singleton Browser & Shared Contexts** (`src/services/playwright.ts`) - Substituição de `launchPersistentContext` por `browser.newContext()` com `_state.json` por conta. Redução de ~300MB/conta para ~50MB.
+- **Flags Agressivas de Chromium** - `--disable-gpu`, `--js-flags=--max-old-space-size=256`, janela compacta `500,400`, bloqueio de mídias pesadas via `route.abort()`.
+- **Telemetria de RAM por Process Tree** (`src/core/metrics.ts`) - Métrica `memory.tree.used` via PowerShell `Get-CimInstance Win32_Process` para monitoramento real da árvore de processos (Node.js + Chromium).
+
+### Estabilidade de Streaming
+
+- **Sliding Window Maximum Overlap** (`src/routes/chat/helpers.ts`) - Algoritmo de Maximum Overlap com limiar de 32 caracteres para eliminar duplicação de palavras causada pelo sliding window da Qwen.
+- **Chunks Órfãos sem Phase** (`src/routes/chat/helpers.ts`) - Validação `delta.phase === 'answer' || (delta.phase === undefined && delta.content !== undefined)` para resgatar blocos de texto que chegam sem declaração de fase.
+- **Auto-Recuperador de JSON Quebrado** (`src/utils/json.ts`, `src/tools/parser.ts`) - Regex universais para consertar chaves sem aspas, omissão de `arguments`, e extração brute-force de tool calls malformados. Fallback para "CRITICAL PARSING ERROR" empacotado como tool_use.
+
+### Timeout e Rede
+
+- **Undici 2h Timeout** (`src/index.ts`) - `setGlobalDispatcher(new Agent({ headersTimeout: 7200000, bodyTimeout: 7200000 }))` para processar contextos massivos sem timeout de 5 minutos.
+- **Inicialização Estagiada** (`src/api/server.ts`) - Delay de 2.5s por conta na inicialização em lote para evitar triggers de WAF por concorrência de IP.
+
+### Compatibilidade Anthropic
+
+- **Injeção de `context_window`** (`src/routes/anthropic/index.ts`, `translate.ts`) - Bloco `context_window: { context_length: 1048576, total_output_tokens: X }` injetado em `message_start` e `message_delta` para compatibilidade com ccstatusline e widgets de contexto.
+- **Estimativa CJK-Aware de Tokens** (`src/utils/token-estimator.ts`) - Heurística inteligente: ~4 chars/token para texto não-CJK, ~1 char/token para CJK. Correção para output tokens zerados quando backend retorna `completion_tokens: 0`.
+- **Mapeamento Claude 3/4** (`src/routes/anthropic/translate.ts`) - Suporte nativo a `claude-opus-4-8`, `claude-sonnet-4`, `claude-haiku-4` direcionados para Qwen.
+- **Blocos de Pensamento Translúcidos** - Restauração de `reasoning_content` da Qwen para eventos `thinking` e `thinking_delta` da Anthropic.
+
+### Limpeza e Manutenção
+
+- **Limpeza de Contas Fantasmas** (`src/core/accounts.ts`) - Query agressiva `DELETE FROM accounts WHERE email NOT IN (...)` para sincronizar SQLite com `.env`.
+- **Injeção de Rota Anthropic** (`src/api/server.ts`) - `app.route('', anthropicApp)` para garantir compatibilidade com Claude Code.
+- **Logs com Timestamp Customizado** (`src/index.ts`) - Override de `console.log/warn/error` com formato `[DD/MM/YYYY HH:MM]`.
+
+---
+
 ## Disclaimer
 
 Este projeto é fornecido para fins educacionais e de pesquisa. Use por sua conta e risco.

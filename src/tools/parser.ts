@@ -43,6 +43,77 @@ interface ActiveIncrementalToolCall {
 // ─── XML Helpers ───────────────────────────────────────────────────────────────
 
 const TOOL_END = "</" + "tool_call>";
+const TOOL_SHORT_END = "</" + "tool>";
+
+function matchesCaseInsensitiveAt(buffer: string, index: number, value: string): boolean {
+  if (index + value.length > buffer.length) return false;
+  for (let j = 0; j < value.length; j++) {
+    const c = buffer.charCodeAt(index + j);
+    const t = value.charCodeAt(j);
+    if (c !== t && (c | 0x20) !== (t | 0x20)) return false;
+  }
+  return true;
+}
+
+function findToolEndMatch(buffer: string): { index: number; length: number } | null {
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < buffer.length; i++) {
+    const ch = buffer[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\') { escaped = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString || ch !== '<') continue;
+
+    if (matchesCaseInsensitiveAt(buffer, i, TOOL_END)) {
+      if (matchesCaseInsensitiveAt(buffer, i, "</" + "tool_calls>")) {
+        return { index: i, length: ("</" + "tool_calls>").length };
+      }
+      return { index: i, length: TOOL_END.length };
+    }
+
+    if (matchesCaseInsensitiveAt(buffer, i, TOOL_SHORT_END)) {
+      return { index: i, length: TOOL_SHORT_END.length };
+    }
+
+    // Some editor clients append environment metadata immediately after a model
+    // emits a truncated closing tag, producing values like
+    // `</tool<environment_details>` or `</<environment_details>`. Treat only
+    // those prefixes as closing boundaries; otherwise wait for more chunks.
+    for (const truncatedClose of ['</tool', '</']) {
+      if (matchesCaseInsensitiveAt(buffer, i, truncatedClose) && buffer[i + truncatedClose.length] === '<') {
+        const after = buffer.substring(i + truncatedClose.length);
+        if (startsWithEnvironmentDetails(after)) {
+          return { index: i, length: truncatedClose.length };
+        }
+      }
+    }
+
+    if (matchesCaseInsensitiveAt(buffer, i, '</tool')) {
+      const next = buffer[i + '</tool'.length];
+      if (next !== undefined && next !== '_' && next !== '>') {
+        return { index: i, length: '</tool'.length };
+      }
+    }
+  }
+  return null;
+}
+
+function findRecoverableTailEndMatch(buffer: string): { index: number; length: number } | null {
+  const tags = ["</" + "tool_calls>", TOOL_END, TOOL_SHORT_END];
+  for (const tag of tags) {
+    const index = buffer.toLowerCase().lastIndexOf(tag);
+    if (index !== -1 && index + tag.length === buffer.length) {
+      return { index, length: tag.length };
+    }
+  }
+  return null;
+}
+
+function startsWithEnvironmentDetails(buffer: string): boolean {
+  return /^\s*<environment_details\b/i.test(buffer);
+}
 
 function advanceMarkdownCodeState(
   text: string,
@@ -241,7 +312,7 @@ function findPartialMissingOpenToolCallIndex(
   buffer: string,
   initialDelimiterLength = 0,
 ): number {
-  if (buffer.match(/<\/tool_calls?>/i)) return -1;
+  if (findToolEndMatch(buffer)) return -1;
 
   const candidateStarts = findCandidateStarts(buffer);
   for (const candidateStart of candidateStarts) {
@@ -266,10 +337,10 @@ function findRecoverableMissingOpenToolCall(
   buffer: string,
   initialDelimiterLength = 0,
 ): { textBefore: string; candidate: string; consumeLength: number } | null {
-  const lower = buffer.toLowerCase();
-  const endMatch = lower.match(/<\/tool_calls?>/);
-  const endIdx = endMatch ? endMatch.index! : -1;
-  if (endIdx === -1) return null;
+  const endMatch = findToolEndMatch(buffer);
+  if (!endMatch) return null;
+  const endIdx = endMatch.index;
+  const endLen = endMatch.length;
 
   const beforeEnd = buffer.substring(0, endIdx);
   const candidateStarts = findCandidateStarts(beforeEnd);
@@ -292,7 +363,7 @@ function findRecoverableMissingOpenToolCall(
     return {
       textBefore: beforeEnd.substring(0, candidateStart),
       candidate,
-      consumeLength: endIdx + endMatch![0].length,
+      consumeLength: endIdx + endLen,
     };
   }
 
@@ -1063,20 +1134,20 @@ export class StreamingToolParser {
         }
       } else {
         // Inside tool: look for </tool_call> or </tool_calls>
-        const endMatch = this.buffer.match(/<\/tool_calls?>/i);
+        const endMatch = findToolEndMatch(this.buffer) || findRecoverableTailEndMatch(this.buffer);
         if (endMatch) {
-          const endIdx = endMatch.index!;
+          const endIdx = endMatch.index;
           const content = this.buffer.substring(0, endIdx);
           if (isToolcallDebugEnabled()) {
             logger.debug("[parser] tool_call close tag detected", {
               contentLength: content.length,
               contentPreview: content.substring(0, 300),
               remainingBufferLength:
-                this.buffer.length - endIdx - endMatch[0].length,
+                this.buffer.length - endIdx - endMatch.length,
             });
           }
           this.emitIncrementalToolCallDeltas(content, result);
-          this.buffer = this.buffer.substring(endIdx + endMatch[0].length);
+          this.buffer = this.buffer.substring(endIdx + endMatch.length);
           this.processToolContent(content, result);
           this.insideTool = false;
           this.currentOpenTag = TOOL_START_LITERAL;

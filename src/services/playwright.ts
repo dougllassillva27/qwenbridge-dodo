@@ -295,6 +295,18 @@ export async function initPlaywrightForAccount(
     accountContexts.set(account.id, acctContext);
     accountPages.set(account.id, acctPage);
 
+    // Minimiza janela via CDP (Chrome DevTools Protocol)
+    try {
+      const client = await acctPage.context().newCDPSession(acctPage);
+      const { windowId } = await client.send('Browser.getWindowForTarget');
+      await client.send('Browser.setWindowBounds', {
+        windowId,
+        bounds: { windowState: 'minimized' }
+      });
+    } catch (err) {
+      // Ignora erro se CDP não suportado
+    }
+
     // Salva cookies ao carregar
     acctPage.on('load', saveState);
 
