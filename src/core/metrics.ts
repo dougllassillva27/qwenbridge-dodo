@@ -257,45 +257,45 @@ async function getTreeMemoryUsage(): Promise<number> {
       if (!stdout || stdout.trim() === "") {
         return process.memoryUsage().rss;
       }
-      
+
       let processes;
       try {
         processes = JSON.parse(stdout);
       } catch (e) {
         return process.memoryUsage().rss;
       }
-      
+
       const procList = Array.isArray(processes) ? processes : [processes];
-      
+
       const adj: Record<number, { pid: number; parent: number; memory: number }[]> = {};
       const selfMap: Record<number, { pid: number; parent: number; memory: number }> = {};
-      
+
       for (const proc of procList) {
         if (!proc || proc.ProcessId === undefined) continue;
         const pid = proc.ProcessId;
         const parent = proc.ParentProcessId;
         const memory = proc.WorkingSetSize || 0;
-        
+
         const item = { pid, parent, memory };
         selfMap[pid] = item;
         if (!adj[parent]) adj[parent] = [];
         adj[parent].push(item);
       }
-      
+
       let totalMemory = 0;
       const queue = [currentPid];
       const visited = new Set<number>();
-      
+
       while (queue.length > 0) {
         const pid = queue.shift()!;
         if (visited.has(pid)) continue;
         visited.add(pid);
-        
+
         const selfItem = selfMap[pid];
         if (selfItem) {
           totalMemory += selfItem.memory;
         }
-        
+
         const children = adj[pid];
         if (children) {
           for (const child of children) {
@@ -303,6 +303,30 @@ async function getTreeMemoryUsage(): Promise<number> {
           }
         }
       }
+      return totalMemory;
+    } else if (process.platform === 'linux') {
+      // Linux: use /proc filesystem to calculate tree memory
+      const { stdout } = await execAsync(
+        `ps --ppid ${currentPid} -o pid=,rss=`
+      );
+
+      if (!stdout || stdout.trim() === "") {
+        return process.memoryUsage().rss;
+      }
+
+      let totalMemory = process.memoryUsage().rss;
+      const lines = stdout.trim().split('\n');
+
+      for (const line of lines) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length === 2) {
+          const rss = parseInt(parts[1], 10);
+          if (!isNaN(rss)) {
+            totalMemory += rss * 1024; // Convert KB to bytes
+          }
+        }
+      }
+
       return totalMemory;
     }
   } catch (err) {
