@@ -1,6 +1,6 @@
 /*
  * File: anthropic.ts
- * Project: qwenproxy (QwenBridge fork integrated)
+ * Project: qwenbridge
  * Description: Anthropic Messages API adapter layer
  */
 
@@ -492,7 +492,7 @@ export async function anthropicMessages(c: Context) {
               type: 'error',
               error: {
                 type: 'api_error',
-                message: `QwenProxy Error: ${errMsg}`
+                message: `QwenBridge Error: ${errMsg}`
               }
             });
           } catch (writeErr) {

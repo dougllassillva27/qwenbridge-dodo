@@ -39,6 +39,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Contexto IA local
+_contexto-ia/
+
 # Binários e executáveis
 *.exe
 *.dll
