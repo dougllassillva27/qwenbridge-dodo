@@ -196,13 +196,7 @@ export class Metrics extends EventEmitter {
     const mem = process.memoryUsage();
     this.gauge("memory.heap.used", mem.heapUsed);
     this.gauge("memory.heap.total", mem.heapTotal);
-
-    try {
-      const treeMemory = await getTreeMemoryUsage();
-      this.gauge("memory.tree.used", treeMemory);
-    } catch (err) {
-      this.gauge("memory.tree.used", mem.rss);
-    }
+    this.gauge("memory.tree.used", mem.rss);
   }
 
   get(name: string, labels?: Record<string, string>): MetricPoint | null {
