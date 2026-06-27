@@ -29,4 +29,8 @@ export class Mutex {
 
     this.locked = false;
   }
+
+  get isLocked(): boolean {
+    return this.locked;
+  }
 }

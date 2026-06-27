@@ -29,6 +29,20 @@ function findPartialThinkOpenIndex(buffer: string): number {
   return -1;
 }
 
+function findPartialThinkCloseIndex(buffer: string): number {
+  const lower = buffer.toLowerCase();
+  const idx = lower.lastIndexOf("</think");
+  if (idx !== -1 && lower.indexOf(">", idx) === -1) return idx;
+
+  for (let i = 1; i < THINK_CLOSE_LITERAL.length; i++) {
+    if (lower.endsWith(THINK_CLOSE_LITERAL.substring(0, i))) {
+      return buffer.length - i;
+    }
+  }
+
+  return -1;
+}
+
 export class StreamingReasoningTagSanitizer {
   private buffer = "";
   private insideThink = false;
@@ -54,6 +68,7 @@ export class StreamingReasoningTagSanitizer {
           this.buffer = this.buffer.substring(openIndex + openMatch[0].length);
           this.currentOpenTag = openMatch[0];
           this.insideThink = true;
+          result.detectedThinkTag = true;
           continue;
         }
 
@@ -79,6 +94,13 @@ export class StreamingReasoningTagSanitizer {
         continue;
       }
 
+      const partialCloseIndex = findPartialThinkCloseIndex(this.buffer);
+      const flushIndex =
+        partialCloseIndex === -1 ? this.buffer.length : partialCloseIndex;
+      if (flushIndex > 0) {
+        result.reasoning += this.buffer.substring(0, flushIndex);
+        this.buffer = this.buffer.substring(flushIndex);
+      }
       break;
     }
 
@@ -99,7 +121,7 @@ export class StreamingReasoningTagSanitizer {
     }
 
     if (this.insideThink) {
-      result.text = `${this.currentOpenTag}${this.buffer}`;
+      result.reasoning += this.buffer;
       result.detectedThinkTag = true;
       result.hadMalformedTag = true;
       result.hadUnclosedTag = true;

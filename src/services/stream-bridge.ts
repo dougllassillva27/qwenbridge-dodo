@@ -133,24 +133,35 @@ export async function browserStreamFetch(
   try {
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
+        const safetyTimeout = setTimeout(() => {
+          streamCallbacks.delete(reqId);
+          abortControllers.delete(reqId);
+          try { controller.error(new Error("Stream safety timeout exceeded")); } catch {}
+          bodyReject(new Error("Stream safety timeout exceeded"));
+        }, 600000);
+        safetyTimeout.unref();
+
         const cb = streamCallbacks.get(reqId);
         if (!cb) return;
         cb.onChunk = (chunk: string) => {
           try { controller.enqueue(enc.encode(chunk)); } catch { /* ignore */ }
         };
         cb.onEnd = () => {
+          clearTimeout(safetyTimeout);
           try { controller.close(); } catch { /* ignore */ }
           bodyResolve('');
           streamCallbacks.delete(reqId);
           abortControllers.delete(reqId);
         };
         cb.onError = (msg: string) => {
+          clearTimeout(safetyTimeout);
           try { controller.error(new Error(msg)); } catch { /* ignore */ }
           bodyReject(new Error(msg));
           streamCallbacks.delete(reqId);
           abortControllers.delete(reqId);
         };
         cb.onBody = (text: string) => {
+          clearTimeout(safetyTimeout);
           bodyResolve(text);
           streamCallbacks.delete(reqId);
           abortControllers.delete(reqId);

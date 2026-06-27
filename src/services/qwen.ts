@@ -1363,9 +1363,22 @@ export async function createQwenStream(
       });
     }
   } catch (error) {
-    throw withCreatedChatMetadata(
-      error instanceof Error ? error : new Error(String(error)),
-    );
+    const err = error instanceof Error ? error : new Error(String(error));
+    const errMsg = err.message.toLowerCase();
+    
+    // Identifica quedas de conexao no Playwright ou timeouts no stream
+    const isBrokenStream = errMsg.includes("timeout") || 
+                           errMsg.includes("target closed") || 
+                           errMsg.includes("econnreset") || 
+                           errMsg.includes("aborted") || 
+                           errMsg.includes("fetch failed");
+
+    if (isBrokenStream) {
+      throw withCreatedChatMetadata(
+        new RetryableQwenStreamError(`Stream fetch interrupted: ${err.message}`, 1000)
+      );
+    }
+    throw withCreatedChatMetadata(err);
   } finally {
     clearTimeout(timeoutId);
   }

@@ -81,10 +81,16 @@ class Mutex {
   }
 }
 
+// Per-account browser contexts and pages
+const accountContexts = new Map<string, BrowserContext>();
+const accountPages = new Map<string, Page>();
+const accountLastActivity = new Map<string, number>();
+
 // Per-account mutexes for browser access
 const accountMutexes = new Map<string, Mutex>();
 
 function getAccountMutex(accountId: string): Mutex {
+  accountLastActivity.set(accountId, Date.now());
   let mutex = accountMutexes.get(accountId);
   if (!mutex) {
     mutex = new Mutex();
@@ -95,9 +101,28 @@ function getAccountMutex(accountId: string): Mutex {
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
-// Per-account browser contexts and pages
-const accountContexts = new Map<string, BrowserContext>();
-const accountPages = new Map<string, Page>();
+
+
+setInterval(async () => {
+  const now = Date.now();
+  for (const [accountId, lastTime] of accountLastActivity.entries()) {
+    if (now - lastTime > 15 * 60 * 1000) { // 15 minutos ocioso
+      const page = accountPages.get(accountId);
+      const ctx = accountContexts.get(accountId);
+      if (page || ctx) {
+        logger.info(`[Playwright] Fechando contexto ocioso de: ${accountId}`);
+        accountPages.delete(accountId);
+        accountContexts.delete(accountId);
+        accountLastActivity.delete(accountId);
+        try {
+          if (ctx) await ctx.close();
+        } catch (e) {
+          // ignora
+        }
+      }
+    }
+  }
+}, 60000).unref();
 
 // Header cache per account
 interface AccountHeaderCache {
@@ -220,7 +245,7 @@ async function getOrLaunchBrowser(headless: boolean, browserType: BrowserType) {
         "--disable-gpu",
         "--disable-software-rasterizer",
         "--disable-dev-shm-usage",
-        "--js-flags=--max-old-space-size=256",
+        "--js-flags=--max-old-space-size=128",
         "--window-size=500,400"
       ],
     });
@@ -693,8 +718,10 @@ export function getPlaywrightStatus(): Record<
 
 // ─── Stealth Script ──────────────────────────────────────────────────────────
 
+let cachedStealthScript: string | null = null;
 export function getStealthScript(): string {
-  return `
+  if (cachedStealthScript) return cachedStealthScript;
+  cachedStealthScript = `
     // 1. Webdriver evasion
     try {
       if (navigator.webdriver !== undefined) {
@@ -966,4 +993,5 @@ export function getStealthScript(): string {
       };
     })();
   `;
+  return cachedStealthScript;
 }

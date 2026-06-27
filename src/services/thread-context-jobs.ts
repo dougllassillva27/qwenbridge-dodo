@@ -25,6 +25,16 @@ const queue: SummaryJob[] = [];
 const queuedSessions = new Set<string>();
 const runningSessions = new Set<string>();
 const lastStartedAt = new Map<string, number>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, time] of lastStartedAt.entries()) {
+    if (now - time > 3600000) { // 1 hora
+      lastStartedAt.delete(key);
+    }
+  }
+}, 3600000).unref();
+
 let activeWorkers = 0;
 
 function shouldRunSummary(sessionId: string, force: boolean): boolean {

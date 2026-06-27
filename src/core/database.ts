@@ -91,7 +91,7 @@ export function getDatabase(): Database.Database {
   db.pragma("journal_mode = WAL");
   db.pragma("busy_timeout = 5000");
   db.pragma("synchronous = NORMAL");
-  db.pragma("cache_size = -64000"); // 64MB cache
+  db.pragma("cache_size = -8000"); // 8MB cache
   db.pragma("foreign_keys = ON");
 
   runMigrations(db);

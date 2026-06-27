@@ -77,6 +77,10 @@ function findToolEndMatch(buffer: string): { index: number; length: number } | n
       return { index: i, length: TOOL_SHORT_END.length };
     }
 
+    if (matchesCaseInsensitiveAt(buffer, i, "</skill>")) {
+      return { index: i, length: 8 };
+    }
+
     // Some editor clients append environment metadata immediately after a model
     // emits a truncated closing tag, producing values like
     // `</tool<environment_details>` or `</<environment_details>`. Treat only
@@ -101,7 +105,7 @@ function findToolEndMatch(buffer: string): { index: number; length: number } | n
 }
 
 function findRecoverableTailEndMatch(buffer: string): { index: number; length: number } | null {
-  const tags = ["</" + "tool_calls>", TOOL_END, TOOL_SHORT_END];
+  const tags = ["</" + "tool_calls>", TOOL_END, TOOL_SHORT_END, "</skill>"];
   for (const tag of tags) {
     const index = buffer.toLowerCase().lastIndexOf(tag);
     if (index !== -1 && index + tag.length === buffer.length) {
@@ -177,7 +181,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
     }
 
     if (delimiterLength === 0) {
-      const match = buffer.substring(i).match(/^<tool_calls?\b[^>]*>/i);
+      const match = buffer.substring(i).match(/^<(?:tool_calls?|skill)\b[^>]*>/i);
       if (match) {
         return { index: i, openTag: match[0] };
       }
@@ -222,7 +226,10 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
       if (tailLower.startsWith("<tool_call") && tailLower.indexOf(">") === -1) {
         return i;
       }
-      if (lowerToolStart.startsWith(tailLower) || "<tool_calls>".startsWith(tailLower)) {
+      if (tailLower.startsWith("<skill") && tailLower.indexOf(">") === -1) {
+        return i;
+      }
+      if (lowerToolStart.startsWith(tailLower) || "<tool_calls>".startsWith(tailLower) || "<skill>".startsWith(tailLower)) {
         return i;
       }
     }
@@ -921,11 +928,12 @@ export class StreamingToolParser {
     if (!snapshot) return;
 
     if (snapshot.name && !incremental.name) {
-      if (!this.isDeclaredToolName(snapshot.name)) {
+      const resolved = this.resolveToolName(snapshot.name);
+      if (!resolved) {
         incremental.disabled = true;
         return;
       }
-      incremental.name = snapshot.name;
+      incremental.name = resolved;
     }
 
     if (
@@ -998,16 +1006,39 @@ export class StreamingToolParser {
     this.advanceMarkdownState(text);
   }
 
-  private isDeclaredToolName(name: string): boolean {
-    // Permissive mode: accept any tool name to prevent crashes from model hallucinations.
-    // When strict validation is needed, pass an empty tools array or override this method.
-    if (this.tools.length === 0) return true;
+  private resolveToolName(name: string): string | null {
+    if (!name) return null;
+    if (this.tools.length === 0) return name;
 
-    // Accept if in the declared list OR if it looks like a generic placeholder name
     const isGeneric = /^[a-z]\d+$|^t\d+$/i.test(name);
-    if (isGeneric) return true;
+    if (isGeneric) return name;
 
-    return this.tools.some((tool) => this.getToolName(tool) === name);
+    const lowerName = name.toLowerCase();
+    const snakeName = name.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+    const noUnderscore = name.replace(/_/g, '').toLowerCase();
+
+    // First pass: Exact match
+    for (const tool of this.tools) {
+      const toolName = this.getToolName(tool);
+      if (!toolName) continue;
+      if (toolName === name) return toolName;
+    }
+
+    // Second pass: Fuzzy match, ignoring namespace prefixes
+    for (const tool of this.tools) {
+      const toolName = this.getToolName(tool);
+      if (!toolName) continue;
+      const strippedTool = toolName.includes(':') ? toolName.split(':').pop()! : toolName;
+      const lowerStripped = strippedTool.toLowerCase();
+      if (lowerStripped === lowerName) return toolName;
+      if (lowerStripped === snakeName) return toolName;
+      if (strippedTool.replace(/_/g, '').toLowerCase() === noUnderscore) return toolName;
+    }
+    return null;
+  }
+
+  private isDeclaredToolName(name: string): boolean {
+    return this.resolveToolName(name) !== null;
   }
 
   private preserveLiteralToolCall(
@@ -1350,7 +1381,8 @@ export class StreamingToolParser {
       this.tools,
     );
     if (xmlParsed) {
-      if (!this.isDeclaredToolName(xmlParsed.name)) {
+      const resolved = this.resolveToolName(xmlParsed.name);
+      if (!resolved) {
         this.preserveLiteralToolCall(
           content,
           result,
@@ -1358,6 +1390,7 @@ export class StreamingToolParser {
         );
         return;
       }
+      xmlParsed.name = resolved;
       if (isToolcallDebugEnabled()) {
         logger.debug(
           "[parser] processToolContent: XML parameter format parsed successfully",
@@ -1394,19 +1427,11 @@ export class StreamingToolParser {
             (tc: ParsedToolCall | null): tc is ParsedToolCall => tc !== null,
           );
 
-        const undeclaredToolNames = parsedCalls
-          .map((tc) => tc.name)
-          .filter((name) => !this.isDeclaredToolName(name));
-        if (undeclaredToolNames.length > 0) {
-          this.preserveLiteralToolCall(
-            content,
-            result,
-            `undeclared tool names in array: ${undeclaredToolNames.join(", ")}`,
-          );
-          return;
-        }
-
         for (const tc of parsedCalls) {
+          if (tc.name) {
+            const resolved = this.resolveToolName(tc.name);
+            if (resolved) tc.name = resolved;
+          }
           if (isToolcallDebugEnabled()) {
             logger.debug("[parser] processToolContent: array item parsed", {
               name: tc.name,
@@ -1435,19 +1460,11 @@ export class StreamingToolParser {
       }
       const tcs = this.parseToolContent(t);
       if (tcs.length > 0) {
-        const undeclaredToolNames = tcs
-          .map((tc) => tc.name)
-          .filter((name) => !this.isDeclaredToolName(name));
-        if (undeclaredToolNames.length > 0) {
-          this.preserveLiteralToolCall(
-            content,
-            result,
-            `undeclared tool names: ${undeclaredToolNames.join(", ")}`,
-          );
-          return;
-        }
-
         for (const tc of tcs) {
+          if (tc.name) {
+            const resolved = this.resolveToolName(tc.name);
+            if (resolved) tc.name = resolved;
+          }
           // Check for tool name from opening tag attribute
           if (!tc.name || tc.name === "") {
             const attrName = extractToolName(this.currentOpenTag, t);
@@ -1544,16 +1561,9 @@ export class StreamingToolParser {
       this.tools,
     );
     if (xmlParsed) {
-      if (!this.isDeclaredToolName(xmlParsed.name)) {
-        if (isToolcallDebugEnabled()) {
-          logger.debug(
-            "[parser] tryRecoverToolCall: rejecting undeclared XML tool name",
-            {
-              name: xmlParsed.name,
-            },
-          );
-        }
-        return null;
+      const resolved = this.resolveToolName(xmlParsed.name);
+      if (resolved) {
+        xmlParsed.name = resolved;
       }
       if (isToolcallDebugEnabled()) {
         logger.debug("[parser] tryRecoverToolCall: full XML parse succeeded", {
@@ -1575,16 +1585,9 @@ export class StreamingToolParser {
       this.tools,
     );
     if (recovered) {
-      if (!this.isDeclaredToolName(recovered.name)) {
-        if (isToolcallDebugEnabled()) {
-          logger.debug(
-            "[parser] tryRecoverToolCall: rejecting undeclared recoverable XML tool name",
-            {
-              name: recovered.name,
-            },
-          );
-        }
-        return null;
+      const resolved = this.resolveToolName(recovered.name);
+      if (resolved) {
+        recovered.name = resolved;
       }
       if (isToolcallDebugEnabled()) {
         logger.debug(
@@ -1609,7 +1612,8 @@ export class StreamingToolParser {
       const attrName = extractToolName(this.currentOpenTag, block);
       if (attrName && !first.name) first.name = attrName;
       if (first.name) {
-        if (!this.isDeclaredToolName(first.name)) {
+        const resolved = this.resolveToolName(first.name);
+        if (!resolved) {
           if (isToolcallDebugEnabled()) {
             logger.debug(
               "[parser] tryRecoverToolCall: rejecting undeclared JSON tool name",
@@ -1620,6 +1624,7 @@ export class StreamingToolParser {
           }
           return null;
         }
+        first.name = resolved;
         if (isToolcallDebugEnabled()) {
           logger.debug("[parser] tryRecoverToolCall: JSON parse succeeded", {
             name: first.name,

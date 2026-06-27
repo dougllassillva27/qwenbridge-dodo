@@ -4,6 +4,7 @@
  */
 
 import { Context } from "hono";
+import { Readable } from "stream";
 import { getBasicHeaders, isAuthMockEnabled } from "../services/auth-http.ts";
 import { v4 as uuidv4 } from "uuid";
 import { ValidationError, ServiceUnavailable } from "../core/errors.js";
@@ -361,7 +362,7 @@ async function getSTSToken(
  * Upload file to Alibaba Cloud OSS using STS credentials
  */
 async function uploadToOSS(
-  fileBuffer: ArrayBuffer | Buffer,
+  fileData: ArrayBuffer | Buffer | ReadableStream,
   stsData: STSResponse["data"],
   filename: string,
 ): Promise<string> {
@@ -396,14 +397,21 @@ async function uploadToOSS(
     refreshSTSTokenInterval: 300000,
   });
 
-  const buffer = Buffer.isBuffer(fileBuffer)
-    ? fileBuffer
-    : Buffer.from(fileBuffer);
   const contentType = detectFileType(filename).mime;
 
-  await client.put(file_path, buffer, {
-    headers: { "Content-Type": contentType },
-  });
+  if (fileData instanceof ReadableStream) {
+    const nodeStream = Readable.fromWeb(fileData as any);
+    await (client as any).putStream(file_path, nodeStream, {
+      headers: { "Content-Type": contentType },
+    });
+  } else {
+    const buffer = Buffer.isBuffer(fileData)
+      ? fileData
+      : Buffer.from(fileData);
+    await client.put(file_path, buffer, {
+      headers: { "Content-Type": contentType },
+    });
+  }
 
   return file_url.split("?")[0];
 }
@@ -483,8 +491,8 @@ export async function uploadFile(c: Context) {
       qwenFileType,
       headers,
     );
-    const fileBuffer = await file.arrayBuffer();
-    const fileUrl = await uploadToOSS(fileBuffer, stsData, file.name);
+    const fileStream = file.stream();
+    const fileUrl = await uploadToOSS(fileStream, stsData, file.name);
 
     return c.json({
       url: fileUrl,

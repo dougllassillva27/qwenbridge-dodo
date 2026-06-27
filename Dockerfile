@@ -20,7 +20,7 @@ USER pwuser
 VOLUME ["/app/data", "/app/qwen_profiles"]
 
 EXPOSE 3000
-ENV NODE_ENV=production PORT=3000
+ENV NODE_ENV=production PORT=3000 NODE_OPTIONS="--max-old-space-size=512 --expose-gc --max-semi-space-size=16"
 
 # Use dumb-init to avoid zombie processes from Playwright
 ENTRYPOINT ["/usr/bin/dumb-init", "--"]
