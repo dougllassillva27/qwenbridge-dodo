@@ -224,6 +224,13 @@ async function getOrLaunchBrowser(headless: boolean, browserType: BrowserType) {
     const { engine, channel } = resolveBrowserEngine(browserType);
     const engineToUse = chromiumWithStealth || engine;
 
+    // Lê posição da janela do launcher para forçar chromes no mesmo monitor
+    const launcherX = process.env.LAUNCHER_WINDOW_X;
+    const launcherY = process.env.LAUNCHER_WINDOW_Y;
+    const windowPosition = (launcherX && launcherY)
+      ? `--window-position=${launcherX},${launcherY}`
+      : "--window-position=0,0";
+
     globalBrowser = await engineToUse.launch({
       headless,
       channel,
@@ -246,7 +253,8 @@ async function getOrLaunchBrowser(headless: boolean, browserType: BrowserType) {
         "--disable-software-rasterizer",
         "--disable-dev-shm-usage",
         "--js-flags=--max-old-space-size=128",
-        "--window-size=500,400"
+        "--window-size=500,400",
+        windowPosition
       ],
     });
     return globalBrowser;

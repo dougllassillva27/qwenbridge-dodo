@@ -47,7 +47,7 @@ export function buildToolInstructions(
     '4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.\n' +
     "5. If you need to use a tool, do it IMMEDIATELY without preamble.\n" +
     "6. After outputting tool call blocks, you MUST STOP and wait for tool responses. NEVER continue generating on your own.\n" +
-    "7. ONLY use tool names that are explicitly defined in the instructions. NEVER invent, guess, rename, or approximate tool names. Tool names vary by editor/integration; do not require generic names like read_file, edit_file, write_file, or apply_patch to exist. If a tool is not listed, it does not exist.\n" +
+    "7. ONLY use tool names that are explicitly defined in the instructions. NEVER invent, guess, rename, or approximate tool names. Tool names vary by editor/integration; do not require generic names like read_file, edit_file, write_file, apply_patch, Monitor, or SendMessage to exist. If you need to wait, sleep, or monitor a task, DO NOT invent a 'Monitor' tool. Use the provided tools (e.g., ScheduleWakeup) or just output text asking the user to wait. If a tool is not listed, it does not exist.\n" +
     "8. Maximum 3 tool calls per response. After 3 calls, STOP immediately and wait for the user to process them.\n\n";
 
   if (

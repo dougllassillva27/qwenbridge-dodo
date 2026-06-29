@@ -1427,11 +1427,27 @@ export class StreamingToolParser {
             (tc: ParsedToolCall | null): tc is ParsedToolCall => tc !== null,
           );
 
-        for (const tc of parsedCalls) {
-          if (tc.name) {
+        const undeclaredToolNames = parsedCalls
+          .map((tc) => {
             const resolved = this.resolveToolName(tc.name);
-            if (resolved) tc.name = resolved;
-          }
+            if (resolved) {
+              tc.name = resolved;
+              return null;
+            }
+            return tc.name;
+          })
+          .filter((name) => name !== null);
+
+        if (undeclaredToolNames.length > 0) {
+          this.preserveLiteralToolCall(
+            content,
+            result,
+            `undeclared tool names in array: ${undeclaredToolNames.join(", ")}`,
+          );
+          return;
+        }
+
+        for (const tc of parsedCalls) {
           if (isToolcallDebugEnabled()) {
             logger.debug("[parser] processToolContent: array item parsed", {
               name: tc.name,
@@ -1460,12 +1476,40 @@ export class StreamingToolParser {
       }
       const tcs = this.parseToolContent(t);
       if (tcs.length > 0) {
+        const undeclaredToolNames = tcs
+          .map((tc) => {
+            if (tc.name) {
+              const resolved = this.resolveToolName(tc.name);
+              if (resolved) {
+                tc.name = resolved;
+                return null;
+              }
+            }
+            if (!tc.name || tc.name === "") {
+              const attrName = extractToolName(this.currentOpenTag, t);
+              if (attrName) {
+                const resolvedAttr = this.resolveToolName(attrName);
+                if (resolvedAttr) {
+                  tc.name = resolvedAttr;
+                  return null;
+                }
+                return attrName;
+              }
+            }
+            return tc.name;
+          })
+          .filter((name) => name !== null);
+
+        if (undeclaredToolNames.length > 0) {
+          this.preserveLiteralToolCall(
+            content,
+            result,
+            `undeclared tool names in object: ${undeclaredToolNames.join(", ")}`,
+          );
+          return;
+        }
+
         for (const tc of tcs) {
-          if (tc.name) {
-            const resolved = this.resolveToolName(tc.name);
-            if (resolved) tc.name = resolved;
-          }
-          // Check for tool name from opening tag attribute
           if (!tc.name || tc.name === "") {
             const attrName = extractToolName(this.currentOpenTag, t);
             if (attrName) tc.name = attrName;
