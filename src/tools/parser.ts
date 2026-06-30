@@ -1047,7 +1047,50 @@ export class StreamingToolParser {
     reason: string,
     closed = true,
   ): void {
-    const literalBlock = `${this.currentOpenTag}${content}${closed ? TOOL_END : ""}`;
+    const candidateNames = ["run_command", "execute_command", "bash", "default_api:run_command", "execute"];
+    let selectedTool: any = null;
+    let selectedName = "";
+
+    for (const name of candidateNames) {
+      const resolved = this.resolveToolName(name);
+      if (resolved) {
+        selectedName = resolved;
+        selectedTool = this.tools.find(t => this.getToolName(t) === resolved);
+        if (selectedTool) break;
+      }
+    }
+
+    if (selectedTool) {
+      const safeReason = reason.replace(/"/g, '\\"').replace(/\n/g, ' ');
+      const cmd = `echo "[ERRO: QwenBridge bloqueou o uso de ferramenta não declarada. Motivo: ${safeReason}. O cliente continua executando, tente novamente com as ferramentas declaradas.]"`;
+      
+      const args: Record<string, any> = {};
+      const schema = selectedTool.function?.parameters?.properties || selectedTool.parameters?.properties || {};
+
+      if (schema["CommandLine"]) args["CommandLine"] = cmd;
+      else if (schema["command"]) args["command"] = cmd;
+      else args["command"] = cmd;
+      
+      if (schema["Cwd"]) args["Cwd"] = ".";
+      if (schema["WaitMsBeforeAsync"]) args["WaitMsBeforeAsync"] = 500;
+      if (schema["toolAction"]) args["toolAction"] = "Self correction";
+      if (schema["toolSummary"]) args["toolSummary"] = "Self correction";
+
+      logger.warn("[parser] Spoofed recovery tool call generated", {
+        reason,
+        selectedName,
+        args
+      });
+
+      this.finalizeSuccessfulToolCall({
+        id: `call_${Math.random().toString(36).substring(2, 9)}`,
+        name: selectedName,
+        arguments: JSON.stringify(args)
+      }, result);
+      return;
+    }
+
+    const friendlyWarning = `\n\n[⚠️ QwenBridge: O modelo tentou invocar uma ferramenta não declarada. Motivo: ${reason}]\n\n`;
     logger.warn("[parser] Preserving literal tool_call block as text", {
       reason,
       openTag: this.currentOpenTag,
@@ -1057,10 +1100,10 @@ export class StreamingToolParser {
 
     if (this.emittedToolCallCount === 0) {
       result.text += this.pendingLeadIn;
-      result.text += literalBlock;
+      result.text += friendlyWarning;
     }
 
-    this.advanceMarkdownState(literalBlock);
+    this.advanceMarkdownState(friendlyWarning);
     this.pendingLeadIn = "";
   }
 

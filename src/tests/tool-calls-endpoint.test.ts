@@ -369,7 +369,8 @@ test("non-stream: undeclared tool name in literal example is preserved as text",
 
     const body = await res.json();
     const message = body.choices[0].message;
-    assert.strictEqual(message.content, literal);
+    const friendlyWarning = `\n\n[⚠️ QwenBridge: O modelo tentou invocar uma ferramenta não declarada. Motivo: undeclared tool names in object: nome_da_ferramenta]\n\n`;
+    assert.strictEqual(message.content, friendlyWarning);
     assert.strictEqual(message.tool_calls, undefined);
     assert.strictEqual(body.choices[0].finish_reason, "stop");
   } finally {

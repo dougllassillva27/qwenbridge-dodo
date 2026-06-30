@@ -231,7 +231,8 @@ test("StreamingToolParser: preserves literal tool_call block when tool name is u
     '<tool_call>{"name":"nome_da_ferramenta","arguments":{"parametro":"valor"}}</tool_call>';
 
   const result = parser.feed(literal);
-  assert.strictEqual(result.text, literal);
+  const friendlyWarning = `\n\n[⚠️ QwenBridge: O modelo tentou invocar uma ferramenta não declarada. Motivo: undeclared tool names in object: nome_da_ferramenta]\n\n`;
+  assert.strictEqual(result.text, friendlyWarning);
   assert.strictEqual(result.toolCalls.length, 0);
 });
 
