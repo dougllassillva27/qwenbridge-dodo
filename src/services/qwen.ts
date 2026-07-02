@@ -811,6 +811,8 @@ export interface QwenFileEntry {
   [key: string]: any;
 }
 
+
+
 async function createQwenChatSession(
   headers: Record<string, string>,
   model: string,
@@ -1160,11 +1162,7 @@ export async function createQwenStream(
   let chatSessionId: string | null | undefined;
   if (options && "chatSessionId" in options) {
     if (options.chatSessionId === null || options.chatSessionId === "") {
-      chatSessionId = await acquireNewQwenChatSession(
-        headers,
-        model,
-        accountId,
-      );
+      chatSessionId = await acquireNewQwenChatSession(headers, model, accountId);
       createdNewChat = true;
     } else {
       chatSessionId = options.chatSessionId;
@@ -1172,11 +1170,7 @@ export async function createQwenStream(
   } else {
     chatSessionId = captured.chatSessionId;
     if (!chatSessionId) {
-      chatSessionId = await acquireNewQwenChatSession(
-        headers,
-        model,
-        accountId,
-      );
+      chatSessionId = await acquireNewQwenChatSession(headers, model, accountId);
       createdNewChat = true;
     }
   }

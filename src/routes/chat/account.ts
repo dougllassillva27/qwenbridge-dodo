@@ -703,17 +703,26 @@ async function tryCreateStreamWithRetry(
     if (isAntiBot) {
       if (config.playwright.enabled) {
         try {
-          const { refreshHeaders, isPlaywrightInitialized } =
+          const { refreshHeaders, isPlaywrightInitialized, initPlaywrightForAccount } =
             await import("../../services/playwright.ts");
+            
+          if (!isPlaywrightInitialized(accountId)) {
+            console.log(`[Playwright] Resurrecting browser for ${accountEmail} due to anti-bot...`);
+            const targetAccount = accounts.find(a => a.id === accountId);
+            if (targetAccount) {
+              await initPlaywrightForAccount(targetAccount, true);
+            }
+          }
+
           if (isPlaywrightInitialized(accountId)) {
             console.log(
               `[Playwright] Refreshing headers for ${accountEmail} due to anti-bot...`,
             );
             await refreshHeaders(accountId);
-            // Deu anti-bot mesmo com Playwright ativo — cooldown curto e rotaciona
+            // Deu anti-bot mesmo com Playwright ativo (ou recém-ativo) — cooldown curto e rotaciona
             console.warn(
-              `[Chat] Anti-bot persisted after header refresh for ${accountEmail}. ` +
-              `Applying 30s cooldown and rotating to next account.`,
+              `[Chat] Anti-bot headers refreshed for ${accountEmail}. ` +
+              `Applying 30s cooldown and rotating to next account to wait for propagation.`,
             );
             markAccountRateLimited(accountId, 30_000, "AntiBotCooldown");
             return { success: false, error: err };
@@ -724,7 +733,7 @@ async function tryCreateStreamWithRetry(
           );
         }
       }
-      // Playwright desabilitado ou não inicializado: cooldown curto e rotaciona
+      // Se falhou ao inicializar ou playwright está desabilitado
       console.warn(
         `[Chat] Anti-bot for ${accountEmail} without Playwright. Applying 30s cooldown.`,
       );

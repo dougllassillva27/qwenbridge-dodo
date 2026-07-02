@@ -1085,7 +1085,7 @@ export class StreamingToolParser {
       this.finalizeSuccessfulToolCall({
         id: `call_${Math.random().toString(36).substring(2, 9)}`,
         name: selectedName,
-        arguments: JSON.stringify(args)
+        arguments: args as Record<string, unknown>
       }, result);
       return;
     }

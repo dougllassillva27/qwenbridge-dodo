@@ -602,11 +602,15 @@ async function captureHeaders(accountId: string): Promise<void> {
 
         // Type something and send to trigger header capture
         const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
-        await page.focus(inputSelector);
-        await page.fill(inputSelector, "");
-        await page.type(inputSelector, "a", { delay: 100 });
-        await sleep(500);
-        await page.keyboard.press("Enter");
+        try {
+          await page.focus(inputSelector, { timeout: 5000 });
+          await page.fill(inputSelector, "");
+          await page.type(inputSelector, "a", { delay: 100 });
+          await sleep(500);
+          await page.keyboard.press("Enter");
+        } catch (inputErr: any) {
+          console.warn(`[Playwright] Could not interact with input for ${accountId}: ${inputErr.message}`);
+        }
         
         // Wait to see if a captcha appears after sending
         await sleep(2000);
@@ -621,11 +625,15 @@ async function captureHeaders(accountId: string): Promise<void> {
             console.log(`[Playwright] Captcha solved via microservice! Retrying request to capture fresh headers...`);
             await page.waitForSelector(inputSelector, { state: 'visible', timeout: 10000 }).catch(() => {});
             await sleep(2000);
-            await page.focus(inputSelector);
-            await page.fill(inputSelector, "");
-            await page.type(inputSelector, "b", { delay: 100 });
-            await page.keyboard.press("Enter");
-            await sleep(2000);
+            try {
+              await page.focus(inputSelector, { timeout: 5000 });
+              await page.fill(inputSelector, "");
+              await page.type(inputSelector, "b", { delay: 100 });
+              await page.keyboard.press("Enter");
+              await sleep(2000);
+            } catch (inputErr: any) {
+              console.warn(`[Playwright] Could not interact with input after captcha for ${accountId}: ${inputErr.message}`);
+            }
           } else {
             console.warn(`[Playwright] Microservice solve failed for ${accountId}, waiting remaining time for manual fallback...`);
           }
@@ -654,11 +662,40 @@ async function refreshHeadersInternal(accountId: string): Promise<void> {
   cookieCaches.delete(accountId);
 
   cache.refreshInProgress = true;
+  await maximizePlaywrightWindow(accountId);
   try {
     await captureHeaders(accountId);
   } finally {
+    await minimizePlaywrightWindow(accountId);
     cache.refreshInProgress = false;
   }
+}
+
+export async function minimizePlaywrightWindow(accountId: string) {
+  const page = accountPages.get(accountId);
+  if (!page) return;
+  try {
+    const client = await page.context().newCDPSession(page);
+    const { windowId } = await client.send('Browser.getWindowForTarget');
+    await client.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: { windowState: 'minimized' }
+    });
+  } catch (err) {}
+}
+
+export async function maximizePlaywrightWindow(accountId: string) {
+  const page = accountPages.get(accountId);
+  if (!page) return;
+  try {
+    const client = await page.context().newCDPSession(page);
+    const { windowId } = await client.send('Browser.getWindowForTarget');
+    await client.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: { windowState: 'normal' }
+    });
+    await page.bringToFront();
+  } catch (err) {}
 }
 
 export async function refreshHeaders(accountId: string): Promise<void> {
