@@ -76,8 +76,14 @@ function syncEnvAccounts(): void {
   `);
 
   const sync = db.transaction(() => {
+    const envEmails = accounts.map(a => a.email);
     for (const acc of accounts) {
       upsert.run(acc.id, acc.email, encrypt(acc.password));
+    }
+
+    if (envEmails.length > 0) {
+      const placeholders = envEmails.map(() => '?').join(',');
+      db.prepare(`DELETE FROM accounts WHERE email NOT IN (${placeholders})`).run(...envEmails);
     }
   });
 

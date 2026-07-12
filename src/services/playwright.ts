@@ -138,7 +138,7 @@ function touchAccountActivity(accountId: string): void {
 function getStealthScript(profile: FingerprintProfile): string {
   const profileJson = JSON.stringify(profile).replace(/</g, "\\u003c");
   return `
-    const __qwenFingerprint = ${profileJson};
+    const __qwenFingerprint = %%FINGERPRINT%%;
 
     // navigator.webdriver
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -398,13 +398,22 @@ export async function initPlaywrightForAccount(
     const profilePath = path.resolve("data", "qwen_profiles", account.id);
     const fingerprint = getFingerprintProfile(account.id);
     const { engine, channel } = resolveBrowserEngine(browserType);
-
+    
     console.log(
       `🚀 [Playwright] Launching ${browserType} for ${maskEmail(account.email)}...`,
     );
 
     // Use playwright-extra with stealth if available, otherwise regular chromium
     const engineToUse = chromiumWithStealth || engine;
+    
+    let targetX = 0;
+    let targetY = 0;
+    if (process.env.LAUNCHER_WINDOW_X && process.env.LAUNCHER_WINDOW_Y) {
+        const cx = parseInt(process.env.LAUNCHER_WINDOW_X, 10);
+        const cy = parseInt(process.env.LAUNCHER_WINDOW_Y, 10);
+        targetX = Math.floor(cx - 400); // Centraliza horizontalmente (800/2)
+        targetY = Math.floor(cy - 550); // Desce mais 30px (agora -550)
+    }
 
     const acctContext = await engineToUse.launchPersistentContext(profilePath, {
       headless,
@@ -412,8 +421,8 @@ export async function initPlaywrightForAccount(
       userAgent: fingerprint.userAgent,
       locale: fingerprint.locale,
       timezoneId: fingerprint.timezoneId,
-      viewport: fingerprint.viewport,
-      screen: fingerprint.viewport,
+      viewport: { width: 800, height: 800 },
+      screen: { width: 800, height: 800 },
       extraHTTPHeaders: {
         "sec-ch-ua": fingerprint.secChUa,
         "sec-ch-ua-mobile": "?0",
@@ -429,12 +438,15 @@ export async function initPlaywrightForAccount(
         "--no-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
-        `--window-size=${fingerprint.viewport.width},${fingerprint.viewport.height}`,
         "--disable-extensions",
         "--disable-background-networking",
         "--disable-sync",
         "--metrics-recording-only",
         "--mute-audio",
+        "--js-flags=--max-old-space-size=128",
+        "--window-size=800,800",
+        ...(process.env.LAUNCHER_WINDOW_X ? [`--window-position=${targetX},${targetY}`] : ["--window-position=0,0"]),
+        "--start-minimized",
       ],
     });
 
@@ -1128,3 +1140,15 @@ export function getPlaywrightStatus(): Record<
   }
   return status;
 }
+
+// [Dodo] Playwright Idle Memory Cleaner (3 horas)
+setInterval(() => {
+  if (closingAllPlaywright) return;
+  const now = Date.now();
+  for (const [accountId, lastActive] of lastAccountActivity.entries()) {
+    if (now - lastActive > 3 * 60 * 60 * 1000) {
+      console.log(`🧹 [Dodo] Fechando Playwright inativo (3h+): ${accountId}`);
+      closePlaywrightForAccount(accountId).catch(() => {});
+    }
+  }
+}, 60 * 60 * 1000); // Roda a cada 1 hora

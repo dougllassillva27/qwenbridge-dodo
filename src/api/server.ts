@@ -107,13 +107,63 @@ app.get("/health", async (c) => {
   });
 });
 
-app.get("/metrics", (c) => {
+const accountsHandler = async (c: any) => {
+  const { loadAccounts } = await import("../core/accounts.ts");
+  const { getCooldownStatus } = await import("../core/account-manager.ts");
+  const { getPlaywrightStatus } = await import("../services/playwright.ts");
+
+  const accounts = loadAccounts();
+  const cooldowns = getCooldownStatus();
+  const playwrights = getPlaywrightStatus();
+
+  return c.json({
+    accounts: accounts.map((a) => {
+      const cooldownInfo = cooldowns[a.id];
+      return {
+        email: a.email,
+        id: a.id,
+        status: cooldownInfo ? "cooldown" : "active",
+        cooldown_until: cooldownInfo ? Date.now() + cooldownInfo.remainingMs : null,
+        tokens: { prompt: 0, completion: 0, total: 0 },
+        playwright: playwrights[a.id] || { initialized: false, hasHeaders: false },
+      };
+    }),
+    total: accounts.length,
+    requests: 0,
+    ram_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    stream_errors: 0,
+    timestamp: Date.now(),
+  }, 200, {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, OPTIONS",
+  });
+};
+
+app.options("/metrics/accounts", (c) => {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+    },
+  });
+});
+app.get("/accounts", accountsHandler);
+app.get("/v1/accounts", accountsHandler);
+app.get("/api/accounts", accountsHandler);
+app.get("/metrics/accounts", accountsHandler);
+
+const metricsHandler = (c: any) => {
   const error = verifyApiKey(c);
   if (error) return error;
   return c.text(metrics.formatPrometheus(), {
     headers: { "Content-Type": "text/plain; version=0.0.4" },
   });
-});
+};
+
+app.get("/metrics", metricsHandler);
+app.get("/v1/metrics", metricsHandler);
+app.get("/api/metrics", metricsHandler);
 
 app.onError((err, c) => {
   const requestId = c.req.header("X-Request-Id") || "unknown";

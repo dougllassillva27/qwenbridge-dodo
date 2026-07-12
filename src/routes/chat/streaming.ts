@@ -190,11 +190,11 @@ export async function processNonStreamingResponse(
     let lastThinkingSummary = "";
     let lastThinkingSummaryLength = 0;
     let lastThinkingSummarySuffix = "";
-    let reasoningBuffer = "";
+    const reasoningBuffer: string[] = [];
     let lastRawContent = "";
     let lastRawContentLength = 0;
     let lastRawContentSuffix = "";
-    let finalContent = "";
+    const finalContent: string[] = [];
     let targetResponseId: string | null = null;
     let currentUiSessionId = uiSessionId;
     const toolParser = shouldParseToolCalls
@@ -231,13 +231,13 @@ export async function processNonStreamingResponse(
 
     const consumeAnswerText = (textChunk: string) => {
       if (!toolParser) {
-        finalContent += textChunk;
+        finalContent.push(textChunk);
         return;
       }
 
       const { text, toolCalls } = toolParser.feed(textChunk);
       if (text) {
-        finalContent += text;
+        finalContent.push(text);
       }
       if (isToolcallDebugEnabled() && (text || toolCalls.length > 0)) {
         logger.debug("[chat] non-stream: parser feed result", {
@@ -288,7 +288,7 @@ export async function processNonStreamingResponse(
         loggedThinkTagLeak = true;
       }
       if (sanitized.reasoning) {
-        reasoningBuffer += sanitized.reasoning;
+        reasoningBuffer.push(sanitized.reasoning);
       }
       if (sanitized.text) {
         consumeAnswerText(sanitized.text);
@@ -436,7 +436,7 @@ export async function processNonStreamingResponse(
           if (foundStr && vStr !== "") {
             if (vStr === "FINISHED") continue;
             if (isThinkingChunk) {
-              reasoningBuffer += vStr;
+              reasoningBuffer.push(vStr);
             } else {
               consumeSanitizedAnswerChunk(vStr);
             }
@@ -490,7 +490,7 @@ export async function processNonStreamingResponse(
         loggedThinkTagLeak = true;
       }
       if (remainingSanitized.reasoning) {
-        reasoningBuffer += remainingSanitized.reasoning;
+        reasoningBuffer.push(remainingSanitized.reasoning);
       }
       if (remainingSanitized.text) {
         consumeAnswerText(remainingSanitized.text);
@@ -512,7 +512,7 @@ export async function processNonStreamingResponse(
     }
 
     if (remainingText) {
-      finalContent += remainingText;
+      finalContent.push(remainingText);
     }
     for (const tc of remainingToolCalls) {
       toolCallsOut.push({
@@ -525,21 +525,24 @@ export async function processNonStreamingResponse(
       });
     }
 
+    const finalContentStr = finalContent.join("");
+    const reasoningBufferStr = reasoningBuffer.join("");
+
     if (isToolcallDebugEnabled()) {
       logger.debug("[chat] non-stream: final toolcall summary", {
         totalToolCalls: toolCallsOut.length,
         toolCallNames: toolCallsOut.map((tc: any) => tc.function?.name),
-        contentLength: finalContent.length,
-        hasReasoning: !!reasoningBuffer,
+        contentLength: finalContentStr.length,
+        hasReasoning: reasoningBuffer.length > 0,
       });
     }
 
     const usage = buildUsage(usageAccumulator);
     const message: any = {
       role: "assistant",
-      content: toolCallsOut.length ? null : finalContent,
+      content: toolCallsOut.length ? null : finalContentStr,
     };
-    if (reasoningBuffer) message.reasoning_content = reasoningBuffer;
+    if (reasoningBuffer.length > 0) message.reasoning_content = reasoningBufferStr;
     if (toolCallsOut.length) {
       toolCallsOut.forEach((tc, idx) => {
         tc.index = idx;
@@ -567,8 +570,8 @@ export async function processNonStreamingResponse(
       model: body.model,
       finalPrompt,
       userPrompt,
-      assistantContent: finalContent,
-      reasoningContent: reasoningBuffer || undefined,
+      assistantContent: finalContentStr,
+      reasoningContent: reasoningBufferStr || undefined,
       usage,
       mode: "non-stream",
       context: tokenEstimationContext,
@@ -582,8 +585,8 @@ export async function processNonStreamingResponse(
       responseId: targetResponseId,
       userPrompt,
       finalPrompt,
-      assistantContent: finalContent,
-      reasoningContent: reasoningBuffer || undefined,
+      assistantContent: finalContentStr,
+      reasoningContent: reasoningBufferStr || undefined,
       usage,
       finishReason,
     });
@@ -813,8 +816,8 @@ export async function processStreamingResponse(
       let lastRawContent = "";
       let lastRawContentLength = 0;
       let lastRawContentSuffix = "";
-      let finalContent = "";
-      let reasoningBuffer = "";
+      const finalContent: string[] = [];
+      const reasoningBuffer: string[] = [];
       let targetResponseId: string | null = null;
       const toolParser = shouldParseToolCalls
         ? new StreamingToolParser(declaredTools, {
@@ -851,7 +854,7 @@ export async function processStreamingResponse(
 
       const emitAnswerText = async (textChunk: string) => {
         if (!toolParser) {
-          finalContent += textChunk;
+          finalContent.push(textChunk);
           await writeEvent({
             id: completionId,
             object: "chat.completion.chunk",
@@ -878,7 +881,7 @@ export async function processStreamingResponse(
         }
 
         if (text) {
-          finalContent += text;
+          finalContent.push(text);
           await writeEvent({
             id: completionId,
             object: "chat.completion.chunk",
@@ -989,7 +992,7 @@ export async function processStreamingResponse(
         }
 
         if (sanitized.reasoning) {
-          reasoningBuffer += sanitized.reasoning;
+          reasoningBuffer.push(sanitized.reasoning);
           await writeEvent({
             id: completionId,
             object: "chat.completion.chunk",
@@ -1197,7 +1200,7 @@ export async function processStreamingResponse(
               if (vStr === "FINISHED") continue;
 
               if (isThinkingChunk) {
-                reasoningBuffer += vStr;
+                reasoningBuffer.push(vStr);
                 await writeEvent({
                   id: completionId,
                   object: "chat.completion.chunk",
@@ -1264,7 +1267,7 @@ export async function processStreamingResponse(
           loggedThinkTagLeak = true;
         }
         if (remainingSanitized.reasoning) {
-          reasoningBuffer += remainingSanitized.reasoning;
+          reasoningBuffer.push(remainingSanitized.reasoning);
           await writeEvent({
             id: completionId,
             object: "chat.completion.chunk",
@@ -1300,7 +1303,7 @@ export async function processStreamingResponse(
       }
 
       if (remainingText) {
-        finalContent += remainingText;
+        finalContent.push(remainingText);
         await writeEvent({
           id: completionId,
           object: "chat.completion.chunk",
@@ -1389,6 +1392,8 @@ export async function processStreamingResponse(
       }
 
       // Finish reason + usage + [DONE]
+      const finalContentStr = finalContent.join("");
+      const reasoningBufferStr = reasoningBuffer.join("");
       const usage = buildUsage(usageAccumulator);
 
       const finalFinishReason =
@@ -1453,8 +1458,8 @@ export async function processStreamingResponse(
           responseId: targetResponseId,
           userPrompt,
           finalPrompt,
-          assistantContent: finalContent,
-          reasoningContent: reasoningBuffer || undefined,
+          assistantContent: finalContentStr,
+          reasoningContent: reasoningBufferStr || undefined,
           usage,
           finishReason: finalFinishReason,
         });
@@ -1476,8 +1481,8 @@ export async function processStreamingResponse(
           model: body.model,
           finalPrompt,
           userPrompt,
-          assistantContent: finalContent,
-          reasoningContent: reasoningBuffer || undefined,
+          assistantContent: finalContentStr,
+          reasoningContent: reasoningBufferStr || undefined,
           usage,
           mode: "stream",
           context: tokenEstimationContext,

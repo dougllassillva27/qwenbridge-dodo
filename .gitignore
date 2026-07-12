@@ -35,3 +35,11 @@ Thumbs.db
 # IDE / Editor
 .kilo
 .roo
+
+# Dodo customizations
+claude.md
+resumo-de-trabalho.md
+scratch-replace.ts
+qwen_profiles/
+_contexto-ia/
+docs/

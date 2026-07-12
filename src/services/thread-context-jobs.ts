@@ -151,3 +151,15 @@ export function getThreadContextJobStats(): {
     activeWorkers,
   };
 }
+
+// [Dodo] Memory Leak Protection: Clear lastStartedAt map periodically
+setInterval(() => {
+  const now = Date.now();
+  const cooldownMs = config.context.threadNative.summaryMinIntervalSeconds * 1000;
+  for (const [sessionId, time] of lastStartedAt.entries()) {
+    if (now - time > cooldownMs * 2) {
+      lastStartedAt.delete(sessionId);
+    }
+  }
+}, 3600000); // 1 hora
+
