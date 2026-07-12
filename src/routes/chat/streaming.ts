@@ -25,7 +25,7 @@ import {
   updateStreamSessionId,
   updateStreamTargetResponseId,
 } from "../../core/stream-registry.ts";
-import { metrics } from "../../core/metrics.js";
+import { metrics, recordAccountTokens } from "../../core/metrics.js";
 import {
   logger,
   isToolcallDebugEnabled,
@@ -566,6 +566,7 @@ export async function processNonStreamingResponse(
     console.log(
       `✅ [Chat] Response sent | ${activeAccountLabel} | ${usage.prompt_tokens} prompt / ${usage.completion_tokens} completion / ${usage.total_tokens} total tokens`,
     );
+    recordAccountTokens(activeAccountId, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens);
     logTokenEstimationSample({
       model: body.model,
       finalPrompt,
@@ -1477,6 +1478,7 @@ export async function processStreamingResponse(
         console.log(
           `✅ [Chat] Response sent | ${activeAccountLabel} | ${usage.prompt_tokens} prompt / ${usage.completion_tokens} completion / ${usage.total_tokens} total tokens`,
         );
+        recordAccountTokens(activeAccountId, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens);
         logTokenEstimationSample({
           model: body.model,
           finalPrompt,

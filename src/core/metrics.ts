@@ -229,3 +229,19 @@ export class Metrics extends EventEmitter {
 }
 
 export const metrics = new Metrics();
+
+export const accountTokenUsage: Record<string, { prompt: number; completion: number; total: number }> = {};
+
+export function recordAccountTokens(
+  accountId: string,
+  prompt: number,
+  completion: number,
+  total: number,
+): void {
+  if (!accountTokenUsage[accountId]) {
+    accountTokenUsage[accountId] = { prompt: 0, completion: 0, total: 0 };
+  }
+  accountTokenUsage[accountId].prompt += prompt;
+  accountTokenUsage[accountId].completion += completion;
+  accountTokenUsage[accountId].total += total;
+}

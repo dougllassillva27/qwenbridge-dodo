@@ -111,6 +111,7 @@ const accountsHandler = async (c: any) => {
   const { loadAccounts } = await import("../core/accounts.ts");
   const { getCooldownStatus } = await import("../core/account-manager.ts");
   const { getPlaywrightStatus } = await import("../services/playwright.ts");
+  const { metrics, accountTokenUsage } = await import("../core/metrics.ts");
 
   const accounts = loadAccounts();
   const cooldowns = getCooldownStatus();
@@ -119,19 +120,20 @@ const accountsHandler = async (c: any) => {
   return c.json({
     accounts: accounts.map((a) => {
       const cooldownInfo = cooldowns[a.id];
+      const tokens = accountTokenUsage[a.id] || { prompt: 0, completion: 0, total: 0 };
       return {
         email: a.email,
         id: a.id,
         status: cooldownInfo ? "cooldown" : "active",
         cooldown_until: cooldownInfo ? Date.now() + cooldownInfo.remainingMs : null,
-        tokens: { prompt: 0, completion: 0, total: 0 },
+        tokens,
         playwright: playwrights[a.id] || { initialized: false, hasHeaders: false },
       };
     }),
     total: accounts.length,
-    requests: 0,
+    requests: metrics.get("requests.total")?.value || 0,
     ram_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
-    stream_errors: 0,
+    stream_errors: metrics.get("requests.errors")?.value || 0,
     timestamp: Date.now(),
   }, 200, {
     "Access-Control-Allow-Origin": "*",
