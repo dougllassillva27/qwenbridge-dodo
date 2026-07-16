@@ -81,6 +81,7 @@ function syncEnvAccounts(): void {
       upsert.run(acc.id, acc.email, encrypt(acc.password));
     }
 
+    // [Dodo] Remove contas órfãs que saíram do QWEN_ACCOUNTS
     if (envEmails.length > 0) {
       const placeholders = envEmails.map(() => '?').join(',');
       db.prepare(`DELETE FROM accounts WHERE email NOT IN (${placeholders})`).run(...envEmails);

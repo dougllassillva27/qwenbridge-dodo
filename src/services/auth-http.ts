@@ -171,8 +171,8 @@ function rowToAuthResult(row: PersistedAuthSessionRow): AuthResult {
     cookie: row.cookie,
     userAgent: row.user_agent || config.auth.userAgent,
     bxV: row.bx_v || config.auth.bxV,
-    bxUa: row.bx_ua || config.auth.bxUa,
-    bxUmidtoken: row.bx_umidtoken || config.auth.bxUmidtoken,
+    bxUa: row.bx_ua || "",
+    bxUmidtoken: row.bx_umidtoken || "",
     userId: row.user_id || undefined,
     expiresAt: row.token_expires_at || undefined,
   };
@@ -334,8 +334,8 @@ export async function loginViaHttp(
     cookie,
     userAgent: config.auth.userAgent,
     bxV: config.auth.bxV,
-    bxUa: config.auth.bxUa,
-    bxUmidtoken: config.auth.bxUmidtoken,
+    bxUa: "",
+    bxUmidtoken: "",
     userId: data?.data?.id || data?.id,
     expiresAt: getTokenExpiration(cookie),
   };
@@ -449,7 +449,7 @@ export async function getBasicHeaders(accountId?: string): Promise<{
   bxUmidtoken: string;
 }> {
   // Use Playwright headers if enabled and account is initialized
-  if (config.playwright.enabled && accountId) {
+  if (accountId) {
     try {
       const { getBasicHeaders: getPwBasicHeaders, isPlaywrightInitialized } =
         await import("./playwright.ts");

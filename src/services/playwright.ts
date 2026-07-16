@@ -59,6 +59,62 @@ function resolveBrowserEngine(browserType: BrowserType): BrowserEngineConfig {
   }
 }
 
+/**
+ * Chromium launch args tuned for multi-account proxy use.
+ * Low-memory flags cap V8 old-space in renderer processes (fork-safe RAM fix).
+ */
+export function buildChromiumLaunchArgs(viewport: {
+  width: number;
+  height: number;
+}): string[] {
+  const args = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process,TranslateUI",
+    "--disable-infobars",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    `--window-size=${viewport.width},${viewport.height}`,
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--disable-default-apps",
+    "--disable-component-extensions-with-background-pages",
+  ];
+
+  if (config.playwright.lowMemoryFlags) {
+    const heapMb = config.playwright.jsHeapMb;
+    args.push(
+      `--js-flags=--max-old-space-size=${heapMb}`,
+      "--renderer-process-limit=2",
+      "--disk-cache-size=1",
+      "--media-cache-size=1",
+      "--disable-hang-monitor",
+      "--disable-ipc-flooding-protection",
+    );
+  }
+
+  // [Dodo] Posiciona janela no monitor correto via LAUNCHER_WINDOW_X/Y
+  // Suporta coordenadas negativas (multi-tela com monitor à esquerda)
+  if (process.env.LAUNCHER_WINDOW_X && process.env.LAUNCHER_WINDOW_Y) {
+    const cx = parseInt(process.env.LAUNCHER_WINDOW_X, 10);
+    const cy = parseInt(process.env.LAUNCHER_WINDOW_Y, 10);
+    const targetX = Math.floor(cx - viewport.width / 2);
+    const targetY = Math.floor(cy - 550);
+    args.push(`--window-position=${targetX},${targetY}`);
+  } else {
+    args.push("--window-position=0,0");
+  }
+
+  args.push("--start-minimized");
+
+  return args;
+}
+
 // Per-account mutexes for browser access
 const accountMutexes = new Map<string, Mutex>();
 
@@ -138,7 +194,7 @@ function touchAccountActivity(accountId: string): void {
 function getStealthScript(profile: FingerprintProfile): string {
   const profileJson = JSON.stringify(profile).replace(/</g, "\\u003c");
   return `
-    const __qwenFingerprint = %%FINGERPRINT%%;
+    const __qwenFingerprint = ${profileJson};
 
     // navigator.webdriver
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -398,22 +454,16 @@ export async function initPlaywrightForAccount(
     const profilePath = path.resolve("data", "qwen_profiles", account.id);
     const fingerprint = getFingerprintProfile(account.id);
     const { engine, channel } = resolveBrowserEngine(browserType);
-    
+
     console.log(
       `🚀 [Playwright] Launching ${browserType} for ${maskEmail(account.email)}...`,
     );
 
     // Use playwright-extra with stealth if available, otherwise regular chromium
     const engineToUse = chromiumWithStealth || engine;
-    
-    let targetX = 0;
-    let targetY = 0;
-    if (process.env.LAUNCHER_WINDOW_X && process.env.LAUNCHER_WINDOW_Y) {
-        const cx = parseInt(process.env.LAUNCHER_WINDOW_X, 10);
-        const cy = parseInt(process.env.LAUNCHER_WINDOW_Y, 10);
-        targetX = Math.floor(cx - 400); // Centraliza horizontalmente (800/2)
-        targetY = Math.floor(cy - 550); // Desce mais 30px (agora -550)
-    }
+
+    // [Dodo] Viewport fixo 800x800 — compatível com todos os monitores
+    const dodoViewport = { width: 800, height: 800 };
 
     const acctContext = await engineToUse.launchPersistentContext(profilePath, {
       headless,
@@ -421,33 +471,15 @@ export async function initPlaywrightForAccount(
       userAgent: fingerprint.userAgent,
       locale: fingerprint.locale,
       timezoneId: fingerprint.timezoneId,
-      viewport: { width: 800, height: 800 },
-      screen: { width: 800, height: 800 },
+      viewport: dodoViewport,
+      screen: dodoViewport,
       extraHTTPHeaders: {
         "sec-ch-ua": fingerprint.secChUa,
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"Windows"',
       },
       ignoreDefaultArgs: ["--enable-automation"],
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-features=IsolateOrigins,site-per-process",
-        "--disable-infobars",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-sync",
-        "--metrics-recording-only",
-        "--mute-audio",
-        "--js-flags=--max-old-space-size=128",
-        "--window-size=800,800",
-        ...(process.env.LAUNCHER_WINDOW_X ? [`--window-position=${targetX},${targetY}`] : ["--window-position=0,0"]),
-        "--start-minimized",
-      ],
+      args: buildChromiumLaunchArgs(dodoViewport),
     });
 
     try {
@@ -846,6 +878,29 @@ export async function refreshHeaders(accountId: string): Promise<void> {
   const release = await getAccountMutex(accountId).acquire();
   try {
     await refreshHeadersInternal(accountId);
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Run work against the account Playwright page under the per-account mutex.
+ * Used by captcha recovery so it cannot race header capture / login.
+ */
+export async function withAccountPage<T>(
+  accountId: string,
+  fn: (page: Page) => Promise<T>,
+): Promise<T> {
+  const page = accountPages.get(accountId);
+  if (!page || page.isClosed()) {
+    throw new Error(`Playwright page unavailable for account: ${accountId}`);
+  }
+  const release = await getAccountMutex(accountId).acquire();
+  try {
+    touchAccountActivity(accountId);
+    const result = await fn(page);
+    touchAccountActivity(accountId);
+    return result;
   } finally {
     release();
   }
