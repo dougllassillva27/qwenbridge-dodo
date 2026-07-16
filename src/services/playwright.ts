@@ -535,6 +535,7 @@ export async function initPlaywrightForAccount(
       // Capture headers by navigating and intercepting
       await captureHeaders(account.id);
       touchAccountActivity(account.id);
+      await minimizeWindow(acctPage);
     } catch (error) {
       await closePlaywrightContextBestEffort(account.id, acctContext);
       cleanupPlaywrightAccountState(account.id);
@@ -827,6 +828,32 @@ async function captureHeaders(accountId: string): Promise<void> {
   });
 }
 
+export async function minimizeWindow(page: Page): Promise<void> {
+  try {
+    const session = await page.context().newCDPSession(page);
+    const { windowId } = await session.send("Browser.getWindowForTarget");
+    await session.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "minimized" },
+    });
+  } catch (err: any) {
+    console.warn(`[Playwright] Failed to minimize window via CDP: ${err.message}`);
+  }
+}
+
+export async function restoreWindow(page: Page): Promise<void> {
+  try {
+    const session = await page.context().newCDPSession(page);
+    const { windowId } = await session.send("Browser.getWindowForTarget");
+    await session.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { windowState: "normal" },
+    });
+  } catch (err: any) {
+    console.warn(`[Playwright] Failed to restore window via CDP: ${err.message}`);
+  }
+}
+
 async function refreshHeadersInternal(accountId: string): Promise<void> {
   const cache = getHeaderCache(accountId);
   if (cache.refreshInProgress) return;
@@ -868,6 +895,9 @@ async function refreshHeadersInternal(accountId: string): Promise<void> {
     }
 
     await captureHeaders(accountId);
+    if (page) {
+      await minimizeWindow(page);
+    }
   } finally {
     touchAccountActivity(accountId);
     cache.refreshInProgress = false;
@@ -1054,6 +1084,7 @@ export async function keepAlivePlaywrightAccount(
         timeout: Math.min(config.timeouts.navigation, 15_000),
       });
       lastKeepAliveNavigation.set(accountId, now);
+      await minimizeWindow(page);
     } else {
       await subtlePageActivity(page);
     }

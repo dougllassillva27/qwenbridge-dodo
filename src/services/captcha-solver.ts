@@ -342,6 +342,12 @@ export async function recoverAntiBotChallenge(
         `🧩 [Captcha] Challenge detected for ${accountId} (${signal.reason}); attempting solve...`,
       );
 
+      // Restore window so user/solver can see it and mouse coordinates are accurate
+      await withAccountPage(accountId, async (page) => {
+        const { restoreWindow } = await import("./playwright.ts");
+        await restoreWindow(page);
+      });
+
       // Phase 3: slider attempts within remaining budget
       let sliderSelector: string | undefined;
       for (
@@ -366,6 +372,12 @@ export async function recoverAntiBotChallenge(
       );
 
       await refreshHeaders(accountId);
+
+      // Minimize window again
+      await withAccountPage(accountId, async (page) => {
+        const { minimizeWindow } = await import("./playwright.ts");
+        await minimizeWindow(page);
+      });
 
       if (cleared) {
         console.log(
