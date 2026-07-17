@@ -1282,9 +1282,13 @@ export async function processStreamingResponse(
                                 updateStreamTargetResponseId(completionId, targetResponseId);
                               }
                             }
+                            rememberParent(chunk["response.created"].response_id);
                             if (chunk["response.created"].chat_id) {
                               rememberSession(chunk["response.created"].chat_id);
                             }
+                          } else if (chunk.response_id && !targetResponseId) {
+                            targetResponseId = chunk.response_id;
+                            rememberParent(chunk.response_id);
                           }
 
             applyUpstreamUsage(usageAccumulator, chunk.usage);
