@@ -73,21 +73,8 @@ export async function getBasicHeaders(accountId?: string): Promise<{
     );
   }
 
-  try {
-    await ensurePlaywrightInitialized(resolvedAccountId);
-    return await getPlaywrightBasicHeaders(resolvedAccountId);
-  } catch (err: any) {
-    if (
-      err.message?.includes("Target page, context or browser has been closed") ||
-      err.message?.includes("Browser has been closed") ||
-      err.message?.includes("Target closed")
-    ) {
-      // [Dodo] Graceful fallback interceptando fechamento do Chromium
-      const { RetryableQwenStreamError } = await import("./qwen.ts");
-      throw new RetryableQwenStreamError(`Playwright target closed: ${err.message}`, 3000);
-    }
-    throw err;
-  }
+  await ensurePlaywrightInitialized(resolvedAccountId);
+  return getPlaywrightBasicHeaders(resolvedAccountId);
 }
 
 export async function getQwenHeaders(
@@ -116,35 +103,22 @@ export async function getQwenHeaders(
     );
   }
 
-  try {
-    await ensurePlaywrightInitialized(resolvedAccountId);
+  await ensurePlaywrightInitialized(resolvedAccountId);
 
-    if (forceNew) {
-      await refreshHeaders(resolvedAccountId);
-    }
-
-    const basic = await getPlaywrightBasicHeaders(resolvedAccountId);
-    return {
-      headers: {
-        cookie: basic.cookie,
-        "user-agent": basic.userAgent,
-        "bx-v": basic.bxV,
-        "bx-ua": basic.bxUa || "",
-        "bx-umidtoken": basic.bxUmidtoken || "",
-      },
-      chatSessionId: "",
-      parentMessageId: null,
-    };
-  } catch (err: any) {
-    if (
-      err.message?.includes("Target page, context or browser has been closed") ||
-      err.message?.includes("Browser has been closed") ||
-      err.message?.includes("Target closed")
-    ) {
-      // [Dodo] Graceful fallback interceptando fechamento do Chromium
-      const { RetryableQwenStreamError } = await import("./qwen.ts");
-      throw new RetryableQwenStreamError(`Playwright target closed: ${err.message}`, 3000);
-    }
-    throw err;
+  if (forceNew) {
+    await refreshHeaders(resolvedAccountId);
   }
+
+  const basic = await getPlaywrightBasicHeaders(resolvedAccountId);
+  return {
+    headers: {
+      cookie: basic.cookie,
+      "user-agent": basic.userAgent,
+      "bx-v": basic.bxV,
+      "bx-ua": basic.bxUa || "",
+      "bx-umidtoken": basic.bxUmidtoken || "",
+    },
+    chatSessionId: "",
+    parentMessageId: null,
+  };
 }

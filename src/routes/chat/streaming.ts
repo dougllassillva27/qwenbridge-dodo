@@ -13,12 +13,10 @@ import { buildQwenRequestHeaders } from "../../services/qwen-headers.ts";
 import {
   updateLogicalThreadParent,
   updateSessionParent,
-  QwenUpstreamError,
   RetryableQwenStreamError,
 } from "../../services/qwen.ts";
 import type { OpenAIRequest, Usage } from "../../utils/types.ts";
 import { StreamingToolParser } from "../../tools/parser.ts";
-import { StreamingReasoningTagSanitizer } from "../../utils/reasoning-tags.ts";
 import {
   getStream,
   removeStream,
@@ -36,6 +34,11 @@ import { classifyError } from "../../api/error-classifier.js";
 import type { QwenBridgeStatusCode } from "../../core/errors.js";
 import { config } from "../../core/config.js";
 import { parseQwenErrorPayload } from "./errors.ts";
+import {
+  parseSseErrorFromBuffer,
+  throwFromSseUpstreamError,
+  toRetryableStreamError,
+} from "./retry-policy.ts";
 import {
   logTokenEstimationSample,
   type TokenEstimationContext,
@@ -76,155 +79,7 @@ function extractChatSessionId(chunk: any): string | null {
   );
 }
 
-function isRetryableInvalidInputError(
-  errCode: string,
-  errDetails: string,
-): boolean {
-  const normalizedCode = errCode.toLowerCase();
-  const details = errDetails.toLowerCase();
-  return (
-    normalizedCode === "invalid_input" &&
-    (details.includes("entrada ou anexo inválido") ||
-      details.includes("invalid input") ||
-      details.includes("invalid attachment"))
-  );
-}
-
-function createRetryableInvalidInputError(
-  errCode: string,
-  errDetails: string,
-): RetryableQwenStreamError {
-  const error = new RetryableQwenStreamError(
-    `Qwen retryable invalid input: ${errCode}: ${errDetails.substring(0, 200)}`,
-    config.retry.baseDelayMs,
-  ) as RetryableQwenStreamError & {
-    upstreamCode?: string;
-    forceNewChat?: boolean;
-    retryWithFullPrompt?: boolean;
-  };
-  error.upstreamCode = errCode;
-  error.forceNewChat = true;
-  error.retryWithFullPrompt = true;
-  return error;
-}
-
-function createRetryableUpstreamError(
-  errCode: string,
-  errDetails: string,
-  options?: {
-    forceNewChat?: boolean;
-    retryWithFullPrompt?: boolean;
-    switchAccount?: boolean;
-    retryAfterMs?: number;
-  },
-): RetryableQwenStreamError {
-  const error = new RetryableQwenStreamError(
-    `Qwen retryable upstream error: ${errCode}: ${errDetails.substring(0, 200)}`,
-    options?.retryAfterMs ?? config.retry.baseDelayMs,
-  ) as RetryableQwenStreamError & {
-    upstreamCode?: string;
-    forceNewChat?: boolean;
-    retryWithFullPrompt?: boolean;
-    switchAccount?: boolean;
-  };
-  error.upstreamCode = errCode;
-  error.forceNewChat = options?.forceNewChat === true;
-  error.retryWithFullPrompt = options?.retryWithFullPrompt === true;
-  error.switchAccount = options?.switchAccount !== false;
-  return error;
-}
-
-function isRetryableUpstreamError(errCode: string, errDetails: string): boolean {
-  const normalizedCode = errCode.toLowerCase();
-  const details = errDetails.toLowerCase();
-  return (
-    normalizedCode === "internal_error" ||
-    normalizedCode === "quota_limit" ||
-    details.includes("internal_error") ||
-    details.includes("ocorreu um erro inesperado") ||
-    details.includes("unexpected error") ||
-    details.includes("try again later") ||
-    details.includes("tente novamente mais tarde") ||
-    details.includes("service temporarily unavailable") ||
-    details.includes("alta demanda") ||
-    details.includes("high demand")
-  );
-}
-
-function throwSseUpstreamError(errCode: string, errDetails: string): never {
-  console.error(
-    `[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`,
-  );
-
-  // Anti-bot: FAIL_SYS_USER_VALIDATE / RGV587_ERROR — retryable
-  if (
-    errDetails.includes("FAIL_SYS_USER_VALIDATE") ||
-    errDetails.includes("RGV587_ERROR") ||
-    errDetails.includes("user validate")
-  ) {
-    throw new RetryableQwenStreamError(
-      `Qwen anti-bot: ${errCode}: ${errDetails}`,
-      config.antiBot.baseDelayMs,
-    );
-  }
-
-  if (
-    errCode === "quota_limit" ||
-    errDetails.includes("Allocated quota exceeded") ||
-    errDetails.includes("quota exceeded") ||
-    errDetails.includes("token-limit") ||
-    errDetails.includes("alta demanda") ||
-    errDetails.includes("high demand")
-  ) {
-    throw createRetryableUpstreamError(errCode, errDetails, {
-      switchAccount: true,
-    });
-  }
-
-  if (isRetryableInvalidInputError(errCode, errDetails)) {
-    throw createRetryableInvalidInputError(errCode, errDetails);
-  }
-
-  if (isRetryableUpstreamError(errCode, errDetails)) {
-    throw createRetryableUpstreamError(errCode, errDetails, {
-      switchAccount: true,
-      forceNewChat: true,
-    });
-  }
-
-  throw new QwenUpstreamError(
-    `Qwen upstream error: ${errCode}: ${errDetails}`,
-    errCode,
-    502,
-  );
-}
-
-function parseSseErrorFromBuffer(
-  buffer: string,
-): { code: string; details: string } | null {
-  const lines = buffer.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data: ")) continue;
-    const dataStr = trimmed.slice(6);
-    if (!dataStr || dataStr === "[DONE]") continue;
-    try {
-      const chunk = JSON.parse(dataStr);
-      if (chunk?.error) {
-        return {
-          code: chunk.error.code || "upstream_error",
-          details:
-            chunk.error.details ||
-            chunk.error.message ||
-            JSON.stringify(chunk.error),
-        };
-      }
-    } catch {
-      // ignore non-JSON SSE lines in the pre-read buffer
-    }
-  }
-  return null;
-}
+// Retry/switch policy lives in ./retry-policy.ts (generic by default).
 
 export interface AssistantCompleteEvent {
   sessionId: string | null;
@@ -309,27 +164,20 @@ export async function processNonStreamingResponse(
     let lastThinkingSummary = "";
     let lastThinkingSummaryLength = 0;
     let lastThinkingSummarySuffix = "";
-    const reasoningBuffer: string[] = [];
+    // [Dodo] Otimização GC: Acúmulo por Arrays (.push / .join)
+    const reasoningChunks: string[] = [];
     let lastRawContent = "";
     let lastRawContentLength = 0;
     let lastRawContentSuffix = "";
-    const finalContent: string[] = [];
+    const finalContentChunks: string[] = [];
     let targetResponseId: string | null = null;
     let currentUiSessionId = uiSessionId;
     const toolParser = shouldParseToolCalls
       ? new StreamingToolParser(declaredTools)
       : null;
-    // Skip sanitizer allocation for no-thinking model variants
-    const enableThinking = !body.model.endsWith("-no-thinking");
-    const reasoningTagSanitizer = enableThinking
-      ? new StreamingReasoningTagSanitizer()
-      : null;
     const toolCallsOut: any[] = [];
-    let loggedThinkTagLeak = false;
     let buffer = "";
-    const usageAccumulator = createUsageAccumulator(
-      Math.ceil(finalPrompt.length / 3.5),
-    );
+    const usageAccumulator = createUsageAccumulator(0);
 
     const rememberSession = (sessionId: string | null) => {
       if (!sessionId || sessionId === currentUiSessionId) return;
@@ -350,13 +198,13 @@ export async function processNonStreamingResponse(
 
     const consumeAnswerText = (textChunk: string) => {
       if (!toolParser) {
-        finalContent.push(textChunk);
+        finalContentChunks.push(textChunk);
         return;
       }
 
       const { text, toolCalls } = toolParser.feed(textChunk);
       if (text) {
-        finalContent.push(text);
+        finalContentChunks.push(text);
       }
       if (isToolcallDebugEnabled() && (text || toolCalls.length > 0)) {
         logger.debug("[chat] non-stream: parser feed result", {
@@ -387,33 +235,6 @@ export async function processNonStreamingResponse(
       }
     };
 
-    const consumeSanitizedAnswerChunk = (textChunk: string) => {
-      if (!reasoningTagSanitizer) {
-        consumeAnswerText(textChunk);
-        return;
-      }
-      const sanitized = reasoningTagSanitizer.feed(textChunk);
-      if (sanitized.detectedThinkTag && !loggedThinkTagLeak) {
-        logger.warn(
-          "[chat] Detected <think> tags in answer content; sanitizing output",
-          {
-            completionId,
-            mode: "non-stream",
-            model: body.model,
-            hadMalformedTag: sanitized.hadMalformedTag,
-            hadUnclosedTag: sanitized.hadUnclosedTag,
-          },
-        );
-        loggedThinkTagLeak = true;
-      }
-      if (sanitized.reasoning) {
-        reasoningBuffer.push(sanitized.reasoning);
-      }
-      if (sanitized.text) {
-        consumeAnswerText(sanitized.text);
-      }
-    };
-
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -439,70 +260,28 @@ export async function processNonStreamingResponse(
           const chunk = JSON.parse(dataStr);
           rememberSession(extractChatSessionId(chunk));
 
-          // Check for upstream error in chunk
+          // Generic upstream SSE error handling (retry/switch via policy)
           if (chunk.error) {
             const errDetails =
               chunk.error.details ||
               chunk.error.message ||
               JSON.stringify(chunk.error);
             const errCode = chunk.error.code || "upstream_error";
-            console.error(
-              `[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`,
-            );
+            throwFromSseUpstreamError(errCode, errDetails);
+          }
 
-            // Anti-bot: FAIL_SYS_USER_VALIDATE / RGV587_ERROR — retryable
-            if (
-              errDetails.includes("FAIL_SYS_USER_VALIDATE") ||
-              errDetails.includes("RGV587_ERROR") ||
-              errDetails.includes("user validate")
-            ) {
-              throw new RetryableQwenStreamError(
-                `Qwen anti-bot: ${errCode}: ${errDetails}`,
-                config.antiBot.baseDelayMs,
-              );
+          if (
+            chunk["response.created"] &&
+            chunk["response.created"].response_id
+          ) {
+            if (chunk["response.created"].chat_id) {
+              rememberSession(chunk["response.created"].chat_id);
             }
-
-            // Quota exceeded in SSE chunk — retryable (try other account)
-                        if (
-                          errCode === "quota_limit" ||
-                          errDetails.includes("Allocated quota exceeded") ||
-                          errDetails.includes("quota exceeded") ||
-                          errDetails.includes("token-limit") ||
-                          errDetails.includes("alta demanda") ||
-                          errDetails.includes("high demand")
-                        ) {
-                          throw createRetryableUpstreamError(errCode, errDetails, {
-                            switchAccount: true,
-                          });
-                        }
-
-                        if (isRetryableInvalidInputError(errCode, errDetails)) {
-                          throw createRetryableInvalidInputError(errCode, errDetails);
-                        }
-
-                        // Transient upstream failures mid-stream — switch account / retry
-                        if (isRetryableUpstreamError(errCode, errDetails)) {
-                          throw createRetryableUpstreamError(errCode, errDetails, {
-                            switchAccount: true,
-                            forceNewChat: true,
-                          });
-                        }
-
-                        throw new QwenUpstreamError(
-                          `Qwen upstream error: ${errCode}: ${errDetails}`,
-                          errCode,
-                          502,
-                        );
-                      }
-
-                      if (
-                        chunk["response.created"] &&
-                        chunk["response.created"].response_id
-                      ) {
-                        if (!targetResponseId) {
-                          targetResponseId = chunk["response.created"].response_id;
-                        }
-                        rememberParent(chunk["response.created"].response_id);
+            if (!targetResponseId) {
+              targetResponseId = chunk["response.created"].response_id;
+            }
+            // Next turn appends with parent_id = this assistant response
+            rememberParent(chunk["response.created"].response_id);
           } else if (chunk.response_id && !targetResponseId) {
             targetResponseId = chunk.response_id;
             rememberParent(chunk.response_id);
@@ -565,17 +344,14 @@ export async function processNonStreamingResponse(
           if (foundStr && vStr !== "") {
             if (vStr === "FINISHED") continue;
             if (isThinkingChunk) {
-              reasoningBuffer.push(vStr);
+              reasoningChunks.push(vStr);
             } else {
-              consumeSanitizedAnswerChunk(vStr);
+              consumeAnswerText(vStr);
             }
           }
         } catch (_e) {
-          // Re-throw known errors for retry logic in index.ts
-          if (
-            _e instanceof RetryableQwenStreamError ||
-            _e instanceof QwenUpstreamError
-          ) {
+          // Re-throw policy-driven retry errors for outer retry loop
+          if (_e instanceof RetryableQwenStreamError) {
             throw _e;
           }
           // Log warning for large chunks that fail to parse
@@ -603,29 +379,6 @@ export async function processNonStreamingResponse(
       );
     }
 
-    if (reasoningTagSanitizer) {
-      const remainingSanitized = reasoningTagSanitizer.flush();
-      if (remainingSanitized.detectedThinkTag && !loggedThinkTagLeak) {
-        logger.warn(
-          "[chat] Detected <think> tags in answer content; sanitizing output",
-          {
-            completionId,
-            mode: "non-stream",
-            model: body.model,
-            hadMalformedTag: remainingSanitized.hadMalformedTag,
-            hadUnclosedTag: remainingSanitized.hadUnclosedTag,
-          },
-        );
-        loggedThinkTagLeak = true;
-      }
-      if (remainingSanitized.reasoning) {
-        reasoningBuffer.push(remainingSanitized.reasoning);
-      }
-      if (remainingSanitized.text) {
-        consumeAnswerText(remainingSanitized.text);
-      }
-    }
-
     const remainingParsed = toolParser
       ? toolParser.flush()
       : { text: "", toolCalls: [] };
@@ -641,7 +394,7 @@ export async function processNonStreamingResponse(
     }
 
     if (remainingText) {
-      finalContent.push(remainingText);
+      finalContentChunks.push(remainingText);
     }
     for (const tc of remainingToolCalls) {
       toolCallsOut.push({
@@ -654,24 +407,33 @@ export async function processNonStreamingResponse(
       });
     }
 
-    const finalContentStr = finalContent.join("");
-    const reasoningBufferStr = reasoningBuffer.join("");
+    let finalContent = finalContentChunks.join("");
+    const reasoningBuffer = reasoningChunks.join("");
 
     if (isToolcallDebugEnabled()) {
       logger.debug("[chat] non-stream: final toolcall summary", {
         totalToolCalls: toolCallsOut.length,
         toolCallNames: toolCallsOut.map((tc: any) => tc.function?.name),
-        contentLength: finalContentStr.length,
-        hasReasoning: reasoningBuffer.length > 0,
+        contentLength: finalContent.length,
+        hasReasoning: !!reasoningBuffer,
       });
     }
 
     const usage = buildUsage(usageAccumulator);
+
+    // [Dodo] Contabilização de tokens por conta para Dashboard Tauri
+    recordAccountTokens(
+      activeAccountId,
+      usage.prompt_tokens,
+      usage.completion_tokens,
+      usage.total_tokens,
+    );
+
     const message: any = {
       role: "assistant",
-      content: toolCallsOut.length ? null : finalContentStr,
+      content: toolCallsOut.length ? null : finalContent,
     };
-    if (reasoningBuffer.length > 0) message.reasoning_content = reasoningBufferStr;
+    if (reasoningBuffer) message.reasoning_content = reasoningBuffer;
     if (toolCallsOut.length) {
       toolCallsOut.forEach((tc, idx) => {
         tc.index = idx;
@@ -680,6 +442,39 @@ export async function processNonStreamingResponse(
     }
 
     const finishReason = toolCallsOut.length ? "tool_calls" : "stop";
+
+    // Check for malformed tool calls and inject error feedback
+    if (toolParser && toolParser.getMalformedToolCalls().length > 0) {
+      const malformedCalls = toolParser.getMalformedToolCalls();
+      const malformedCount = malformedCalls.length;
+      
+      // Build detailed error message
+      const undeclaredNames = malformedCalls
+        .flatMap((mc) => mc.undeclaredNames || [])
+        .filter((name, index, self) => self.indexOf(name) === index);
+      
+      let errorMessage: string;
+      if (undeclaredNames.length > 0) {
+        errorMessage = `\n\n⚠️ [ERROR] ${malformedCount} tool call(s) used undeclared tool names: ${undeclaredNames.join(", ")}. Only declared tools can be executed. Please retry with valid tool names.\n\n`;
+      } else {
+        errorMessage = `\n\n⚠️ [ERROR] ${malformedCount} tool call(s) were malformed and could not be executed. The model generated invalid JSON. Please retry the request.\n\n`;
+      }
+      
+      finalContent += errorMessage;
+      if (message.content) {
+        message.content += errorMessage;
+      } else {
+        message.content = errorMessage;
+      }
+      
+      logger.debug("[chat] non-stream: injected malformed tool call error feedback", {
+        malformedCount,
+        undeclaredNames,
+        completionId,
+      });
+      
+      toolParser.clearMalformedToolCalls();
+    }
 
     if (isToolcallDebugEnabled()) {
       logger.debug("[chat] non-stream: sending response", {
@@ -692,16 +487,12 @@ export async function processNonStreamingResponse(
       });
     }
 
-    console.log(
-      `✅ [Chat] Response sent | ${activeAccountLabel} | ${usage.prompt_tokens} prompt / ${usage.completion_tokens} completion / ${usage.total_tokens} total tokens`,
-    );
-    recordAccountTokens(activeAccountId, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens);
     logTokenEstimationSample({
       model: body.model,
       finalPrompt,
       userPrompt,
-      assistantContent: finalContentStr,
-      reasoningContent: reasoningBufferStr || undefined,
+      assistantContent: finalContent,
+      reasoningContent: reasoningBuffer || undefined,
       usage,
       mode: "non-stream",
       context: tokenEstimationContext,
@@ -715,8 +506,8 @@ export async function processNonStreamingResponse(
       responseId: targetResponseId,
       userPrompt,
       finalPrompt,
-      assistantContent: finalContentStr,
-      reasoningContent: reasoningBufferStr || undefined,
+      assistantContent: finalContent,
+      reasoningContent: reasoningBuffer || undefined,
       usage,
       finishReason,
     });
@@ -791,29 +582,29 @@ export async function processStreamingResponse(
   }
 
   const upstreamError = parseQwenErrorPayload(initialStreamBuffer);
-    if (upstreamError) {
-      await streamReader.cancel().catch(() => undefined);
-      removeStream(completionId);
-      if (onStreamComplete) onStreamComplete();
-      return sendOpenAIError(
-        c,
-        createError(
-          upstreamError.status as QwenBridgeStatusCode,
-          upstreamError.message,
-        ),
-      );
-    }
+  if (upstreamError) {
+    await streamReader.cancel().catch(() => undefined);
+    removeStream(completionId);
+    if (onStreamComplete) onStreamComplete();
+    return sendOpenAIError(
+      c,
+      createError(
+        upstreamError.status as QwenBridgeStatusCode,
+        upstreamError.message,
+      ),
+    );
+  }
 
-    // Detect first-chunk SSE error BEFORE committing to SSE so outer retry loop can run
-    const earlySseError = parseSseErrorFromBuffer(initialStreamBuffer);
-    if (earlySseError) {
-      await streamReader.cancel().catch(() => undefined);
-      removeStream(completionId);
-      if (onStreamComplete) onStreamComplete();
-      throwSseUpstreamError(earlySseError.code, earlySseError.details);
-    }
+  // Detect first-chunk SSE error BEFORE committing to SSE so outer retry loop can run
+  const earlySseError = parseSseErrorFromBuffer(initialStreamBuffer);
+  if (earlySseError) {
+    await streamReader.cancel().catch(() => undefined);
+    removeStream(completionId);
+    if (onStreamComplete) onStreamComplete();
+    throwFromSseUpstreamError(earlySseError.code, earlySseError.details);
+  }
 
-    c.header("Content-Type", "text/event-stream");
+  c.header("Content-Type", "text/event-stream");
   c.header("Cache-Control", "no-cache");
   c.header("Connection", "keep-alive");
 
@@ -827,7 +618,7 @@ export async function processStreamingResponse(
       clientDisconnected = true;
 
       console.log(
-        `[Chat] Client disconnected for ${completionId}, stopping Qwen generation...`,
+        `🔌 [Chat] Client disconnected | ${completionId} | stopping Qwen generation`,
       );
 
       if (isToolcallDebugEnabled()) {
@@ -843,7 +634,7 @@ export async function processStreamingResponse(
           const targetResponseId = streamData.targetResponseId;
           if (targetResponseId) {
             console.log(
-              `[Chat] Calling Qwen stop for session=${currentUiSessionId}, response=${targetResponseId}`,
+              `🛑 [Chat] Stopping Qwen generation | session=${currentUiSessionId} | response=${targetResponseId}`,
             );
             await fetch(
               `https://chat.qwen.ai/api/v2/chat/completions/stop?chat_id=${currentUiSessionId}`,
@@ -864,12 +655,12 @@ export async function processStreamingResponse(
               },
             ).catch((err) => {
               console.error(
-                `❌ [Chat] Error calling Qwen stop: ${err.message}`,
+                `❌ [Chat] Stop failed | ${err.message}`,
               );
             });
           } else {
             console.log(
-              `[Chat] No targetResponseId yet for ${completionId}, skipping Qwen stop`,
+              `⏭️  [Chat] Skip Qwen stop | ${completionId} | no response_id yet`,
             );
           }
         }
@@ -879,13 +670,13 @@ export async function processStreamingResponse(
         } catch (abortErr: any) {
           if (abortErr.name !== "AbortError") {
             console.error(
-              `❌ [Chat] Error aborting stream: ${abortErr.message}`,
+              `❌ [Chat] Abort stream failed | ${abortErr.message}`,
             );
           }
         }
       } catch (err: any) {
         console.error(
-          `❌ [Chat] Error during disconnect cleanup: ${err.message}`,
+          `❌ [Chat] Disconnect cleanup failed | ${err.message}`,
         );
       }
 
@@ -896,6 +687,23 @@ export async function processStreamingResponse(
     };
 
     c.req.raw.signal.addEventListener("abort", abortHandler);
+
+    // Micro-buffer: coalesce many tiny SSE writes into fewer socket writes to cut
+    // syscall overhead on long responses. Ordering is preserved because EVERY write
+    // (content, reasoning, events, [DONE]) goes through this single buffer.
+    let writeBuffer = '';
+    let writeTimer: ReturnType<typeof setTimeout> | null = null;
+    const WRITE_FLUSH_BYTES = 8192;
+    const WRITE_FLUSH_MS = 3;
+
+    const flushWrites = () => {
+      if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
+      if (writeBuffer) {
+        const data = writeBuffer;
+        writeBuffer = '';
+        streamWriter.write(data);
+      }
+    };
 
     try {
       await streamWriter.write(": heartbeat\n\n");
@@ -918,6 +726,15 @@ export async function processStreamingResponse(
 
       const createdTimestamp = Math.floor(Date.now() / 1000);
 
+      const bufferedWrite = (data: string) => {
+        writeBuffer += data;
+        if (writeBuffer.length >= WRITE_FLUSH_BYTES) {
+          flushWrites();
+        } else if (!writeTimer) {
+          writeTimer = setTimeout(flushWrites, WRITE_FLUSH_MS);
+        }
+      };
+
       // Batch buffer: when non-null, writeEvent accumulates instead of flushing
       let flushBuffer: string[] | null = null;
 
@@ -927,7 +744,7 @@ export async function processStreamingResponse(
           flushBuffer.push(serialized);
           return;
         }
-        await streamWriter.write(serialized);
+        bufferedWrite(serialized);
       };
 
       const makeChoice = (delta: any, finishReason: string | null = null) => ({
@@ -955,25 +772,18 @@ export async function processStreamingResponse(
       let lastRawContent = "";
       let lastRawContentLength = 0;
       let lastRawContentSuffix = "";
-      const finalContent: string[] = [];
-      const reasoningBuffer: string[] = [];
+      // [Dodo] Otimização GC: Acúmulo por Arrays (.push / .join)
+      const finalContentChunks: string[] = [];
+      const reasoningChunks: string[] = [];
       let targetResponseId: string | null = null;
       const toolParser = shouldParseToolCalls
         ? new StreamingToolParser(declaredTools, {
             incrementalToolCalls: true,
           })
         : null;
-      // Skip sanitizer allocation for no-thinking model variants
-      const enableThinking = !body.model.endsWith("-no-thinking");
-      const reasoningTagSanitizer = enableThinking
-        ? new StreamingReasoningTagSanitizer()
-        : null;
-      let loggedThinkTagLeak = false;
 
       let buffer = initialStreamBuffer;
-      const usageAccumulator = createUsageAccumulator(
-        Math.ceil(finalPrompt.length / 3.5),
-      );
+      const usageAccumulator = createUsageAccumulator(0);
       const rememberSession = (sessionId: string | null) => {
         if (!sessionId || sessionId === currentUiSessionId) return;
         currentUiSessionId = sessionId;
@@ -993,7 +803,7 @@ export async function processStreamingResponse(
 
       const emitAnswerText = async (textChunk: string) => {
         if (!toolParser) {
-          finalContent.push(textChunk);
+          finalContentChunks.push(textChunk);
           await writeEvent({
             id: completionId,
             object: "chat.completion.chunk",
@@ -1020,7 +830,7 @@ export async function processStreamingResponse(
         }
 
         if (text) {
-          finalContent.push(text);
+          finalContentChunks.push(text);
           await writeEvent({
             id: completionId,
             object: "chat.completion.chunk",
@@ -1110,42 +920,6 @@ export async function processStreamingResponse(
         }
       };
 
-      const emitSanitizedAnswerChunk = async (textChunk: string) => {
-        if (!reasoningTagSanitizer) {
-          await emitAnswerText(textChunk);
-          return;
-        }
-        const sanitized = reasoningTagSanitizer.feed(textChunk);
-        if (sanitized.detectedThinkTag && !loggedThinkTagLeak) {
-          logger.warn(
-            "[chat] Detected <think> tags in answer content; sanitizing output",
-            {
-              completionId,
-              mode: "stream",
-              model: body.model,
-              hadMalformedTag: sanitized.hadMalformedTag,
-              hadUnclosedTag: sanitized.hadUnclosedTag,
-            },
-          );
-          loggedThinkTagLeak = true;
-        }
-
-        if (sanitized.reasoning) {
-          reasoningBuffer.push(sanitized.reasoning);
-          await writeEvent({
-            id: completionId,
-            object: "chat.completion.chunk",
-            created: createdTimestamp,
-            model: body.model,
-            choices: [makeChoice({ reasoning_content: sanitized.reasoning })],
-          });
-        }
-
-        if (sanitized.text) {
-          await emitAnswerText(sanitized.text);
-        }
-      };
-
       // Main SSE reader loop
       while (true) {
         if (clientDisconnected) {
@@ -1176,7 +950,7 @@ export async function processStreamingResponse(
             if (!clientDisconnected) {
               await streamWriter.write("data: [DONE]\n\n");
             }
-            continue;
+            break; // Exit loop immediately - no need to wait for connection close
           }
 
           if (upstreamDebugEnabled) {
@@ -1206,7 +980,7 @@ export async function processStreamingResponse(
                 lastRawContent = result.matchedContent;
                 lastRawContentLength = result.contentLength;
                 lastRawContentSuffix = result.contentSuffix;
-                await emitSanitizedAnswerChunk(vStr);
+                await emitAnswerText(vStr);
               }
             }
             continue;
@@ -1216,80 +990,39 @@ export async function processStreamingResponse(
             const chunk = JSON.parse(dataStr);
             rememberSession(extractChatSessionId(chunk));
 
-            // Check for upstream error in chunk
+            // Generic upstream SSE error handling (retry/switch via policy)
             if (chunk.error) {
               const errDetails =
                 chunk.error.details ||
                 chunk.error.message ||
                 JSON.stringify(chunk.error);
               const errCode = chunk.error.code || "upstream_error";
-              console.error(
-                `[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`,
-              );
+              throwFromSseUpstreamError(errCode, errDetails);
+            }
 
-              // Anti-bot: FAIL_SYS_USER_VALIDATE / RGV587_ERROR — retryable
-                            if (
-                              errDetails.includes("FAIL_SYS_USER_VALIDATE") ||
-                              errDetails.includes("RGV587_ERROR") ||
-                              errDetails.includes("user validate")
-                            ) {
-                              throw new RetryableQwenStreamError(
-                                `Qwen anti-bot: ${errCode}: ${errDetails}`,
-                                config.antiBot.baseDelayMs,
-                              );
-                            }
-
-                            // Quota exceeded in SSE chunk — retryable (try other account)
-                            if (
-                              errCode === "quota_limit" ||
-                              errDetails.includes("Allocated quota exceeded") ||
-                              errDetails.includes("quota exceeded") ||
-                              errDetails.includes("token-limit") ||
-                              errDetails.includes("alta demanda") ||
-                              errDetails.includes("high demand")
-                            ) {
-                              throw createRetryableUpstreamError(errCode, errDetails, {
-                                switchAccount: true,
-                              });
-                            }
-
-                            if (isRetryableInvalidInputError(errCode, errDetails)) {
-                              throw createRetryableInvalidInputError(errCode, errDetails);
-                            }
-
-                            // Transient upstream failures mid-stream — switch account / retry
-                            if (isRetryableUpstreamError(errCode, errDetails)) {
-                              throw createRetryableUpstreamError(errCode, errDetails, {
-                                switchAccount: true,
-                                forceNewChat: true,
-                              });
-                            }
-
-                            throw new QwenUpstreamError(
-                              `Qwen upstream error: ${errCode}: ${errDetails}`,
-                              errCode,
-                              502,
-                            );
-                          }
-
-                          if (
-                            chunk["response.created"] &&
-                            chunk["response.created"].response_id
-                          ) {
-                            if (!targetResponseId) {
-                              targetResponseId = chunk["response.created"].response_id;
-                              if (targetResponseId) {
-                                updateStreamTargetResponseId(completionId, targetResponseId);
-                              }
-                            }
-                            rememberParent(chunk["response.created"].response_id);
-                            if (chunk["response.created"].chat_id) {
-                              rememberSession(chunk["response.created"].chat_id);
-                            }
-                          } else if (chunk.response_id && !targetResponseId) {
-                            targetResponseId = chunk.response_id;
-                            rememberParent(chunk.response_id);
-                          }
+            if (
+              chunk["response.created"] &&
+              chunk["response.created"].response_id
+            ) {
+              // chat_id first so rememberParent can bind sticky state
+              if (chunk["response.created"].chat_id) {
+                rememberSession(chunk["response.created"].chat_id);
+              }
+              if (!targetResponseId) {
+                targetResponseId = chunk["response.created"].response_id;
+                if (targetResponseId) {
+                  updateStreamTargetResponseId(completionId, targetResponseId);
+                }
+              }
+              // Next turn must parent to this assistant response (append, not edit)
+              rememberParent(chunk["response.created"].response_id);
+            } else if (chunk.response_id && !targetResponseId) {
+              targetResponseId = chunk.response_id;
+              if (targetResponseId) {
+                updateStreamTargetResponseId(completionId, targetResponseId);
+              }
+              rememberParent(chunk.response_id);
+            }
 
             applyUpstreamUsage(usageAccumulator, chunk.usage);
 
@@ -1349,7 +1082,7 @@ export async function processStreamingResponse(
               if (vStr === "FINISHED") continue;
 
               if (isThinkingChunk) {
-                reasoningBuffer.push(vStr);
+                reasoningChunks.push(vStr);
                 await writeEvent({
                   id: completionId,
                   object: "chat.completion.chunk",
@@ -1358,15 +1091,12 @@ export async function processStreamingResponse(
                   choices: [makeChoice({ reasoning_content: vStr })],
                 });
               } else {
-                await emitSanitizedAnswerChunk(vStr);
+                await emitAnswerText(vStr);
               }
             }
           } catch (_e) {
-            // Re-throw known errors for retry logic in index.ts
-            if (
-              _e instanceof RetryableQwenStreamError ||
-              _e instanceof QwenUpstreamError
-            ) {
+            // Re-throw policy-driven retry errors for outer retry loop
+            if (_e instanceof RetryableQwenStreamError) {
               throw _e;
             }
             // Ignore partial chunk parse errors
@@ -1400,38 +1130,6 @@ export async function processStreamingResponse(
       // Activate batch mode — all writeEvent calls accumulate until flushed
       flushBuffer = [];
 
-      if (reasoningTagSanitizer) {
-        const remainingSanitized = reasoningTagSanitizer.flush();
-        if (remainingSanitized.detectedThinkTag && !loggedThinkTagLeak) {
-          logger.warn(
-            "[chat] Detected <think> tags in answer content; sanitizing output",
-            {
-              completionId,
-              mode: "stream",
-              model: body.model,
-              hadMalformedTag: remainingSanitized.hadMalformedTag,
-              hadUnclosedTag: remainingSanitized.hadUnclosedTag,
-            },
-          );
-          loggedThinkTagLeak = true;
-        }
-        if (remainingSanitized.reasoning) {
-          reasoningBuffer.push(remainingSanitized.reasoning);
-          await writeEvent({
-            id: completionId,
-            object: "chat.completion.chunk",
-            created: createdTimestamp,
-            model: body.model,
-            choices: [
-              makeChoice({ reasoning_content: remainingSanitized.reasoning }),
-            ],
-          });
-        }
-        if (remainingSanitized.text) {
-          await emitAnswerText(remainingSanitized.text);
-        }
-      }
-
       const remainingParsed = toolParser
         ? toolParser.flush()
         : { text: "", toolCalls: [], toolCallDeltas: [] };
@@ -1452,7 +1150,7 @@ export async function processStreamingResponse(
       }
 
       if (remainingText) {
-        finalContent.push(remainingText);
+        finalContentChunks.push(remainingText);
         await writeEvent({
           id: completionId,
           object: "chat.completion.chunk",
@@ -1543,6 +1241,14 @@ export async function processStreamingResponse(
       // Finish reason + usage + [DONE]
       const usage = buildUsage(usageAccumulator);
 
+      // [Dodo] Contabilização de tokens por conta para Dashboard Tauri
+      recordAccountTokens(
+        activeAccountId,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.total_tokens,
+      );
+
       const finalFinishReason =
         toolParser && toolParser.getEmittedToolCallCount() > 0
           ? "tool_calls"
@@ -1580,7 +1286,44 @@ export async function processStreamingResponse(
         });
       }
 
+      const finalContent = finalContentChunks.join("");
+      const reasoningBuffer = reasoningChunks.join("");
+
       if (!clientDisconnected) {
+        // Check for malformed tool calls and inject error feedback
+        if (toolParser && toolParser.getMalformedToolCalls().length > 0) {
+          const malformedCalls = toolParser.getMalformedToolCalls();
+          const malformedCount = malformedCalls.length;
+          
+          // Build detailed error message
+          const undeclaredNames = malformedCalls
+            .flatMap((mc) => mc.undeclaredNames || [])
+            .filter((name, index, self) => self.indexOf(name) === index);
+          
+          let errorMessage: string;
+          if (undeclaredNames.length > 0) {
+            errorMessage = `\n\n⚠️ [ERROR] ${malformedCount} tool call(s) used undeclared tool names: ${undeclaredNames.join(", ")}. Only declared tools can be executed. Please retry with valid tool names.\n\n`;
+          } else {
+            errorMessage = `\n\n⚠️ [ERROR] ${malformedCount} tool call(s) were malformed and could not be executed. The model generated invalid JSON. Please retry the request.\n\n`;
+          }
+          
+          await writeEvent({
+            id: completionId,
+            object: "chat.completion.chunk",
+            created: createdTimestamp,
+            model: body.model,
+            choices: [makeChoice({ content: errorMessage })],
+          });
+          
+          logger.debug("[chat] stream: injected malformed tool call error feedback", {
+            malformedCount,
+            undeclaredNames,
+            completionId,
+          });
+          
+          toolParser.clearMalformedToolCalls();
+        }
+        
         // Single write: flush all accumulated events + [DONE] sentinel
         const donePayload = "data: [DONE]\n\n";
         const payload =
@@ -1594,11 +1337,9 @@ export async function processStreamingResponse(
           });
         }
 
+        flushWrites();
         await streamWriter.write(payload);
         flushBuffer = null;
-
-        const finalContentStr = finalContent.join("");
-        const reasoningBufferStr = reasoningBuffer.join("");
 
         scheduleAssistantComplete(onAssistantComplete, {
           sessionId: logicalSessionId,
@@ -1608,8 +1349,8 @@ export async function processStreamingResponse(
           responseId: targetResponseId,
           userPrompt,
           finalPrompt,
-          assistantContent: finalContentStr,
-          reasoningContent: reasoningBufferStr || undefined,
+          assistantContent: finalContent,
+          reasoningContent: reasoningBuffer || undefined,
           usage,
           finishReason: finalFinishReason,
         });
@@ -1624,16 +1365,12 @@ export async function processStreamingResponse(
           });
         }
 
-        console.log(
-          `✅ [Chat] Response sent | ${activeAccountLabel} | ${usage.prompt_tokens} prompt / ${usage.completion_tokens} completion / ${usage.total_tokens} total tokens`,
-        );
-        recordAccountTokens(activeAccountId, usage.prompt_tokens, usage.completion_tokens, usage.total_tokens);
         logTokenEstimationSample({
           model: body.model,
           finalPrompt,
           userPrompt,
-          assistantContent: finalContentStr,
-          reasoningContent: reasoningBufferStr || undefined,
+          assistantContent: finalContent,
+          reasoningContent: reasoningBuffer || undefined,
           usage,
           mode: "stream",
           context: tokenEstimationContext,
@@ -1648,43 +1385,44 @@ export async function processStreamingResponse(
     } catch (err: any) {
       const streamStillRegistered = Boolean(getStream(completionId));
       if (
-              shouldSuppressStreamAbort(
-                err,
-                clientDisconnected,
-                c.req.raw.signal.aborted,
-                streamStillRegistered,
-              )
-            ) {
-              if (isToolcallDebugEnabled()) {
-                logger.debug("[chat] stream: suppressed expected abort", {
-                  completionId,
-                  clientDisconnected,
-                  requestAborted: c.req.raw.signal.aborted,
-                  streamStillRegistered,
-                  errorName: err?.name,
-                  errorMessage: err?.message,
-                });
-              }
-              return;
-            }
+        shouldSuppressStreamAbort(
+          err,
+          clientDisconnected,
+          c.req.raw.signal.aborted,
+          streamStillRegistered,
+        )
+      ) {
+        if (isToolcallDebugEnabled()) {
+          logger.debug("[chat] stream: suppressed expected abort", {
+            completionId,
+            clientDisconnected,
+            requestAborted: c.req.raw.signal.aborted,
+            streamStillRegistered,
+            errorName: err?.name,
+            errorMessage: err?.message,
+          });
+        }
+        return;
+      }
 
-            // Idle/upstream aborts are retryable when the client is still connected
-            if (
-              isAbortError(err) &&
-              !clientDisconnected &&
-              !c.req.raw.signal.aborted
-            ) {
-              throw createRetryableUpstreamError(
-                "stream_aborted",
-                err?.message || "This operation was aborted",
-                {
-                  switchAccount: true,
-                  forceNewChat: true,
-                  retryAfterMs: Math.min(config.retry.baseDelayMs * 2, 3000),
-                },
-              );
-            }
-            throw err;
+      // Idle/upstream aborts are retryable when the client is still connected
+      if (
+        isAbortError(err) &&
+        !clientDisconnected &&
+        !c.req.raw.signal.aborted
+      ) {
+        throw toRetryableStreamError(
+          "stream_aborted",
+          err?.message || "This operation was aborted",
+          {
+            switchAccount: true,
+            forceNewChat: true,
+            retryAfterMs: Math.min(config.retry.baseDelayMs * 2, 3000),
+            reason: "stream_aborted",
+          },
+        );
+      }
+      throw err;
     } finally {
       if (isToolcallDebugEnabled()) {
         logger.debug("[chat] stream: cleanup started", {
@@ -1692,6 +1430,8 @@ export async function processStreamingResponse(
           clientDisconnected,
         });
       }
+
+      flushWrites();
 
       c.req.raw.signal.removeEventListener("abort", abortHandler);
       if (heartbeatTimeout) {

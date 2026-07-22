@@ -411,6 +411,7 @@ export interface QwenPayload {
   stream: boolean;
   version: string;
   incremental_output: boolean;
+  stream_options?: { include_usage: boolean };
   chat_id: string | null;
   chat_mode: string;
   model: string;
@@ -513,7 +514,7 @@ function rememberActivePersonalization(
     chars: size.chars,
     bytes: size.bytes,
     hash: size.hash,
-    estimatedTokens: estimateTokenCount(instruction, metadata.model),
+    estimatedTokens: estimateTokenCount(instruction),
     source,
     updatedAt: Date.now(),
   });
@@ -648,6 +649,8 @@ export async function syncQwenRequestPersonalization(
     toolsCount?: number;
     sessionId?: string | null;
     promptChars?: number;
+    /** Bypass memory/DB/GET caches and always POST. Used on new chat creation. */
+    forceSync?: boolean;
   } = {},
 ): Promise<void> {
   if (isAuthMockEnabled()) return;
@@ -664,17 +667,18 @@ export async function syncQwenRequestPersonalization(
 
   const sent = textSize(instruction);
   const syncHash = sent.hash ? `${sent.hash}:${QWEN_SAFE_SETTINGS_HASH}` : null;
+  const bypassCache = metadata.forceSync === true;
 
-  // 1. Check memory cache
+  // 1. Check memory cache (skipped on forceSync)
   const cachedHash = lastSyncedPersonalizationHashes.get(cacheKey);
-  if (syncHash && cachedHash === syncHash) {
+  if (!bypassCache && syncHash && cachedHash === syncHash) {
     rememberActivePersonalization(cacheKey, instruction, metadata, "memory");
     // Personalization unchanged - no log needed
     return;
   }
 
-  // 2. Check DB cache (survives restarts)
-  if (syncHash && !cachedHash) {
+  // 2. Check DB cache (survives restarts) (skipped on forceSync)
+  if (!bypassCache && syncHash && !cachedHash) {
     const dbHash = getPersonalizationHashFromDb(cacheKey);
     if (dbHash === syncHash) {
       lastSyncedPersonalizationHashes.set(cacheKey, syncHash);
@@ -687,8 +691,8 @@ export async function syncQwenRequestPersonalization(
   let existing = { chars: null, bytes: null, hash: null } as ReturnType<
     typeof textSize
   >;
-  // Verifica GET apenas se temos um hash válido
-  if (syncHash && !cachedHash && config.qwen.personalizationVerifyGet) {
+  // Verifica GET apenas se temos um hash válido (skipped on forceSync)
+  if (!bypassCache && syncHash && !cachedHash && config.qwen.personalizationVerifyGet) {
     try {
       const existingResponse = await fetch(
         `${config.qwen.baseUrl}/api/v2/users/user/settings`,
@@ -924,9 +928,6 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
             `⚠️  [Qwen] Failed to disable native tools for ${cacheKey} (attempt ${attempt}/${DISABLE_TOOLS_MAX_RETRIES}): ${lastError}`,
           );
         } else {
-          console.log(
-            `✅ [Qwen] Native tools disabled successfully for ${cacheKey}.`,
-          );
           nativeToolsDisabled.add(cacheKey);
           return;
         }
@@ -1682,20 +1683,24 @@ export async function createQwenStream(
       });
     }
 
-    // Dynamic idle timeout based on payload size
-    // Base: 60s + 30s per MB of payload
+    // Dynamic idle timeout based on model type and payload size
+    // Reasoning models (thinking enabled): use REASONING_MODEL_TIMEOUT as base (600s default)
+    // Non-reasoning models: use IDLE_STREAM_TIMEOUT as base (60s default)
+    // Both add 30s per MB of payload
+    const baseTimeoutMs = enableThinking
+      ? config.timeouts.reasoningModelTimeout
+      : config.timeouts.idleStreamTimeout;
     const payloadMB = payloadSize / (1024 * 1024);
-    const dynamicIdleTimeoutMs =
-      config.timeouts.idleStreamTimeout + Math.ceil(payloadMB * 30_000);
+    const dynamicIdleTimeoutMs = baseTimeoutMs + Math.ceil(payloadMB * 30_000);
 
-    if (dynamicIdleTimeoutMs > config.timeouts.idleStreamTimeout) {
-      logger.debug("[Qwen] dynamic idle timeout", {
-        chatId: chatSessionId || "new",
-        payloadMB: payloadMB.toFixed(2),
-        baseTimeout: config.timeouts.idleStreamTimeout,
-        dynamicTimeout: dynamicIdleTimeoutMs,
-      });
-    }
+    logger.debug("[Qwen] dynamic idle timeout", {
+      chatId: chatSessionId || "new",
+      model: modelId,
+      enableThinking,
+      payloadMB: payloadMB.toFixed(2),
+      baseTimeout: baseTimeoutMs,
+      dynamicTimeout: dynamicIdleTimeoutMs,
+    });
 
     return addIdleTimeoutToStream(
       stream,

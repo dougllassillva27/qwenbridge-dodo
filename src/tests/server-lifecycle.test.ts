@@ -17,7 +17,7 @@ function isPortAvailable(port: number): Promise<boolean> {
 }
 
 test("server lifecycle starts and stops without accounts or HTTP fallback", async (t) => {
-  const port = 3000;
+  const port = Number(process.env.PORT || "3000");
   if (!(await isPortAvailable(port))) {
     t.skip(`port ${port} is not available`);
     return;

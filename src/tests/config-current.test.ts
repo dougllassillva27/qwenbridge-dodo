@@ -9,17 +9,18 @@ test("config exposes only Playwright/thread-native current auth and context sett
   assert.equal("enabled" in config.playwright, false);
   assert.equal("rateLimit" in config, false);
   assert.equal("topicDetection" in config, false);
-  assert.equal("mode" in config.context, false);
 
-  assert.equal(typeof config.context.summarization.enabled, "boolean");
-  assert.equal(
-    typeof config.context.threadNative.persistenceEnabled,
-    "boolean",
-  );
   assert.equal(typeof config.qwen.personalizationFromRequest, "boolean");
   assert.equal(typeof config.playwright.initBatchSize, "number");
   assert.equal(typeof config.playwright.contextCloseTimeoutMs, "number");
   assert.equal(typeof config.playwright.idleContextTtlMs, "number");
+  assert.equal(typeof config.playwright.jsHeapMb, "number");
+  assert.equal(typeof config.playwright.lowMemoryFlags, "boolean");
+  assert.equal(typeof config.oss.multipartThresholdBytes, "number");
+  assert.ok(config.playwright.jsHeapMb >= 64);
+  assert.ok(config.oss.multipartThresholdBytes >= 1024 * 1024);
+  assert.equal(typeof config.captchaSolver.enabled, "boolean");
+  assert.equal(typeof config.captchaSolver.timeoutMs, "number");
   assert.equal(typeof config.sessionKeeper.enabled, "boolean");
   assert.equal(typeof config.sessionKeeper.intervalMs, "number");
   assert.equal(typeof config.sessionKeeper.idleMs, "number");

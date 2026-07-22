@@ -245,7 +245,7 @@ export class Metrics extends EventEmitter {
 
 export const metrics = new Metrics();
 
-// [Dodo] Token usage por conta — usado pelo dashboard Tauri via /accounts e /metrics/accounts
+// [Dodo] Token usage por conta é usado pelo dashboard Tauri via /accounts e /metrics/accounts
 export const accountTokenUsage: Record<string, { prompt: number; completion: number; total: number }> = {};
 
 export function recordAccountTokens(

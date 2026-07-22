@@ -22,81 +22,12 @@ import {
 import { config } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
 import {
-  deleteQwenChat,
   getLogicalThreadState,
   RetryableQwenStreamError,
 } from "../../services/qwen.ts";
-import { isAuthMockEnabled } from "../../services/auth-playwright.ts";
-import { enqueueThreadContextSummary } from "../../services/thread-context-jobs.ts";
-import {
-  finalizeThreadContextRolloverSuccess,
-  markThreadContextRolloverStarted,
-  prepareThreadContextRollover,
-  type ThreadContextRolloverPlan,
-} from "../../services/thread-context-rollover.ts";
-import {
-  saveThreadContextCompletion,
-  setThreadContextStatus,
-  upsertThreadContextSession,
-} from "../../services/thread-context-store.ts";
-import {
-  summarizeLargePayload,
-  rebuildPromptWithSummary,
-  truncateMessages,
-} from "../../services/payload-summarizer.ts";
+import { classifyRetryAction } from "./retry-policy.ts";
 
-async function reducePromptForRetry(
-  messages: Array<{ role: string; content: any }>,
-  systemPrompt: string,
-  model: string,
-): Promise<string | null> {
-  try {
-    if (messages.length > 2) {
-      const result = await summarizeLargePayload(messages, model);
-      if (result) {
-        const keepCount = Math.min(2, messages.length);
-        const recentMessages = messages.slice(messages.length - keepCount);
-        const prompt = rebuildPromptWithSummary(
-          systemPrompt,
-          recentMessages,
-          result.summary,
-        );
-        console.log(
-          `📝 [Chat] Reduced prompt via summarization: ${result.originalChars} → ${result.summaryChars} chars`,
-        );
-        return prompt;
-      }
-    }
 
-    // Fallback: truncate individual messages
-    const truncated = truncateMessages(messages);
-    const truncatedText = truncated
-      .map((msg: any) => {
-        const content =
-          typeof msg.content === "string"
-            ? msg.content
-            : Array.isArray(msg.content)
-              ? msg.content
-                  .map((p: any) => p.text || JSON.stringify(p))
-                  .join("\n")
-              : JSON.stringify(msg.content);
-        return `${msg.role}: ${content}`;
-      })
-      .join("\n\n");
-    const prompt = systemPrompt
-      ? `${systemPrompt}\n\n${truncatedText}`
-      : truncatedText;
-    console.warn(
-      `⚠️  [Chat] Reduced prompt via truncation: ${messages.length} messages → ${prompt.length} chars`,
-    );
-    return prompt;
-  } catch (err) {
-    console.warn(
-      `❌ [Chat] Failed to reduce prompt: ${(err as Error).message}`,
-    );
-    return null;
-  }
-}
 
 function formatTimingHeader(timings: Record<string, number>): string {
   return Object.entries(timings)
@@ -128,7 +59,6 @@ export async function chatCompletions(c: Context) {
       currentFiles,
       shouldParseToolCalls,
       conversationKey,
-      isInternalSummarizationRequest,
     } = parsed;
 
     const messages = body.messages || [];
@@ -146,7 +76,6 @@ export async function chatCompletions(c: Context) {
       enableThinking,
       conversationKey,
       hasExplicitConversationKey: parsed.hasExplicitConversationKey,
-      isInternalSummarizationRequest,
     });
     mark("context", stepStartedAt);
 
@@ -162,37 +91,7 @@ export async function chatCompletions(c: Context) {
     }
     mark("lock", stepStartedAt);
 
-    // Thread context management should run for ALL requests in thread-native mode
-    // This ensures the first turn is saved and thread context is properly managed
-    const shouldManageThreadContext =
-      ctx.useThreadNative &&
-      !ctx.isAuxiliaryRequest &&
-      !!ctx.sessionId &&
-      config.context.threadNative.persistenceEnabled &&
-      !isAuthMockEnabled();
-
     let finalPrompt = ctx.finalPrompt;
-    let activeRolloverPlan: ThreadContextRolloverPlan | null = null;
-
-    stepStartedAt = Date.now();
-    if (shouldManageThreadContext && ctx.sessionId) {
-      upsertThreadContextSession({
-        sessionId: ctx.sessionId,
-        model: body.model,
-        modelContextWindow: ctx.modelContextWindow,
-        systemPrompt,
-      });
-
-      const prepared = await prepareThreadContextRollover({
-        sessionId: ctx.sessionId,
-        finalPrompt,
-        currentPrompt: currentPrompt || prompt,
-        systemPrompt,
-        skipRollover: ctx.isAuxiliaryRequest,
-      });
-      finalPrompt = prepared.finalPrompt;
-      activeRolloverPlan = prepared.rollover;
-    }
     mark("thread", stepStartedAt);
 
     const files = ctx.useThreadNative ? currentFiles : allFiles;
@@ -204,9 +103,6 @@ export async function chatCompletions(c: Context) {
 
     const personalizationChars =
       ctx.requestPersonalizationInstruction?.length ?? 0;
-    console.log(
-      `📤 [Chat] Request | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
-    );
     logger.debug("[chat] request routing details", {
       model: body.model,
       messages: msgCount,
@@ -230,11 +126,15 @@ export async function chatCompletions(c: Context) {
     });
 
     stepStartedAt = Date.now();
+    // fullPrompt always carries system + full conversation history so account
+    // failover / forceNewChat can rebuild upstream context without deltas only.
+    const fullPromptForRequest = ctx.requestPersonalizationInstruction
+      ? parsed.prompt
+      : parsed.systemPrompt + parsed.prompt;
+
     let streamResult = await acquireUpstreamStream({
       finalPrompt,
-      fullPrompt: ctx.requestPersonalizationInstruction
-        ? parsed.prompt
-        : parsed.systemPrompt + parsed.prompt,
+      fullPrompt: fullPromptForRequest,
       isThinkingModel: ctx.isThinkingModel,
       model: body.model,
       shouldResetUpstreamThread: ctx.shouldResetUpstreamThread,
@@ -244,52 +144,15 @@ export async function chatCompletions(c: Context) {
       useThreadNative: ctx.useThreadNative,
       updateLogicalThread: ctx.updateLogicalThread,
       allowThreadReuse: ctx.allowThreadReuse,
-      forceNewChat:
-        activeRolloverPlan !== null || isInternalSummarizationRequest,
-      preferredAccountId: activeRolloverPlan?.preferredAccountId ?? null,
+      forceNewChat: false,
+      preferredAccountId: undefined,
       messageCount: msgCount,
       fullMessageCount: parsed.messageCount,
       toolsCount: declaredTools.length || undefined,
       requestPersonalizationInstruction: ctx.requestPersonalizationInstruction,
     });
 
-    // TMD retry: if all accounts failed with anti-bot, summarize/truncate and retry
-    if (
-      "error" in streamResult &&
-      streamResult.error?.upstreamCode === "FAIL_SYS_USER_VALIDATE"
-    ) {
-      console.warn(
-        `[Chat] TMD on all accounts; summarizing/truncating prompt and retrying...`,
-      );
-      const reducedPrompt = await reducePromptForRetry(
-        messages,
-        systemPrompt,
-        body.model,
-      );
-      if (reducedPrompt && reducedPrompt.length < finalPrompt.length) {
-        finalPrompt = reducedPrompt;
-        streamResult = await acquireUpstreamStream({
-          finalPrompt,
-          fullPrompt: finalPrompt,
-          isThinkingModel: ctx.isThinkingModel,
-          model: body.model,
-          shouldResetUpstreamThread: ctx.shouldResetUpstreamThread,
-          allFiles: files,
-          isNewSession: ctx.isNewSession,
-          sessionId: ctx.sessionId,
-          useThreadNative: ctx.useThreadNative,
-          updateLogicalThread: ctx.updateLogicalThread,
-          allowThreadReuse: ctx.allowThreadReuse,
-          forceNewChat: true,
-          preferredAccountId: null,
-          messageCount: msgCount,
-          fullMessageCount: parsed.messageCount,
-          toolsCount: declaredTools.length || undefined,
-          requestPersonalizationInstruction:
-            ctx.requestPersonalizationInstruction,
-        });
-      }
-    }
+
 
     mark("upstream", stepStartedAt);
     timings.preResponse = Date.now() - startedAt;
@@ -311,93 +174,14 @@ export async function chatCompletions(c: Context) {
         err.upstreamStatus = 429;
         throw err;
       }
-      if (activeRolloverPlan) {
-        setThreadContextStatus(
-          activeRolloverPlan.sessionId,
-          "error",
-          streamResult.error instanceof Error
-            ? streamResult.error.message
-            : "Rollover stream acquisition failed",
-        );
-      }
       throw streamResult.error || new Error("All accounts failed");
     }
 
     console.log(
-      `🚀 [Chat] Request routed | ${streamResult.activeAccountLabel} | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
+      `📤 [Chat] Request | ${streamResult.activeAccountLabel} | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
     );
 
-    if (activeRolloverPlan) {
-      activeRolloverPlan = markThreadContextRolloverStarted({
-        plan: activeRolloverPlan,
-        toAccountId: streamResult.activeAccountId,
-        toChatId: streamResult.uiSessionId,
-      });
-    }
-
-    const onAssistantComplete = shouldManageThreadContext
-      ? async (event: AssistantCompleteEvent) => {
-          if (!event.sessionId || !event.chatSessionId) return;
-
-          const savedSession = saveThreadContextCompletion({
-            sessionId: event.sessionId,
-            model: body.model,
-            modelContextWindow: ctx.modelContextWindow,
-            accountId: event.accountId,
-            chatSessionId: event.chatSessionId,
-            parentId: event.parentId,
-            responseId: event.responseId,
-            userPrompt: event.userPrompt,
-            finalPrompt: event.finalPrompt,
-            assistantContent: event.assistantContent,
-            usage: event.usage,
-            finishReason: event.finishReason,
-            resetThreadEstimate: activeRolloverPlan !== null,
-            metadata: {
-              rolloverId: activeRolloverPlan?.rolloverId ?? null,
-              rolloverReason: activeRolloverPlan?.reason ?? null,
-              reasoningCharacters: event.reasoningContent?.length ?? 0,
-            },
-          });
-
-          if (
-            activeRolloverPlan &&
-            (event.responseId || event.assistantContent.trim().length > 0)
-          ) {
-            await finalizeThreadContextRolloverSuccess(activeRolloverPlan);
-          }
-
-          // Background summaries disabled — only summarize at rollover limit
-          // enqueueThreadContextSummary(
-          //   savedSession.sessionId,
-          //   "assistant_complete",
-          // );
-        }
-      : isInternalSummarizationRequest
-        ? async (event: AssistantCompleteEvent) => {
-            if (!event.chatSessionId) return;
-            try {
-              await deleteQwenChat(
-                event.chatSessionId,
-                event.accountId && event.accountId !== "global"
-                  ? event.accountId
-                  : undefined,
-              );
-              console.log(
-                `[ThreadContext] Summary chat deleted | ${event.chatSessionId}`,
-              );
-            } catch (error) {
-              logger.warn(
-                "[thread-context] failed to delete auxiliary summary chat",
-                {
-                  chatSessionId: event.chatSessionId,
-                  accountId: event.accountId,
-                  error: error instanceof Error ? error.message : String(error),
-                },
-              );
-            }
-          }
-        : undefined;
+    const onAssistantComplete: ((event: AssistantCompleteEvent) => Promise<void> | void) | undefined = undefined;
 
     const params = {
       c,
@@ -422,159 +206,156 @@ export async function chatCompletions(c: Context) {
       },
     };
 
-    // Retry loop for stream processing errors (quota/anti-bot during SSE)
-    let streamProcessingRetries = 2;
-    let currentStreamResult = streamResult;
-    let currentParams = params;
+    // Retry loop for mid-stream/create-stream failures (generic policy)
+        let streamProcessingRetries = Math.max(0, config.retry.maxAttempts - 1);
+        let currentStreamResult = streamResult;
+        let currentParams = params;
 
-    while (true) {
-      try {
-        return isStream
-          ? await processStreamingResponse(currentParams)
-          : await processNonStreamingResponse(currentParams);
-      } catch (streamErr: any) {
-        // Only retry RetryableQwenStreamError (quota/anti-bot during stream)
-        if (
-          streamProcessingRetries > 0 &&
-          streamErr instanceof RetryableQwenStreamError
-        ) {
-          streamProcessingRetries--;
-          console.warn(
-            `[Chat] Stream processing error, retrying with new stream | ${streamErr.message?.substring(0, 150)} | retries left: ${streamProcessingRetries}`,
-          );
+        while (true) {
+          try {
+            return isStream
+              ? await processStreamingResponse(currentParams)
+              : await processNonStreamingResponse(currentParams);
+          } catch (streamErr: any) {
+            const policy = classifyRetryAction(streamErr);
 
-          const switchAccount = Boolean(
-                      (streamErr as { switchAccount?: boolean }).switchAccount,
-                    );
-                    const errCode =
-                      (streamErr as { upstreamCode?: string }).upstreamCode || "";
+            // Prefer explicit RetryableQwenStreamError OR generic retryable policy
+            const canRetry =
+              streamProcessingRetries > 0 &&
+              policy.retryable &&
+              (streamErr instanceof RetryableQwenStreamError ||
+                config.retry.onUnknownUpstream !== false);
 
-                    // Mark current account for cooldown on account-scoped errors
-                    if (
-                      streamErr.message?.includes("quota") ||
-                      errCode === "quota_limit" ||
-                      streamErr.message?.includes("alta demanda") ||
-                      streamErr.message?.includes("high demand")
-                    ) {
-                      const { markAccountRateLimited } =
-                        await import("../../core/account-manager.ts");
-                      markAccountRateLimited(
-                        currentStreamResult.activeAccountId,
-                        undefined,
-                        errCode === "quota_limit" ? "QuotaLimit" : "QuotaExceeded",
-                      );
-                    }
-
-                    // Release current chat lock
-                    if (releaseChatLock) {
-                      releaseChatLock();
-                      releaseChatLock = null;
-                    }
-
-                    const fullPromptForRetry = ctx.requestPersonalizationInstruction
-                      ? parsed.prompt
-                      : parsed.systemPrompt + parsed.prompt;
-                    const forceRetryNewChat = Boolean(
-                      (streamErr as { forceNewChat?: boolean }).forceNewChat,
-                    );
-                    const retryFinalPrompt = (
-                      streamErr as { retryWithFullPrompt?: boolean }
-                    ).retryWithFullPrompt
-                      ? fullPromptForRetry
-                      : finalPrompt;
-                    const retryMessageCount = (
-                      streamErr as { retryWithFullPrompt?: boolean }
-                    ).retryWithFullPrompt
-                      ? parsed.messageCount
-                      : msgCount;
-
-                    if (forceRetryNewChat) {
-                      console.warn(
-                        `[Chat] Retry will force a new upstream chat and resend full context | ${streamErr.message?.substring(0, 150)}`,
-                      );
-                    }
-                    if (switchAccount) {
-                      console.warn(
-                        `[Chat] Retry will prefer another account when available | ${streamErr.message?.substring(0, 150)}`,
-                      );
-                    }
-
-                    // Re-acquire stream with different account or a fresh upstream chat
-                    const newStreamResult = await acquireUpstreamStream({
-                      finalPrompt: retryFinalPrompt,
-                      fullPrompt: fullPromptForRetry,
-                      isThinkingModel: ctx.isThinkingModel,
-                      model: body.model,
-                      shouldResetUpstreamThread: ctx.shouldResetUpstreamThread,
-                      allFiles: files,
-                      isNewSession: ctx.isNewSession,
-                      sessionId: ctx.sessionId,
-                      useThreadNative: ctx.useThreadNative,
-                      updateLogicalThread: ctx.updateLogicalThread,
-                      allowThreadReuse: ctx.allowThreadReuse,
-                      forceNewChat:
-                        forceRetryNewChat ||
-                        activeRolloverPlan !== null ||
-                        isInternalSummarizationRequest,
-                      // null => rotate away from sticky account when possible
-                      preferredAccountId: switchAccount
-                        ? null
-                        : (activeRolloverPlan?.preferredAccountId ?? null),
-                      messageCount: retryMessageCount,
-            fullMessageCount: parsed.messageCount,
-            toolsCount: declaredTools.length || undefined,
-            requestPersonalizationInstruction:
-              ctx.requestPersonalizationInstruction,
-          });
-
-          if ("error" in newStreamResult) {
-            // Can't get new stream, fail with original error
-            throw streamErr;
-          }
-
-          console.log(
-            `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry`,
-          );
-
-          // Re-acquire chat lock for new stream
-          if (ctx.allowThreadReuse && ctx.sessionId) {
-            const existingThread = getLogicalThreadState(ctx.sessionId);
-            const chatId = existingThread?.chatSessionId;
-            if (chatId) {
-              releaseChatLock = await acquireChatLock(chatId);
+            if (!canRetry) {
+              throw streamErr;
             }
-          }
 
-          currentStreamResult = newStreamResult;
-          currentParams = {
-            c,
-            completionId: newStreamResult.completionId,
-            stream: newStreamResult.stream,
-            uiSessionId: newStreamResult.uiSessionId,
-            activeAccountId: newStreamResult.activeAccountId,
-            activeAccountLabel: newStreamResult.activeAccountLabel,
-            logicalSessionId: newStreamResult.logicalSessionId,
-            body,
-            finalPrompt: retryFinalPrompt,
-            userPrompt: currentPrompt || prompt,
-            shouldParseToolCalls,
-            declaredTools,
-            tokenEstimationContext: newStreamResult.tokenEstimationContext,
-            onAssistantComplete,
-            onStreamComplete: () => {
-              if (releaseChatLock) {
-                releaseChatLock();
-                releaseChatLock = null;
+            streamProcessingRetries--;
+            console.warn(
+              `[Chat] Stream processing error, retrying with new stream | reason=${policy.reason} | ${streamErr.message?.substring(0, 150)} | retries left: ${streamProcessingRetries}`,
+            );
+
+            const switchAccount = policy.switchAccount;
+            const forceRetryNewChat = policy.forceNewChat;
+            const retryWithFullPrompt = policy.retryWithFullPrompt;
+
+            // Mark current account for cooldown when policy requests it
+            if (policy.accountCooldownMs || policy.accountCooldownReason) {
+              const { markAccountRateLimited } =
+                await import("../../core/account-manager.ts");
+              markAccountRateLimited(
+                currentStreamResult.activeAccountId,
+                policy.accountCooldownMs,
+                policy.accountCooldownReason || "StreamRetry",
+              );
+            }
+
+            // Release current chat lock
+            if (releaseChatLock) {
+              releaseChatLock();
+              releaseChatLock = null;
+            }
+
+            // Account switch always rebuilds full history; same-account retry
+            // only does so when the policy asks for forceNewChat/full prompt.
+            const needsFullPromptOnRetry =
+              retryWithFullPrompt || switchAccount || forceRetryNewChat;
+            const retryFinalPrompt = needsFullPromptOnRetry
+              ? fullPromptForRequest
+              : finalPrompt;
+            const retryMessageCount = needsFullPromptOnRetry
+              ? parsed.messageCount
+              : msgCount;
+
+            if (forceRetryNewChat || switchAccount) {
+              console.warn(
+                `[Chat] Retry will force a new upstream chat and resend full context | ${streamErr.message?.substring(0, 150)}`,
+              );
+            }
+            if (switchAccount) {
+              console.warn(
+                `[Chat] Retry will prefer another account when available | ${streamErr.message?.substring(0, 150)}`,
+              );
+            }
+
+            if (policy.retryAfterMs > 0) {
+              await new Promise((resolve) =>
+                setTimeout(resolve, Math.min(policy.retryAfterMs, 3000)),
+              );
+            }
+
+            // Re-acquire stream with different account or a fresh upstream chat
+            const newStreamResult = await acquireUpstreamStream({
+              finalPrompt: retryFinalPrompt,
+              fullPrompt: fullPromptForRequest,
+              isThinkingModel: ctx.isThinkingModel,
+              model: body.model,
+              shouldResetUpstreamThread: ctx.shouldResetUpstreamThread,
+              allFiles: files,
+              isNewSession: ctx.isNewSession,
+              sessionId: ctx.sessionId,
+              useThreadNative: ctx.useThreadNative,
+              updateLogicalThread: ctx.updateLogicalThread,
+              allowThreadReuse: ctx.allowThreadReuse,
+              forceNewChat:
+                forceRetryNewChat || switchAccount,
+              preferredAccountId: switchAccount
+                ? null
+                : currentStreamResult.activeAccountId,
+              excludeAccountIds: switchAccount
+                ? [currentStreamResult.activeAccountId]
+                : undefined,
+              messageCount: retryMessageCount,
+              fullMessageCount: parsed.messageCount,
+              toolsCount: declaredTools.length || undefined,
+              requestPersonalizationInstruction:
+                ctx.requestPersonalizationInstruction,
+            });
+
+            if ("error" in newStreamResult) {
+              // Can't get new stream, fail with original error
+              throw streamErr;
+            }
+
+            console.log(
+              `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry`,
+            );
+
+            // Re-acquire chat lock for new stream
+            if (ctx.allowThreadReuse && ctx.sessionId) {
+              const existingThread = getLogicalThreadState(ctx.sessionId);
+              const chatId = existingThread?.chatSessionId;
+              if (chatId) {
+                releaseChatLock = await acquireChatLock(chatId);
               }
-            },
-          };
-          continue;
-        }
+            }
 
-        // Not retryable or retries exhausted — propagate error
-        throw streamErr;
-      }
-    }
+            currentStreamResult = newStreamResult;
+            currentParams = {
+              c,
+              completionId: newStreamResult.completionId,
+              stream: newStreamResult.stream,
+              uiSessionId: newStreamResult.uiSessionId,
+              activeAccountId: newStreamResult.activeAccountId,
+              activeAccountLabel: newStreamResult.activeAccountLabel,
+              logicalSessionId: newStreamResult.logicalSessionId,
+              body,
+              finalPrompt: retryFinalPrompt,
+              userPrompt: currentPrompt || prompt,
+              shouldParseToolCalls,
+              declaredTools,
+              tokenEstimationContext: newStreamResult.tokenEstimationContext,
+              onAssistantComplete,
+              onStreamComplete: () => {
+                if (releaseChatLock) {
+                  releaseChatLock();
+                  releaseChatLock = null;
+                }
+              },
+            };
+            continue;
+          }
+        }
   } catch (err) {
     timings.preResponse = Date.now() - startedAt;
     c.header("X-QwenBridge-Timing", formatTimingHeader(timings));

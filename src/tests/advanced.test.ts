@@ -301,11 +301,22 @@ test("session-parent-tracking: sends only current delta using response message_i
     assert.strictEqual(capturedPayloads.length, 2);
     // In Turn 1, parent_id should be null (mock-session is fresh)
     assert.strictEqual(capturedPayloads[0].parent_id, null);
+    assert.strictEqual(capturedPayloads[0].messages[0].user_action, "chat");
     // In Turn 2, parent_id should be qwen-1001 (the ID returned in Turn 1)
     assert.strictEqual(
       capturedPayloads[1].parent_id,
       "qwen-1001",
       "Turn 2 should use response_id from Turn 1 as parent",
+    );
+    assert.strictEqual(
+      capturedPayloads[1].messages[0].parentId,
+      "qwen-1001",
+      "message.parentId must match root parent_id for append",
+    );
+    assert.strictEqual(
+      capturedPayloads[1].messages[0].user_action,
+      "chat",
+      "append turns must use user_action=chat, never edit",
     );
     assert.strictEqual(
       capturedPayloads[1].messages[0].content,
@@ -317,7 +328,91 @@ test("session-parent-tracking: sends only current delta using response message_i
   }
 });
 
-test("thread-native: keeps system and tools out of chat content without replaying history", async () => {
+test("session-parent-tracking (stream): next turn parent is previous response_id", async () => {
+  const capturedPayloads: any[] = [];
+
+  const restore = setupFetchMock((url, init) => {
+    const bodyObj = JSON.parse((init?.body as string) || "{}");
+    capturedPayloads.push(bodyObj);
+
+    const mockMessageId =
+      capturedPayloads.length === 1 ? "qwen-stream-1001" : "qwen-stream-1002";
+
+    const stream = new ReadableStream({
+      start(c) {
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response.created":{"chat_id":"qwen-chat-stream-parent","response_id":"${mockMessageId}"}}\n\n`,
+          ),
+        );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"${mockMessageId}","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\n`,
+          ),
+        );
+        c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
+        c.close();
+      },
+    });
+    return new Response(stream, { status: 200 });
+  });
+
+  try {
+    const sessionId = "test-session-parent-tracking-stream";
+
+    const res1 = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          stream: true,
+          session_id: sessionId,
+          messages: [{ role: "user", content: "Turn 1 stream" }],
+        }),
+      }),
+    );
+    assert.strictEqual(res1.status, 200);
+    await res1.text();
+
+    const res2 = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          stream: true,
+          session_id: sessionId,
+          messages: [
+            { role: "user", content: "Turn 1 stream" },
+            { role: "assistant", content: "Response 1" },
+            { role: "user", content: "Turn 2 stream" },
+          ],
+        }),
+      }),
+    );
+    assert.strictEqual(res2.status, 200);
+    await res2.text();
+
+    assert.strictEqual(capturedPayloads.length, 2);
+    assert.strictEqual(capturedPayloads[0].parent_id, null);
+    assert.strictEqual(capturedPayloads[0].messages[0].user_action, "chat");
+    assert.strictEqual(
+      capturedPayloads[1].parent_id,
+      "qwen-stream-1001",
+      "Stream turn 2 must parent to response_id from turn 1 (append, not edit)",
+    );
+    assert.strictEqual(capturedPayloads[1].messages[0].user_action, "chat");
+    assert.strictEqual(
+      capturedPayloads[1].messages[0].content,
+      "User: Turn 2 stream\n\n",
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("thread-native: includes system and tools in first message, excludes from continuations", async () => {
   const capturedPayloads: any[] = [];
 
   const restore = setupFetchMock((url, init) => {
@@ -395,10 +490,14 @@ test("thread-native: keeps system and tools out of chat content without replayin
     assert.equal(typeof capturedPayloads[0].chat_id, "string");
     assert.ok(capturedPayloads[0].chat_id.length > 0);
     assert.strictEqual(capturedPayloads[1].chat_id, "qwen-chat-first-only");
-    assert.strictEqual(firstContent, "User: Turn 1\n\n");
+    
+    // First message (new chat) includes system prompt and tools
+    assert.ok(firstContent.includes("FIRST_ONLY_SYSTEM_MARKER"), "First message should include system prompt");
+    assert.ok(firstContent.includes("first_only_tool_marker"), "First message should include tools");
+    assert.ok(firstContent.includes("User: Turn 1"), "First message should include user content");
+    
+    // Continuation message excludes system prompt, tools, and history replay
     assert.strictEqual(secondContent, "User: Turn 2\n\n");
-    assert.ok(!firstContent.includes("FIRST_ONLY_SYSTEM_MARKER"));
-    assert.ok(!firstContent.includes("first_only_tool_marker"));
     assert.ok(!secondContent.includes("FIRST_ONLY_SYSTEM_MARKER"));
     assert.ok(!secondContent.includes("first_only_tool_marker"));
     assert.ok(!secondContent.includes("User: Turn 1"));

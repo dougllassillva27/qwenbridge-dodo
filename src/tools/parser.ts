@@ -712,6 +712,12 @@ export class StreamingToolParser {
   private markdownCodeDelimiterLength = 0;
   private incrementalToolCalls = false;
   private activeIncrementalToolCall: ActiveIncrementalToolCall | null = null;
+  private malformedToolCalls: Array<{
+    contentPreview: string;
+    contentLength: number;
+    timestamp: number;
+    undeclaredNames?: string[];
+  }> = [];
 
   /**
    * @param tools - Optional array of tool definitions for name inference
@@ -729,6 +735,20 @@ export class StreamingToolParser {
         incrementalToolCalls: this.incrementalToolCalls,
       });
     }
+  }
+
+  /**
+   * Get malformed tool calls that were dropped (for error feedback).
+   */
+  getMalformedToolCalls() {
+    return this.malformedToolCalls;
+  }
+
+  /**
+   * Clear malformed tool calls tracking.
+   */
+  clearMalformedToolCalls() {
+    this.malformedToolCalls = [];
   }
 
   /**
@@ -1520,18 +1540,15 @@ export class StreamingToolParser {
     // 4) Tool call is malformed and unrecoverable.
     // Never leak internal XML to user-visible content.
     // Restore lead-in text if no tools were emitted.
-    logger.warn("[parser] Dropping malformed tool call block", {
-      contentPreview: t.substring(0, 500),
-      hasName:
-        t.includes('"name"') || t.includes('"tool"') || t.includes("tool_name"),
-      hasArgs:
-        t.includes('"arguments"') ||
-        t.includes('"args"') ||
-        t.includes('"parameters"') ||
-        t.includes('"input"'),
-      first100Chars: t.substring(0, 100),
+    const malformedInfo = {
+      contentPreview: t.substring(0, 150),
       contentLength: t.length,
-    });
+      timestamp: Date.now(),
+    };
+    
+    this.malformedToolCalls.push(malformedInfo);
+    
+    logger.warn(`[parser] Dropping malformed tool call (${t.length} chars): ${t.substring(0, 80).replace(/\n/g, " ")}...`);
     if (
       this.emittedToolCallCount === 0 &&
       this.pendingLeadIn.trim().length > 0

@@ -32,7 +32,6 @@ try {
     const plugin = stealth.default();
     pwExtra.chromium.use(plugin);
     chromiumWithStealth = pwExtra.chromium;
-    console.log("🛡️  [Playwright] Stealth plugin loaded");
   }
 } catch {
   console.warn(
@@ -109,7 +108,6 @@ export function buildChromiumLaunchArgs(viewport: {
   } else {
     args.push("--window-position=0,0");
   }
-
   args.push("--start-minimized");
 
   return args;
@@ -445,19 +443,12 @@ export async function initPlaywrightForAccount(
   try {
     // Double-check after acquiring lock
     if (accountPages.has(account.id)) {
-      console.log(
-        `[Playwright] Already initialized for ${maskEmail(account.email)}`,
-      );
       return;
     }
 
     const profilePath = path.resolve("data", "qwen_profiles", account.id);
     const fingerprint = getFingerprintProfile(account.id);
     const { engine, channel } = resolveBrowserEngine(browserType);
-
-    console.log(
-      `🚀 [Playwright] Launching ${browserType} for ${maskEmail(account.email)}...`,
-    );
 
     // Use playwright-extra with stealth if available, otherwise regular chromium
     const engineToUse = chromiumWithStealth || engine;
@@ -499,8 +490,10 @@ export async function initPlaywrightForAccount(
           c.name.toLowerCase().includes("session"),
       );
 
+      let didLogin = false;
       if (!hasAuthCookie && account.email && account.password) {
         await loginToQwen(account.id, account.email, account.password);
+        didLogin = true;
       }
 
       // Navigate to Qwen home to validate session and populate cookies
@@ -512,30 +505,26 @@ export async function initPlaywrightForAccount(
         const url = acctPage.url();
         if (url.includes("auth") || url.includes("login")) {
           if (account.email && account.password) {
-            console.log(
-              `[Playwright] Session expired for ${maskEmail(account.email)}, re-logging in...`,
+            console.warn(
+              `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
             );
             await loginToQwen(account.id, account.email, account.password);
+            didLogin = true;
           } else {
             console.warn(
               `[Playwright] Session expired for account ${account.id} but no credentials available.`,
             );
           }
-        } else {
-          console.log(
-            `✅ [Playwright] Session validated for ${maskEmail(account.email)}.`,
-          );
         }
       } catch (err: any) {
         console.warn(
-          `[Playwright] Failed to validate session for ${maskEmail(account.email)}: ${err.message}`,
+          `❌ [Playwright] Failed to validate session for ${maskEmail(account.email)}: ${err.message}`,
         );
       }
 
       // Capture headers by navigating and intercepting
       await captureHeaders(account.id);
       touchAccountActivity(account.id);
-      await minimizeWindow(acctPage);
     } catch (error) {
       await closePlaywrightContextBestEffort(account.id, acctContext);
       cleanupPlaywrightAccountState(account.id);
@@ -556,27 +545,20 @@ async function loginToQwen(
   const page = accountPages.get(accountId);
   if (!page) return false;
 
-  console.log(`🔐 [Playwright] Logging in ${maskEmail(email)}...`);
-
   // Try API login first
   const apiResult = await loginViaApi(page, email, password);
   if (apiResult) {
-    console.log(`✅ [Playwright] API login successful for ${maskEmail(email)}`);
     return true;
   }
 
   // Fallback to UI login
-  console.log(
-    `[Playwright] API login failed, trying UI login for ${maskEmail(email)}...`,
-  );
   const uiResult = await loginViaUi(page, email, password);
   if (uiResult) {
-    console.log(`✅ [Playwright] UI login successful for ${maskEmail(email)}`);
     return true;
   }
 
   console.error(
-    `[Playwright] All login methods failed for ${maskEmail(email)}`,
+    `❌ [Playwright] All login methods failed for ${maskEmail(email)}`,
   );
   return false;
 }
@@ -670,7 +652,6 @@ async function loginViaUi(
     }
 
     // Fill email
-    console.log(`📝 [Playwright] UI: Filling email...`);
     await page.fill(emailSelector, email);
     await page.keyboard.press("Enter");
     await sleep(1500);
@@ -682,7 +663,6 @@ async function loginViaUi(
     });
 
     // Fill password
-    console.log(`📝 [Playwright] UI: Filling password...`);
     await page.fill(passwordSelector, password);
     await page.keyboard.press("Enter");
     await sleep(3000);
@@ -746,8 +726,6 @@ async function captureHeaders(accountId: string): Promise<void> {
       };
       cache.lastRefresh = Date.now();
       touchAccountActivity(accountId);
-
-      console.log(`✅ [Playwright] Headers captured for ${accountId}`);
 
       await route.abort("aborted").catch(() => {});
       await page
@@ -828,32 +806,6 @@ async function captureHeaders(accountId: string): Promise<void> {
   });
 }
 
-export async function minimizeWindow(page: Page): Promise<void> {
-  try {
-    const session = await page.context().newCDPSession(page);
-    const { windowId } = await session.send("Browser.getWindowForTarget");
-    await session.send("Browser.setWindowBounds", {
-      windowId,
-      bounds: { windowState: "minimized" },
-    });
-  } catch (err: any) {
-    console.warn(`[Playwright] Failed to minimize window via CDP: ${err.message}`);
-  }
-}
-
-export async function restoreWindow(page: Page): Promise<void> {
-  try {
-    const session = await page.context().newCDPSession(page);
-    const { windowId } = await session.send("Browser.getWindowForTarget");
-    await session.send("Browser.setWindowBounds", {
-      windowId,
-      bounds: { windowState: "normal" },
-    });
-  } catch (err: any) {
-    console.warn(`[Playwright] Failed to restore window via CDP: ${err.message}`);
-  }
-}
-
 async function refreshHeadersInternal(accountId: string): Promise<void> {
   const cache = getHeaderCache(accountId);
   if (cache.refreshInProgress) return;
@@ -871,8 +823,8 @@ async function refreshHeadersInternal(accountId: string): Promise<void> {
         });
         const url = page.url();
         if (url.includes("auth") || url.includes("login")) {
-          console.log(
-            `[Playwright] Session expired during refresh, re-logging in for ${accountId}...`,
+          console.warn(
+            `⚠️  [Playwright] Session expired during refresh for ${accountId}, re-authenticating...`,
           );
           const { getAccountCredentials } = await import("../core/accounts.ts");
           const creds = getAccountCredentials(accountId);
@@ -895,9 +847,6 @@ async function refreshHeadersInternal(accountId: string): Promise<void> {
     }
 
     await captureHeaders(accountId);
-    if (page) {
-      await minimizeWindow(page);
-    }
   } finally {
     touchAccountActivity(accountId);
     cache.refreshInProgress = false;
@@ -998,11 +947,7 @@ export function schedulePlaywrightProfileReset(accountId: string): void {
     .catch(() => {})
     .then(async () => {
       if (closingAllPlaywright) return;
-      console.log(`🔄 [Playwright] Queued profile reset for ${accountId}...`);
       await refreshHeadersWithProfileReset(accountId);
-      console.log(
-        `✅ [Playwright] Queued profile reset complete for ${accountId}.`,
-      );
     })
     .catch((error) => {
       console.warn(
@@ -1084,7 +1029,6 @@ export async function keepAlivePlaywrightAccount(
         timeout: Math.min(config.timeouts.navigation, 15_000),
       });
       lastKeepAliveNavigation.set(accountId, now);
-      await minimizeWindow(page);
     } else {
       await subtlePageActivity(page);
     }
@@ -1226,15 +1170,3 @@ export function getPlaywrightStatus(): Record<
   }
   return status;
 }
-
-// [Dodo] Playwright Idle Memory Cleaner (3 horas)
-setInterval(() => {
-  if (closingAllPlaywright) return;
-  const now = Date.now();
-  for (const [accountId, lastActive] of lastAccountActivity.entries()) {
-    if (now - lastActive > 3 * 60 * 60 * 1000) {
-      console.log(`🧹 [Dodo] Fechando Playwright inativo (3h+): ${accountId}`);
-      closePlaywrightForAccount(accountId).catch(() => {});
-    }
-  }
-}, 60 * 60 * 1000); // Roda a cada 1 hora
