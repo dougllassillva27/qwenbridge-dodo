@@ -143,27 +143,51 @@ const accountsHandler = async (c: Context) => {
 
   const { loadAccounts } = await import("../core/accounts.ts");
   const { getAccountCooldownInfo } = await import("../core/account-manager.ts");
-  const { accountTokenUsage } = await import("../core/metrics.ts");
+  const { accountTokenUsage, metrics } = await import("../core/metrics.ts");
+  const { getHeapUsageSnapshot } = await import("../core/memory-usage.ts");
 
   const accounts = loadAccounts();
+  const heap = getHeapUsageSnapshot();
+  const requestsCount = metrics.get("requests.total")?.value || 0;
+  const errorsCount = metrics.get("requests.errors")?.value || 0;
+
+  let activeCount = 0;
+  let cooldownCount = 0;
+
   const result = accounts.map((acc) => {
     const cooldownInfo = getAccountCooldownInfo(acc.id);
     const usage = accountTokenUsage[acc.id] || { prompt: 0, completion: 0, total: 0 };
+    const isCooldown = Boolean(cooldownInfo);
+
+    if (isCooldown) cooldownCount++;
+    else activeCount++;
+
+    const cooldownUntil = cooldownInfo ? Date.now() + cooldownInfo.remainingMs : 0;
+    const cooldownReason = cooldownInfo ? cooldownInfo.reason : null;
+
     return {
       id: acc.id,
       email: acc.email,
-      status: cooldownInfo ? "cooldown" : "ready",
-      cooldownUntil: cooldownInfo ? Date.now() + cooldownInfo.remainingMs : 0,
-      cooldownReason: cooldownInfo ? cooldownInfo.reason : null,
+      status: isCooldown ? "cooldown" : "ready",
+      cooldown_until: cooldownUntil,
+      cooldownUntil: cooldownUntil,
+      cooldown_reason: cooldownReason,
+      cooldownReason: cooldownReason,
       tokens: usage,
     };
   });
 
   return c.json({
-    accounts: result,
+    total: accounts.length,
     totalAccounts: accounts.length,
-    activeAccounts: result.filter((a) => a.status === "ready").length,
+    active: activeCount,
+    activeAccounts: activeCount,
+    cooldown: cooldownCount,
+    requests: requestsCount,
+    ram_mb: Math.round(heap.heapUsed / (1024 * 1024)),
+    stream_errors: errorsCount,
     totalTokens: Object.values(accountTokenUsage).reduce((acc, curr) => acc + curr.total, 0),
+    accounts: result,
   });
 };
 

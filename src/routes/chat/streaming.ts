@@ -420,6 +420,13 @@ export async function processNonStreamingResponse(
     }
 
     const usage = buildUsage(usageAccumulator);
+    if (usage.prompt_tokens === 0 && finalPrompt) {
+      usage.prompt_tokens = Math.ceil(finalPrompt.length / 4);
+    }
+    if (usage.completion_tokens === 0) {
+      usage.completion_tokens = Math.max(1, Math.ceil((finalContent.length + reasoningBuffer.length) / 4));
+    }
+    usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
 
     // [Dodo] Contabilização de tokens por conta para Dashboard Tauri
     recordAccountTokens(
@@ -1238,8 +1245,18 @@ export async function processStreamingResponse(
         });
       }
 
+      const finalContent = finalContentChunks.join("");
+      const reasoningBuffer = reasoningChunks.join("");
+
       // Finish reason + usage + [DONE]
       const usage = buildUsage(usageAccumulator);
+      if (usage.prompt_tokens === 0 && finalPrompt) {
+        usage.prompt_tokens = Math.ceil(finalPrompt.length / 4);
+      }
+      if (usage.completion_tokens === 0) {
+        usage.completion_tokens = Math.max(1, Math.ceil((finalContent.length + reasoningBuffer.length) / 4));
+      }
+      usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
 
       // [Dodo] Contabilização de tokens por conta para Dashboard Tauri
       recordAccountTokens(
@@ -1285,9 +1302,6 @@ export async function processStreamingResponse(
           usage,
         });
       }
-
-      const finalContent = finalContentChunks.join("");
-      const reasoningBuffer = reasoningChunks.join("");
 
       if (!clientDisconnected) {
         // Check for malformed tool calls and inject error feedback
