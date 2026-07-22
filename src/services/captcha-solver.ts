@@ -385,6 +385,9 @@ export async function recoverAntiBotChallenge(
         };
       }
 
+      console.warn(
+        `❌ [Captcha] Failed to clear challenge for ${accountId} (${signal.reason})`,
+      );
       return {
         success: false,
         method: "failed",
