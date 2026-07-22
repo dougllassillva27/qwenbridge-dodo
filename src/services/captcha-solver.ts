@@ -20,7 +20,9 @@ import { config } from "../core/config.ts";
 import { humanDelay, sleep, subtlePageActivity } from "./human-behavior.ts";
 import {
   isPlaywrightInitialized,
+  minimizeWindow,
   refreshHeaders,
+  restoreWindow,
   withAccountPage,
 } from "./playwright.ts";
 
@@ -339,8 +341,9 @@ export async function recoverAntiBotChallenge(
       }
 
       console.log(
-        `🧩 [Captcha] Challenge detected for ${accountId} (${signal.reason}); attempting solve...`,
+        `🧩 [Captcha] Challenge detected for ${accountId} (${signal.reason}); restoring window to solve...`,
       );
+      await withAccountPage(accountId, (page) => restoreWindow(page));
 
       // Phase 3: slider attempts within remaining budget
       let sliderSelector: string | undefined;
@@ -366,6 +369,9 @@ export async function recoverAntiBotChallenge(
       );
 
       await refreshHeaders(accountId);
+
+      // Re-minimize window after challenge resolution
+      await withAccountPage(accountId, (page) => minimizeWindow(page));
 
       if (cleared) {
         console.log(
