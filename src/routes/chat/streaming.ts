@@ -60,6 +60,39 @@ function firstString(...values: unknown[]): string | null {
   return null;
 }
 
+const STREAM_READ_TIMEOUT_MS = 120_000; // 120 seconds (2 min) idle timeout for SSE chunks
+
+function readWithTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number = STREAM_READ_TIMEOUT_MS,
+  label: string = "idle",
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise.finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            toRetryableStreamError(
+              "upstream_idle_timeout",
+              `Qwen Web upstream read timed out after ${Math.round(timeoutMs / 1000)}s without new data (${label})`,
+              {
+                switchAccount: true,
+                forceNewChat: true,
+                retryAfterMs: 1000,
+                reason: "upstream_idle_timeout",
+              },
+            ),
+          ),
+        timeoutMs,
+      );
+    }),
+  ]);
+}
+
 function extractChatSessionId(chunk: any): string | null {
   const created = chunk?.["response.created"];
   return firstString(
@@ -236,7 +269,11 @@ export async function processNonStreamingResponse(
     };
 
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readWithTimeout(
+        reader.read(),
+        STREAM_READ_TIMEOUT_MS,
+        "non-stream",
+      );
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
@@ -572,7 +609,11 @@ export async function processStreamingResponse(
   let initialStreamBuffer = "";
 
   while (true) {
-    const { done, value } = await streamReader.read();
+    const { done, value } = await readWithTimeout(
+      streamReader.read(),
+      STREAM_READ_TIMEOUT_MS,
+      "stream-preread",
+    );
     if (done) {
       initialStreamBuffer += streamDecoder.decode();
       break;
@@ -937,7 +978,11 @@ export async function processStreamingResponse(
         }
 
         if (!buffer.includes("\n")) {
-          const { done, value } = await reader.read();
+          const { done, value } = await readWithTimeout(
+            reader.read(),
+            STREAM_READ_TIMEOUT_MS,
+            "stream-loop",
+          );
           if (done) break;
 
           buffer += decoder.decode(value, { stream: true });
