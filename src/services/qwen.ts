@@ -3,10 +3,12 @@ import {
   getQwenHeaders,
   getBasicHeaders,
   isAuthMockEnabled,
+  isTokenExpiringSoon,
 } from "./auth-playwright.ts";
 import { v4 as uuidv4 } from "uuid";
 import { UpstreamRateLimit, UpstreamError, AuthError } from "../core/errors.ts";
 import { buildQwenRequestHeaders, QWEN_WEB_VERSION } from "./qwen-headers.ts";
+import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { config } from "../core/config.ts";
 import { logger, isToolcallDebugEnabled } from "../core/logger.ts";
 import { estimateTokenCount } from "../utils/context-truncation.ts";
@@ -16,9 +18,155 @@ import type {
 } from "./token-estimation-metrics.ts";
 import { getDatabase } from "../core/database.ts";
 import { markAccountRateLimited } from "../core/account-manager.ts";
-import { MAX_PAYLOAD_SIZE } from "../core/model-registry.ts";
+import { mapClientModelToQwen } from "../core/model-alias.ts";
+import {
+  MAX_PAYLOAD_SIZE,
+  replaceModelMetadata,
+  syncModelMetadata,
+} from "../core/model-registry.ts";
+import { type Page } from "playwright";
+import { withAccountPage } from "./playwright.ts";
+import { assertAntiBotHeaders } from "./playwright.ts";
+import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
+import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
+import { isAccountBusy } from "../core/account-concurrency.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const BROWSER_STREAM_BINDING = "__qwenBridgeStreamEvent";
+const BROWSER_ABORTERS_KEY = "__qwenBridgeAborters";
+const BROWSER_STREAM_FLUSH_BYTES = 4096;
+const BROWSER_STREAM_FLUSH_MS = 25;
+const METADATA_TIMEOUT_PER_PAYLOAD_MB_MS = 10_000;
+const POST_CAPTCHA_METADATA_GRACE_MS = 20_000;
+
+type BrowserStreamEvent = {
+  type: "headers" | "chunk" | "done" | "error";
+  status?: number;
+  contentType?: string;
+  data?: string;
+  message?: string;
+  errorName?: string;
+};
+
+interface BrowserStreamMetadata {
+  status: number;
+  contentType: string;
+}
+
+interface BrowserStreamState {
+  chunks: Uint8Array[];
+  done: boolean;
+  error: Error | null;
+  metadata: BrowserStreamMetadata | null;
+  waiters: Set<() => void>;
+}
+
+const browserStreamStates = new Map<string, BrowserStreamState>();
+const browserStreamBindingPages = new WeakSet<object>();
+
+function wakeBrowserStreamState(state: BrowserStreamState): void {
+  const waiters = Array.from(state.waiters);
+  state.waiters.clear();
+  for (const wake of waiters) wake();
+}
+
+function handleBrowserStreamEvent(
+  requestId: string,
+  event: BrowserStreamEvent,
+): void {
+  const state = browserStreamStates.get(requestId);
+  if (!state) return;
+
+  if (event.type === "headers") {
+    state.metadata = {
+      status: event.status ?? 0,
+      contentType: event.contentType ?? "",
+    };
+  } else if (event.type === "chunk" && typeof event.data === "string") {
+    if (event.data.length > 0) {
+      state.chunks.push(Buffer.from(event.data, "utf8"));
+    }
+  } else if (event.type === "done") {
+    state.done = true;
+  } else if (event.type === "error") {
+    state.error = browserStreamError(
+      event.message || "Browser Qwen stream failed",
+      event.errorName,
+    );
+    state.done = true;
+  }
+
+  wakeBrowserStreamState(state);
+}
+
+async function ensureBrowserStreamBinding(page: Page): Promise<void> {
+  if (browserStreamBindingPages.has(page)) return;
+
+  await page.exposeFunction(
+    BROWSER_STREAM_BINDING,
+    (requestId: string, event: BrowserStreamEvent) => {
+      handleBrowserStreamEvent(requestId, event);
+    },
+  );
+  browserStreamBindingPages.add(page);
+}
+
+function browserStreamError(message: string, errorName?: string): Error {
+  const normalizedMessage = message || "Browser Qwen stream failed";
+  if (errorName === "AbortError") {
+    const abortError = new DOMException(normalizedMessage, "AbortError");
+    return abortError;
+  }
+  return new QwenNetworkError(normalizedMessage);
+}
+
+function withBrowserTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise.finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      timer.unref?.();
+    }),
+  ]);
+}
+
+async function waitForBrowserStreamMetadata(
+  requestId: string,
+  timeoutMs: number,
+): Promise<BrowserStreamMetadata> {
+  const state = browserStreamStates.get(requestId);
+  if (!state) {
+    throw new Error("Browser Qwen stream state was lost before response headers");
+  }
+
+  const waitForStateChange = new Promise<void>((resolve) => {
+    state.waiters.add(resolve);
+    if (state.metadata || state.error || state.done) {
+      state.waiters.delete(resolve);
+      resolve();
+    }
+  });
+
+  while (!state.metadata && !state.error && !state.done) {
+    await waitForStateChange;
+    if (!state.metadata && !state.error && !state.done) {
+      return waitForBrowserStreamMetadata(requestId, timeoutMs);
+    }
+  }
+
+  if (state.metadata) return state.metadata;
+  throw state.error ?? new Error(
+    `Browser Qwen stream ended before response headers after ${timeoutMs}ms`,
+  );
+}
 
 function addIdleTimeoutToStream(
   stream: ReadableStream<Uint8Array>,
@@ -77,7 +225,7 @@ function addIdleTimeoutToStream(
     cancel(reason) {
       clearIdleTimer();
       onDone?.();
-      return stream.cancel(reason);
+      return reader ? reader.cancel(reason) : stream.cancel(reason);
     },
   });
 }
@@ -379,15 +527,17 @@ function getSessionParent(
 }
 
 export interface QwenMessage {
+  id: string | null;
   fid: string;
   parentId: string | null;
   childrenIds: string[];
-  role: "user" | "assistant";
+  role: string;
   content: string;
   user_action: string;
   files: any[];
   timestamp: number;
   models: string[];
+  model: string;
   chat_type: string;
   feature_config: {
     thinking_enabled: boolean;
@@ -395,7 +545,7 @@ export interface QwenMessage {
     research_mode: string;
     auto_thinking: boolean;
     thinking_mode: string;
-    thinking_format: string;
+    thinking_format?: string;
     auto_search: boolean;
   };
   extra: {
@@ -412,7 +562,9 @@ export interface QwenPayload {
   version: string;
   incremental_output: boolean;
   stream_options?: { include_usage: boolean };
+  chatId?: string | null;
   chat_id: string | null;
+  parentId?: string;
   chat_mode: string;
   model: string;
   parent_id: string | null;
@@ -420,14 +572,22 @@ export interface QwenPayload {
   timestamp: number;
 }
 
-interface PublicQwenModel {
+export interface PublicQwenModel {
   id: string;
   name: string;
   object: "model";
   owned_by: string;
   created: number;
   context_window?: number;
-  capabilities?: any;
+  capabilities?: Record<string, unknown>;
+  metadata?: Record<string, unknown>;
+  info?: Record<string, unknown>;
+  meta?: Record<string, unknown>;
+  modality?: string[];
+  chat_type?: string[];
+  think_skip?: Record<string, unknown>;
+  is_active?: boolean;
+  [key: string]: unknown;
 }
 
 const MODEL_CACHE_TTL_MS = 60 * 60 * 1000;
@@ -478,6 +638,11 @@ function setPersonalizationHashInDb(accountId: string, hash: string): void {
 
 function shortContentHash(value: string): string {
   return crypto.createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function shortAccountId(accountId: string): string {
+  const normalized = accountId.trim();
+  return normalized.length > 12 ? normalized.slice(0, 12) : normalized;
 }
 
 function textSize(value: unknown): {
@@ -534,6 +699,7 @@ function buildCapturedQwenHeaders(
     extra?: Record<string, string>;
   } = {},
 ): Record<string, string> {
+  assertAntiBotHeaders(headers, "Qwen request");
   return buildQwenRequestHeaders({
     cookie: headers["cookie"],
     userAgent: headers["user-agent"],
@@ -545,6 +711,75 @@ function buildCapturedQwenHeaders(
       ...(options.referer ? { Referer: options.referer } : {}),
       ...(options.extra || {}),
     },
+  });
+}
+
+/**
+ * Open an isolated page in the same browser context for short-lived operations
+ * (settings, models, etc.). The main chat page is never navigated away.
+ */
+async function withIsolatedQwenPage<T>(
+  accountId: string,
+  fn: (page: Page) => Promise<T>,
+  targetUrl?: string,
+): Promise<T> {
+  return withAccountPage(
+    accountId,
+    async (mainPage) => {
+      const context = mainPage.context();
+      const page = await context.newPage();
+      try {
+        if (targetUrl) {
+          await page.goto(targetUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: config.timeouts.navigation,
+          });
+        }
+        return await fn(page);
+      } finally {
+        await page.close().catch(() => {});
+      }
+    },
+    config.timeouts.page,
+  );
+}
+
+// Per-account stream serialization: one active stream per account at a time
+const accountStreamMutexes = new Map<string, { queue: Array<() => void>; locked: boolean }>();
+
+function getAccountStreamMutex(accountId: string): { queue: Array<() => void>; locked: boolean } {
+  let mutex = accountStreamMutexes.get(accountId);
+  if (!mutex) {
+    mutex = { queue: [], locked: false };
+    accountStreamMutexes.set(accountId, mutex);
+  }
+  return mutex;
+}
+
+async function acquireAccountStreamLock(accountId: string): Promise<() => void> {
+  const mutex = getAccountStreamMutex(accountId);
+  if (!mutex.locked) {
+    mutex.locked = true;
+    return () => {
+      const next = mutex.queue.shift();
+      if (next) {
+        next();
+      } else {
+        mutex.locked = false;
+      }
+    };
+  }
+  return new Promise<() => void>((resolve) => {
+    mutex.queue.push(() => {
+      resolve(() => {
+        const next = mutex.queue.shift();
+        if (next) {
+          next();
+        } else {
+          mutex.locked = false;
+        }
+      });
+    });
   });
 }
 
@@ -583,6 +818,12 @@ function buildQwenSettingsUpdatePayload(
   currentSettings: any,
   instruction: string,
 ): Record<string, unknown> {
+  const currentPersonalization =
+    currentSettings?.personalization &&
+    typeof currentSettings.personalization === "object"
+      ? currentSettings.personalization
+      : {};
+
   return {
     ...(currentSettings && typeof currentSettings === "object"
       ? currentSettings
@@ -608,13 +849,8 @@ function buildQwenSettingsUpdatePayload(
       ...QWEN_SAFE_SETTINGS_PATCH.tools_enabled,
     },
     personalization: {
-      ...(currentSettings?.personalization &&
-      typeof currentSettings.personalization === "object"
-        ? currentSettings.personalization
-        : {}),
+      ...currentPersonalization,
       name: "",
-      description:
-        "Always follow the active personalized instructions. Always think in English, and always answer in the language of the user's question. Always remember and consider the full conversation history and context when responding.",
       style: null,
       instruction,
       enable_for_new_chat: true,
@@ -641,6 +877,624 @@ async function readJsonTextResponse(
   }
 }
 
+async function withQwenBrowserPage<T>(
+  accountId: string,
+  fn: (page: Page) => Promise<T>,
+  targetPath?: string,
+  operationTimeoutMs = config.timeouts.page,
+): Promise<T> {
+  // Keep the account page on the chat UI for normal browser operations. The
+  // personalization helper passes /settings/personalization explicitly; an
+  // omitted target must not leave a same-origin settings page in place.
+  const effectiveTargetPath = targetPath || "/";
+  const targetUrl = qwenUrl(effectiveTargetPath);
+  const targetOrigin = new URL(targetUrl).origin;
+  const normalizedTargetPath =
+    new URL(targetUrl).pathname.replace(/\/+$/, "") || "/";
+
+  return withAccountPage(
+    accountId,
+    async (page) => {
+      let currentOrigin = "";
+      let currentPath = "";
+      try {
+        const currentUrl = new URL(page.url());
+        currentOrigin = currentUrl.origin;
+        currentPath = currentUrl.pathname.replace(/\/+$/, "") || "/";
+      } catch {
+        // Navigate below when the current page has no usable URL.
+      }
+
+      if (
+        currentOrigin !== targetOrigin ||
+        (normalizedTargetPath && currentPath !== normalizedTargetPath)
+      ) {
+        await page.goto(targetUrl, {
+          waitUntil: "domcontentloaded",
+          timeout: Math.min(config.timeouts.navigation, operationTimeoutMs),
+        });
+      }
+
+      return fn(page);
+    },
+    operationTimeoutMs,
+    Math.min(config.timeouts.page, 5_000),
+  );
+}
+
+async function withQwenPersonalizationPage<T>(
+  accountId: string,
+  fn: (page: Page) => Promise<T>,
+  operationTimeoutMs = config.timeouts.page,
+): Promise<T> {
+  return withQwenBrowserPage(
+    accountId,
+    async (page) => {
+      try {
+        return await fn(page);
+      } finally {
+        if (!page.isClosed()) {
+          try {
+            const currentUrl = new URL(page.url());
+            const currentPath = currentUrl.pathname.replace(/\/+$/, "") || "/";
+            if (currentUrl.origin !== qwenOrigin() || currentPath !== "/") {
+              await page.goto(qwenUrl("/"), {
+                waitUntil: "domcontentloaded",
+                timeout: Math.min(config.timeouts.navigation, operationTimeoutMs),
+              });
+            }
+          } catch (error) {
+            // Do not mask the personalization request result if restoring the
+            // normal chat page fails; the next normal operation will retry it.
+            logger.warn("[Qwen] Could not restore chat page after personalization", {
+              accountId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
+      }
+    },
+    "/settings/personalization",
+    operationTimeoutMs,
+  );
+}
+
+/**
+ * Build minimal headers for browser-side fetch. The browser automatically
+ * adds Cookie, User-Agent, Origin, Referer, and sec-* headers, so we only
+ * pass the anti-bot tokens and metadata that the browser cannot infer.
+ */
+function getBrowserFetchHeaders(
+  headers: Record<string, string>,
+): Record<string, string> {
+  const browserAllowedHeaders = new Set([
+    "accept",
+    "content-type",
+    "bx-ua",
+    "bx-umidtoken",
+    "bx-v",
+    "source",
+    "version",
+    "timezone",
+    "x-request-id",
+    "x-accel-buffering",
+  ]);
+
+  return Object.fromEntries(
+    Object.entries(headers).filter(([name]) =>
+      browserAllowedHeaders.has(name.toLowerCase()),
+    ),
+  );
+}
+
+interface BrowserTextResponse {
+  status: number;
+  contentType: string;
+  raw: string;
+}
+
+export async function requestQwenTextInBrowser(
+  accountId: string | undefined,
+  method: "GET" | "POST" | "DELETE",
+  path: string,
+  headers: Record<string, string>,
+  body?: string,
+  options: {
+    settingsPage?: boolean;
+    referrer?: string;
+    timeoutMs?: number;
+  } = {},
+): Promise<Response> {
+  const url = qwenUrl(path);
+
+  // Mock tests intentionally use Node fetch and do not initialize a browser.
+  if (isAuthMockEnabled()) {
+    return fetch(url, {
+      method,
+      headers,
+      ...(body === undefined ? {} : { body }),
+    });
+  }
+
+  if (!accountId) {
+    throw new Error("A Qwen account is required for browser request");
+  }
+
+  const browserHeaders = getBrowserFetchHeaders(headers);
+  if (
+    body !== undefined &&
+    !Object.keys(browserHeaders).some(
+      (name) => name.toLowerCase() === "content-type",
+    )
+  ) {
+    browserHeaders["Content-Type"] = "application/json";
+  }
+
+  const evaluateRequest = (page: Page) =>
+    page.evaluate(
+      async ({ url, method, headers, body, referrer }: {
+        url: string;
+        method: "GET" | "POST" | "DELETE";
+        headers: Record<string, string>;
+        body?: string;
+        referrer?: string;
+      }): Promise<BrowserTextResponse> => {
+        const response = await fetch(url, {
+          method,
+          credentials: "include",
+          headers,
+          body,
+          ...(referrer ? { referrer } : {}),
+        });
+        return {
+          status: response.status,
+          contentType: response.headers.get("content-type") || "",
+          raw: await response.text(),
+        };
+      },
+      {
+        url,
+        method,
+        headers: browserHeaders,
+        body,
+        referrer: options.referrer,
+      },
+    );
+  const response = options.settingsPage
+    ? await withQwenPersonalizationPage<BrowserTextResponse>(
+        accountId,
+        evaluateRequest,
+        options.timeoutMs,
+      )
+    : await withQwenBrowserPage<BrowserTextResponse>(
+        accountId,
+        evaluateRequest,
+        undefined,
+        options.timeoutMs,
+      );
+
+  return new Response(response.raw, {
+    status: response.status,
+    headers: response.contentType
+      ? { "content-type": response.contentType }
+      : undefined,
+  });
+}
+
+async function requestQwenPersonalizationInBrowser(
+  accountId: string | undefined,
+  method: "GET" | "POST",
+  path: string,
+  headers: Record<string, string>,
+  payload?: Record<string, unknown>,
+): Promise<{ status: number; raw: string; json: any }> {
+  const response = await requestQwenTextInBrowser(
+    accountId,
+    method,
+    path,
+    headers,
+    payload === undefined ? undefined : JSON.stringify(payload),
+    {
+      settingsPage: true,
+      referrer: qwenUrl("/settings/personalization"),
+    },
+  );
+  const { raw, json } = await readJsonTextResponse(response);
+  return { status: response.status, raw, json };
+}
+
+async function cancelQwenBrowserStream(
+  accountId: string,
+  requestId: string,
+): Promise<void> {
+  const state = browserStreamStates.get(requestId);
+  if (state) {
+    state.done = true;
+    wakeBrowserStreamState(state);
+  }
+
+  try {
+    await withQwenBrowserPage(accountId, async (page) => {
+      await page.evaluate(
+        ({ abortersKey, requestId }: {
+          abortersKey: string;
+          requestId: string;
+        }) => {
+          const aborters = (globalThis as unknown as Record<string, unknown>)[
+            abortersKey
+          ] as Map<string, AbortController> | undefined;
+          aborters?.get(requestId)?.abort();
+        },
+        { abortersKey: BROWSER_ABORTERS_KEY, requestId },
+      );
+    });
+  } catch {
+    // The page may already be closing after an abort or timeout.
+  } finally {
+    browserStreamStates.delete(requestId);
+  }
+}
+
+async function createQwenBrowserResponse(
+  accountId: string | undefined,
+  url: string,
+  method: "POST",
+  headers: Record<string, string>,
+  body: string,
+  signal: AbortSignal,
+  referrer?: string,
+  pageOperationTimeoutMs = config.timeouts.page,
+): Promise<Response> {
+  if (isAuthMockEnabled()) {
+    return fetch(url, {
+      method,
+      headers,
+      body,
+      signal,
+    });
+  }
+
+  if (!accountId) {
+    throw new Error("A Qwen account is required for browser streaming");
+  }
+  if (signal.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
+
+  const requestId = uuidv4();
+  const state: BrowserStreamState = {
+    chunks: [],
+    done: false,
+    error: null,
+    metadata: null,
+    waiters: new Set(),
+  };
+  browserStreamStates.set(requestId, state);
+
+  const browserHeaders = getBrowserFetchHeaders(headers);
+  if (
+    !Object.keys(browserHeaders).some(
+      (name) => name.toLowerCase() === "content-type",
+    )
+  ) {
+    browserHeaders["Content-Type"] = "application/json";
+  }
+
+  let settled = false;
+  let abortListener: (() => void) | undefined;
+  let cancelPromise: Promise<void> | undefined;
+  const cleanup = () => {
+    if (settled) return;
+    settled = true;
+    if (abortListener) signal.removeEventListener("abort", abortListener);
+    browserStreamStates.delete(requestId);
+  };
+  const cancel = () => {
+    if (!cancelPromise) {
+      cancelPromise = cancelQwenBrowserStream(accountId, requestId);
+    }
+    cleanup();
+    return cancelPromise;
+  };
+
+  abortListener = () => {
+    void cancel();
+  };
+  signal.addEventListener("abort", abortListener, { once: true });
+
+  const payloadMbForMetadata = Math.ceil(
+    Buffer.byteLength(body, "utf8") / (1024 * 1024),
+  );
+  const metadataTimeoutMs = Math.max(
+    5_000,
+    Math.min(
+      pageOperationTimeoutMs,
+      Math.max(60_000, config.timeouts.timeToFirstByte) +
+        payloadMbForMetadata * METADATA_TIMEOUT_PER_PAYLOAD_MB_MS,
+    ),
+  );
+  let captchaWatcher: ReturnType<typeof startBaxiaCaptchaWatcher> | undefined;
+
+  try {
+    const startOperationTimeoutMs = Math.max(
+      5_000,
+      Math.min(config.timeouts.navigation, pageOperationTimeoutMs),
+    );
+    const started = await withQwenBrowserPage(
+      accountId,
+      async (page) => {
+        await ensureBrowserStreamBinding(page);
+        if (config.captcha.enabled) {
+          captchaWatcher = startBaxiaCaptchaWatcher(
+            page,
+            metadataTimeoutMs,
+            {
+              maxAttempts: config.captcha.maxAttempts,
+              retryDelayMs: config.captcha.retryDelayMs,
+              settleMs: config.captcha.settleMs,
+            },
+          );
+        }
+        return page.evaluate(
+          ({
+            url,
+            method,
+            headers,
+            body,
+            referrer,
+            requestId,
+            bindingName,
+            abortersKey,
+            flushBytes,
+            flushMs,
+            timeoutMs,
+          }: {
+            url: string;
+            method: "POST";
+            headers: Record<string, string>;
+            body: string;
+            referrer?: string;
+            requestId: string;
+            bindingName: string;
+            abortersKey: string;
+            flushBytes: number;
+            flushMs: number;
+            timeoutMs: number;
+          }) => {
+            const globalObject = globalThis as unknown as Record<string, unknown>;
+            const notify = globalObject[bindingName] as (
+              (id: string, event: BrowserStreamEvent) => Promise<void>
+            );
+            if (typeof notify !== "function") {
+              throw new Error("Qwen browser stream binding is unavailable");
+            }
+
+            let aborters = globalObject[abortersKey] as
+              | Map<string, AbortController>
+              | undefined;
+            if (!aborters) {
+              aborters = new Map<string, AbortController>();
+              globalObject[abortersKey] = aborters;
+            }
+            const abortController = new AbortController();
+            aborters.set(requestId, abortController);
+            const timeoutId = setTimeout(
+              () => abortController.abort(),
+              timeoutMs,
+            );
+
+            void (async () => {
+              try {
+                const response = await fetch(url, {
+                  method,
+                  credentials: "include",
+                  headers,
+                  body,
+                  signal: abortController.signal,
+                  ...(referrer ? { referrer } : {}),
+                });
+                clearTimeout(timeoutId);
+
+                await notify(requestId, {
+                  type: "headers",
+                  status: response.status,
+                  contentType: response.headers.get("content-type") || "",
+                });
+
+                if (!response.body) {
+                  await notify(requestId, { type: "done" });
+                  return;
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffered = "";
+                let lastFlushAt = Date.now();
+                let firstChunkSent = false;
+
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  if (!value) continue;
+
+                  buffered += decoder.decode(value, { stream: true });
+                  if (
+                    !firstChunkSent ||
+                    buffered.length >= flushBytes ||
+                    Date.now() - lastFlushAt >= flushMs
+                  ) {
+                    const data = buffered;
+                    buffered = "";
+                    firstChunkSent = true;
+                    lastFlushAt = Date.now();
+                    await notify(requestId, { type: "chunk", data });
+                  }
+                }
+
+                buffered += decoder.decode();
+                if (buffered) {
+                  const data = buffered;
+                  buffered = "";
+                  await notify(requestId, { type: "chunk", data });
+                }
+                await notify(requestId, { type: "done" });
+              } catch (error) {
+                clearTimeout(timeoutId);
+                try {
+                  await notify(requestId, {
+                    type: "error",
+                    message:
+                      error instanceof Error ? error.message : String(error),
+                    errorName: error instanceof Error ? error.name : undefined,
+                  });
+                } catch {
+                  // Node may have cancelled the stream already.
+                }
+              } finally {
+                aborters?.delete(requestId);
+              }
+            })();
+
+            // Do not await the upstream fetch here. Returning immediately
+            // releases the per-account Playwright mutex while metadata/chunks
+            // continue through the exposed binding.
+            return true;
+          },
+          {
+            url,
+            method,
+            headers: browserHeaders,
+            body,
+            referrer,
+            requestId,
+            bindingName: BROWSER_STREAM_BINDING,
+            abortersKey: BROWSER_ABORTERS_KEY,
+            flushBytes: BROWSER_STREAM_FLUSH_BYTES,
+            flushMs: BROWSER_STREAM_FLUSH_MS,
+            timeoutMs: metadataTimeoutMs,
+          },
+        );
+      },
+      undefined,
+      startOperationTimeoutMs,
+    );
+
+    if (!started) {
+      throw new Error("Qwen browser stream failed to start");
+    }
+
+    let captchaSolvedDuringMetadata = false;
+    let metadataTimer: ReturnType<typeof setTimeout> | undefined;
+    const metadataTimeoutPromise = new Promise<never>((_, reject) => {
+      const fail = () =>
+        reject(
+          new Error(
+            `Qwen browser stream timed out waiting for response headers after ${metadataTimeoutMs}ms${
+              captchaSolvedDuringMetadata
+                ? " (captcha solved; original request did not resume)"
+                : ""
+            }`,
+          ),
+        );
+      metadataTimer = setTimeout(fail, metadataTimeoutMs);
+      metadataTimer.unref?.();
+
+      // When the watcher solves a challenge while headers have not arrived, the
+      // original background fetch often remains stalled. Give it a short grace
+      // window; if nothing arrives, the caller retries with fresh headers.
+      if (captchaWatcher) {
+        void captchaWatcher.promise
+          .then((solved) => {
+            if (!solved) return;
+            captchaSolvedDuringMetadata = true;
+            if (metadataTimer) {
+              clearTimeout(metadataTimer);
+              metadataTimer = setTimeout(fail, POST_CAPTCHA_METADATA_GRACE_MS);
+              metadataTimer.unref?.();
+            }
+          })
+          .catch(() => undefined);
+      }
+    });
+
+    let metadata: BrowserStreamMetadata;
+    try {
+      metadata = await Promise.race([
+        waitForBrowserStreamMetadata(
+          requestId,
+          metadataTimeoutMs + POST_CAPTCHA_METADATA_GRACE_MS,
+        ),
+        metadataTimeoutPromise,
+      ]);
+    } catch (error) {
+      if (
+        captchaSolvedDuringMetadata &&
+        error instanceof Error &&
+        error.message.includes("timed out waiting for response headers")
+      ) {
+        const retryableError = new Error(error.message);
+        (retryableError as any).captchaSolvedDuringMetadata = true;
+        throw retryableError;
+      }
+      throw error;
+    } finally {
+      if (metadataTimer) clearTimeout(metadataTimer);
+    }
+
+    if (signal.aborted) {
+      throw new DOMException("The operation was aborted", "AbortError");
+    }
+
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        const current = browserStreamStates.get(requestId);
+        if (!current) {
+          controller.close();
+          return;
+        }
+
+        while (current.chunks.length === 0 && !current.done) {
+          await new Promise<void>((resolve) => {
+            current.waiters.add(resolve);
+            if (current.chunks.length > 0 || current.done) {
+              current.waiters.delete(resolve);
+              resolve();
+            }
+          });
+        }
+
+        if (current.chunks.length > 0) {
+          controller.enqueue(current.chunks.shift()!);
+          return;
+        }
+
+        cleanup();
+        if (current.error) {
+          controller.error(current.error);
+        } else {
+          controller.close();
+        }
+      },
+      cancel() {
+        return cancel();
+      },
+    });
+
+    return new Response(stream, {
+      status: metadata.status,
+      headers: metadata.contentType
+        ? { "content-type": metadata.contentType }
+        : undefined,
+    });
+  } catch (error) {
+    captchaWatcher?.stop();
+    await cancel().catch(() => {});
+    throw error;
+  } finally {
+    captchaWatcher?.stop();
+  }
+}
+
 export async function syncQwenRequestPersonalization(
   instruction: string,
   accountId?: string,
@@ -652,16 +1506,31 @@ export async function syncQwenRequestPersonalization(
     /** Bypass memory/DB/GET caches and always POST. Used on new chat creation. */
     forceSync?: boolean;
   } = {},
-): Promise<void> {
-  if (isAuthMockEnabled()) return;
+): Promise<boolean> {
+  if (isAuthMockEnabled()) return true;
   // instruction pode ser vazia para limpar personalization
 
   const cacheKey = accountId || "global";
-  const { headers } = await getQwenHeaders(false, accountId);
-  const requestHeaders = buildCapturedQwenHeaders(headers, {
-    referer: `${config.qwen.baseUrl}/settings/personalization`,
-  });
 
+  // Proactive token renewal: refresh BEFORE attempting personalization
+  // to avoid 401 errors that waste time on retry
+  let forceRefresh = false;
+  try {
+    const basic = await getBasicHeaders(accountId);
+    if (isTokenExpiringSoon(basic.cookie, 5)) {
+      logger.debug("[Qwen] Token expiring soon, refreshing proactively", {
+        accountId: cacheKey,
+      });
+      forceRefresh = true;
+    }
+  } catch {
+    // If we can't check, let the normal flow handle it
+  }
+
+  const { headers } = await getQwenHeaders(forceRefresh, accountId);
+  let requestHeaders = buildCapturedQwenHeaders(headers, {
+    referer: qwenUrl("/settings/personalization"),
+  });
   let currentSettings: any = null;
   let payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
 
@@ -674,7 +1543,7 @@ export async function syncQwenRequestPersonalization(
   if (!bypassCache && syncHash && cachedHash === syncHash) {
     rememberActivePersonalization(cacheKey, instruction, metadata, "memory");
     // Personalization unchanged - no log needed
-    return;
+    return true;
   }
 
   // 2. Check DB cache (survives restarts) (skipped on forceSync)
@@ -684,7 +1553,7 @@ export async function syncQwenRequestPersonalization(
       lastSyncedPersonalizationHashes.set(cacheKey, syncHash);
       rememberActivePersonalization(cacheKey, instruction, metadata, "db");
       // Personalization unchanged (DB) - no log needed
-      return;
+      return true;
     }
   }
 
@@ -694,15 +1563,13 @@ export async function syncQwenRequestPersonalization(
   // Verifica GET apenas se temos um hash válido (skipped on forceSync)
   if (!bypassCache && syncHash && !cachedHash && config.qwen.personalizationVerifyGet) {
     try {
-      const existingResponse = await fetch(
-        `${config.qwen.baseUrl}/api/v2/users/user/settings`,
-        {
-          method: "GET",
-          headers: requestHeaders,
-        },
-      );
       const { json: existingJson } =
-        await readJsonTextResponse(existingResponse);
+        await requestQwenPersonalizationInBrowser(
+          accountId,
+          "GET",
+          "/api/v2/users/user/settings",
+          requestHeaders,
+        );
       currentSettings = existingJson?.data ?? null;
       payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
       existing = textSize(existingJson?.data?.personalization?.instruction);
@@ -734,7 +1601,7 @@ export async function syncQwenRequestPersonalization(
           sent,
           existing,
         });
-        return;
+        return true;
       }
     } catch (err) {
       logger.debug("[Qwen] personalization pre-check failed; updating anyway", {
@@ -750,17 +1617,13 @@ export async function syncQwenRequestPersonalization(
   ): Promise<{ raw: string; json: any }> {
     if (!currentSettings) {
       try {
-        const settingsResponse = await fetch(
-          `${config.qwen.baseUrl}/api/v2/users/user/settings`,
-          {
-            method: "GET",
-            headers: buildCapturedQwenHeaders(headers, {
-              referer: `${config.qwen.baseUrl}/settings/personalization`,
-            }),
-          },
-        );
         const { json: settingsJson } =
-          await readJsonTextResponse(settingsResponse);
+          await requestQwenPersonalizationInBrowser(
+            accountId,
+            "GET",
+            "/api/v2/users/user/settings",
+            headers,
+          );
         currentSettings = settingsJson?.data ?? null;
         payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
       } catch (err) {
@@ -774,18 +1637,13 @@ export async function syncQwenRequestPersonalization(
       }
     }
 
-    const reqHeaders = buildCapturedQwenHeaders(headers, {
-      referer: `${config.qwen.baseUrl}/settings/personalization`,
-    });
-    const resp = await fetch(
-      `${config.qwen.baseUrl}/api/v2/users/user/settings/update`,
-      {
-        method: "POST",
-        headers: reqHeaders,
-        body: JSON.stringify(payload),
-      },
+    return requestQwenPersonalizationInBrowser(
+      accountId,
+      "POST",
+      "/api/v2/users/user/settings/update",
+      headers,
+      payload,
     );
-    return readJsonTextResponse(resp);
   }
 
   let raw: string;
@@ -808,13 +1666,16 @@ export async function syncQwenRequestPersonalization(
     );
     try {
       const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
+      requestHeaders = buildCapturedQwenHeaders(freshHeaders, {
+        referer: qwenUrl("/settings/personalization"),
+      });
       ({ raw, json } = await attemptPost(freshHeaders));
     } catch (retryErr) {
       // Layer 3: Retry failed → non-fatal, continue without personalization
       console.warn(
         `[Qwen] Personalization retry failed, continuing without it | account=${cacheKey} | error=${(retryErr as Error).message?.substring(0, 150)}`,
       );
-      return;
+      return false;
     }
   }
 
@@ -823,7 +1684,7 @@ export async function syncQwenRequestPersonalization(
     console.warn(
       `[Qwen] Personalization sync failed (non-fatal) | account=${cacheKey} | response=${raw.slice(0, 200)}`,
     );
-    return; // Don't throw — continue with request without personalization
+    return false;
   }
 
   const returnedInstruction = json?.data?.personalization?.instruction;
@@ -833,26 +1694,39 @@ export async function syncQwenRequestPersonalization(
   >;
 
   if (config.qwen.personalizationVerifyGet) {
-    const verifyResponse = await fetch(
-      `${config.qwen.baseUrl}/api/v2/users/user/settings`,
-      {
-        method: "GET",
-        headers: requestHeaders,
-      },
-    );
-    const { json: verifyJson } = await readJsonTextResponse(verifyResponse);
+    const { json: verifyJson } =
+      await requestQwenPersonalizationInBrowser(
+        accountId,
+        "GET",
+        "/api/v2/users/user/settings",
+        requestHeaders,
+      );
     stored = textSize(verifyJson?.data?.personalization?.instruction);
   }
 
   const matchReturned = returned.hash !== null && returned.hash === sent.hash;
   const matchStored = stored.hash === null ? null : stored.hash === sent.hash;
-  if (syncHash && (matchReturned || matchStored === true)) {
+  const applied = matchReturned || matchStored === true;
+  if (syncHash && applied) {
     lastSyncedPersonalizationHashes.set(cacheKey, syncHash);
     setPersonalizationHashInDb(cacheKey, syncHash);
     rememberActivePersonalization(cacheKey, instruction, metadata, "synced");
   }
+
+  if (!applied) {
+    logger.warn("[Qwen] personalization response did not confirm the requested instructions", {
+      accountId: cacheKey,
+      model: metadata.model || null,
+      tools: metadata.toolsCount ?? 0,
+      sent,
+      returned,
+      stored,
+    });
+    return false;
+  }
+
   console.log(
-    `✅ [Qwen] Personalization synced | ${metadata.model || "?"} | ${metadata.toolsCount ?? 0} tool(s) | ${sent.chars} chars${matchStored === null ? "" : ` | verified=${matchStored}`}`,
+    `✅ [Qwen] Personalization synced | account=${shortAccountId(cacheKey)} | model=${metadata.model || "?"} | tools=${metadata.toolsCount ?? 0} | prompt_chars=${sent.chars ?? 0}${metadata.sessionId ? ` | chat=${metadata.sessionId.substring(0, 12)}` : ""}${matchStored === null ? "" : ` | verified=${matchStored}`}`,
   );
   logger.debug("[Qwen] personalization sync details", {
     accountId: cacheKey,
@@ -867,9 +1741,9 @@ export async function syncQwenRequestPersonalization(
     matchReturned,
     matchStored,
   });
+  return true;
 }
 
-const DISABLE_TOOLS_TIMEOUT_MS = 15000;
 const DISABLE_TOOLS_MAX_RETRIES = 3;
 const DISABLE_TOOLS_BACKOFF_MS = 2000;
 
@@ -884,8 +1758,6 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
   disablingNativeToolsInProgress.add(cacheKey);
 
   try {
-    const { headers } = await getQwenHeaders(false, accountId);
-
     const payload = {
       tools_enabled: {
         web_extractor: false,
@@ -900,26 +1772,81 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
       },
     };
 
-    const requestHeaders = buildCapturedQwenHeaders(headers);
+    // Use an isolated page only when the main page is actively serving a stream.
+    // Startup/idle operations should not open a visible extra tab.
+    if (accountId && !isAuthMockEnabled() && isAccountBusy(accountId)) {
+      try {
+        const result = await withIsolatedQwenPage(
+          accountId,
+          async (page) => {
+            const response = await page.evaluate(
+              async ({ payload, timeoutMs }: { payload: any; timeoutMs: number }) => {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+                try {
+                  const resp = await fetch(
+                    "https://chat.qwen.ai/api/v2/users/user/settings/update",
+                    {
+                      method: "POST",
+                      headers: {
+                        accept: "application/json, text/plain, */*",
+                        "content-type": "application/json",
+                        "x-request-id": crypto.randomUUID(),
+                        timezone: new Date().toString().split(" (")[0],
+                        source: "web",
+                      },
+                      body: JSON.stringify(payload),
+                      signal: controller.signal,
+                    },
+                  );
+                  return { status: resp.status, body: await resp.text() };
+                } finally {
+                  clearTimeout(timeoutId);
+                }
+              },
+              { payload, timeoutMs: config.timeouts.http },
+            );
+            return response;
+          },
+          qwenUrl("/"),
+        );
+
+        if (result.status < 400) {
+          nativeToolsDisabled.add(cacheKey);
+          return;
+        }
+        console.warn(
+          `⚠️  [Qwen] Isolated disableNativeTools returned ${result.status} for ${cacheKey}`,
+        );
+      } catch (error) {
+        // Fall through to standard request path
+        logger.debug("[Qwen] Isolated disableNativeTools failed, using standard path", {
+          accountId: cacheKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    // Fallback: standard request path
+    const { headers } = await getQwenHeaders(false, accountId);
+    const requestHeaders = buildCapturedQwenHeaders(headers, {
+      referer: qwenUrl("/settings/personalization"),
+    });
 
     let lastError: string | null = null;
     for (let attempt = 1; attempt <= DISABLE_TOOLS_MAX_RETRIES; attempt++) {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(
-        () => controller.abort(),
-        DISABLE_TOOLS_TIMEOUT_MS,
-      );
       try {
-        const response = await fetch(
-          `${config.qwen.baseUrl}/api/v2/users/user/settings/update`,
+        const response = await requestQwenTextInBrowser(
+          accountId,
+          "POST",
+          "/api/v2/users/user/settings/update",
+          requestHeaders,
+          JSON.stringify(payload),
           {
-            method: "POST",
-            headers: requestHeaders,
-            body: JSON.stringify(payload),
-            signal: controller.signal,
+            settingsPage: true,
+            referrer: qwenUrl("/settings/personalization"),
           },
         );
-        clearTimeout(timeoutId);
 
         if (!response.ok) {
           const text = await response.text();
@@ -932,7 +1859,6 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
           return;
         }
       } catch (err: any) {
-        clearTimeout(timeoutId);
         lastError = err.message;
         console.warn(
           `[Qwen] Error disabling native tools for ${cacheKey} (attempt ${attempt}/${DISABLE_TOOLS_MAX_RETRIES}): ${lastError}`,
@@ -956,29 +1882,99 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
   }
 }
 
-function formatPublicQwenModel(
-  model: any,
-  noThinking = false,
-): PublicQwenModel {
+function asModelRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Keep the upstream model object intact while adding stable normalized aliases.
+ * The registry consumes `info.meta`, and adapters can still inspect fields Qwen
+ * adds in the future without another parser change.
+ */
+function formatPublicQwenModel(model: Record<string, unknown>): PublicQwenModel {
+  const info = asModelRecord(model.info);
+  const metadata = {
+    ...asModelRecord(model.metadata),
+    ...asModelRecord(model.meta),
+    ...asModelRecord(info.meta),
+  };
+  const capabilities = {
+    ...asModelRecord(metadata.capabilities),
+    ...asModelRecord(info.capabilities),
+    ...asModelRecord(model.capabilities),
+  };
+  const id = typeof model.id === "string" ? model.id : "";
+  const name =
+    (typeof model.name === "string" && model.name) ||
+    (typeof info.name === "string" && info.name) ||
+    id;
+  const createdValue = info.created_at ?? model.created;
+  const created =
+    typeof createdValue === "number" && Number.isFinite(createdValue)
+      ? createdValue
+      : Date.now();
+  const contextWindow =
+    typeof metadata.max_context_length === "number"
+      ? metadata.max_context_length
+      : undefined;
+  const modality = Array.isArray(metadata.modality)
+    ? metadata.modality.filter((value): value is string => typeof value === "string")
+    : undefined;
+  const chatType = Array.isArray(metadata.chat_type)
+    ? metadata.chat_type.filter((value): value is string => typeof value === "string")
+    : undefined;
+  const isActive =
+    typeof info.is_active === "boolean"
+      ? info.is_active
+      : typeof model.is_active === "boolean"
+        ? model.is_active
+        : undefined;
+
   return {
-    id: noThinking ? `${model.id}-no-thinking` : model.id,
-    name: noThinking ? `${model.name} (No Thinking)` : model.name,
+    ...model,
+    id,
+    name,
     object: "model",
-    owned_by: model.owned_by || "qwen",
-    created: model.info?.created_at || Date.now(),
-    context_window: model.info?.meta?.max_context_length,
-    capabilities: model.info?.meta?.capabilities,
+    owned_by:
+      (typeof model.owned_by === "string" && model.owned_by) || "qwen",
+    created,
+    ...(contextWindow !== undefined ? { context_window: contextWindow } : {}),
+    capabilities,
+    metadata,
+    info,
+    meta: metadata,
+    ...(modality ? { modality } : {}),
+    ...(chatType ? { chat_type: chatType } : {}),
+    ...(metadata.think_skip && typeof metadata.think_skip === "object"
+      ? { think_skip: metadata.think_skip as Record<string, unknown> }
+      : {}),
+    ...(isActive !== undefined ? { is_active: isActive } : {}),
+    ...(metadata.max_summary_generation_length !== undefined
+      ? { max_summary_generation_length: metadata.max_summary_generation_length }
+      : {}),
+    ...(metadata.max_thinking_generation_length !== undefined
+      ? {
+          max_thinking_generation_length:
+            metadata.max_thinking_generation_length,
+        }
+      : {}),
   };
 }
 
 export async function deleteAllQwenChats(accountId?: string): Promise<boolean> {
   const { headers } = await getQwenHeaders(false, accountId);
-  const response = await fetch(`${config.qwen.baseUrl}/api/v2/chats/`, {
-    method: "DELETE",
-    headers: buildCapturedQwenHeaders(headers, {
-      referer: `${config.qwen.baseUrl}/settings/chats`,
+  const response = await requestQwenTextInBrowser(
+    accountId,
+    "DELETE",
+    "/api/v2/chats/",
+    buildCapturedQwenHeaders(headers, {
+      referer: qwenUrl("/settings/chats"),
     }),
-  });
+    undefined,
+    { referrer: qwenUrl("/settings/chats") },
+  );
 
   const { raw, json: parsed } = await readJsonTextResponse(response, {
     strict: true,
@@ -1006,14 +2002,15 @@ export async function deleteQwenChat(
 ): Promise<boolean> {
   if (!chatId) return false;
   const { headers } = await getQwenHeaders(false, accountId);
-  const response = await fetch(
-    `${config.qwen.baseUrl}/api/v2/chats/${encodeURIComponent(chatId)}`,
-    {
-      method: "DELETE",
-      headers: buildCapturedQwenHeaders(headers, {
-        referer: `${config.qwen.baseUrl}/settings/chats`,
-      }),
-    },
+  const response = await requestQwenTextInBrowser(
+    accountId,
+    "DELETE",
+    `/api/v2/chats/${encodeURIComponent(chatId)}`,
+    buildCapturedQwenHeaders(headers, {
+      referer: qwenUrl("/settings/chats"),
+    }),
+    undefined,
+    { referrer: qwenUrl("/settings/chats") },
   );
 
   const { raw, json: parsed } = await readJsonTextResponse(response, {
@@ -1041,15 +2038,16 @@ export async function fetchQwenChatHistory(
 ): Promise<any> {
   if (!chatId) return null;
   const { headers } = await getQwenHeaders(false, accountId);
-  const response = await fetch(
-    `${config.qwen.baseUrl}/api/v2/chats/${encodeURIComponent(chatId)}`,
-    {
-      method: "GET",
-      headers: buildCapturedQwenHeaders(headers, {
-        chatSessionId: chatId,
-        referer: `${config.qwen.baseUrl}/c/${chatId}`,
-      }),
-    },
+  const response = await requestQwenTextInBrowser(
+    accountId,
+    "GET",
+    `/api/v2/chats/${encodeURIComponent(chatId)}`,
+    buildCapturedQwenHeaders(headers, {
+      chatSessionId: chatId,
+      referer: qwenUrl(`/c/${encodeURIComponent(chatId)}`),
+    }),
+    undefined,
+    { referrer: qwenUrl(`/c/${encodeURIComponent(chatId)}`) },
   );
 
   const { raw, json } = await readJsonTextResponse(response, { strict: true });
@@ -1068,14 +2066,79 @@ export async function fetchQwenModels(
   const now = Date.now();
   const cached = modelsCache.get(cacheKey);
   if (cached && now - cached.fetchedAt < MODEL_CACHE_TTL_MS) {
+    syncModelMetadata(
+      cached.models as unknown as Array<Record<string, unknown> & { id: string }>,
+      accountId,
+    );
     return cached.models;
+  }
+
+  // Use an isolated page only when the main page is actively serving a stream.
+  // Startup/idle operations should not open a visible extra tab.
+  if (accountId && !isAuthMockEnabled() && isAccountBusy(accountId)) {
+    try {
+      const result = await withIsolatedQwenPage(
+        accountId,
+        async (page) => {
+          const response = await page.evaluate(async (timeoutMs: number) => {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+              const resp = await fetch("https://chat.qwen.ai/api/models", {
+                method: "GET",
+                headers: {
+                  accept: "application/json, text/plain, */*",
+                  "x-request-id": crypto.randomUUID(),
+                  timezone: new Date().toString().split(" (")[0],
+                  source: "web",
+                },
+                signal: controller.signal,
+              });
+              return { status: resp.status, body: await resp.text() };
+            } finally {
+              clearTimeout(timeoutId);
+            }
+          }, config.timeouts.http);
+          return response;
+        },
+        qwenUrl("/"),
+      );
+
+      if (result.status < 400) {
+        const json = JSON.parse(result.body);
+        if (json.data && Array.isArray(json.data)) {
+          const models = json.data
+            .filter((model: unknown) => {
+              const record = asModelRecord(model);
+              return typeof record.id === "string" && record.id.trim().length > 0;
+            })
+            .map((model: unknown) => formatPublicQwenModel(asModelRecord(model)));
+
+          replaceModelMetadata(
+            models as unknown as Array<Record<string, unknown> & { id: string }>,
+            accountId,
+          );
+          modelsCache.set(cacheKey, { models, fetchedAt: now });
+          return models;
+        }
+      }
+    } catch (error) {
+      // Fall through to standard request path
+      logger.debug("[Qwen] Isolated model fetch failed, using standard path", {
+        accountId: cacheKey,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
 
   const { cookie, userAgent, bxV, bxUa, bxUmidtoken } =
     await getBasicHeaders(accountId);
 
-  const response = await fetch(`${config.qwen.baseUrl}/api/models`, {
-    headers: buildQwenRequestHeaders({
+  const response = await requestQwenTextInBrowser(
+    accountId,
+    "GET",
+    "/api/models",
+    buildQwenRequestHeaders({
       cookie,
       userAgent,
       bxV,
@@ -1085,7 +2148,9 @@ export async function fetchQwenModels(
         timezone: new Date().toString(),
       },
     }),
-  });
+    undefined,
+    { referrer: qwenUrl("/") },
+  );
 
   if (!response.ok) {
     throw new Error(
@@ -1095,11 +2160,20 @@ export async function fetchQwenModels(
 
   const json = await response.json();
   if (json.data && Array.isArray(json.data)) {
-    const models = json.data.flatMap((model: any) => [
-      formatPublicQwenModel(model),
-      formatPublicQwenModel(model, true),
-    ]);
+    // Keep only upstream/base entries here. The public `-fast` variant is
+    // generated exactly once by the public models endpoint after metadata has
+    // been synchronized.
+    const models = json.data
+      .filter((model: unknown) => {
+        const record = asModelRecord(model);
+        return typeof record.id === "string" && record.id.trim().length > 0;
+      })
+      .map((model: unknown) => formatPublicQwenModel(asModelRecord(model)));
 
+    replaceModelMetadata(
+      models as unknown as Array<Record<string, unknown> & { id: string }>,
+      accountId,
+    );
     modelsCache.set(cacheKey, { models, fetchedAt: now });
     return models;
   }
@@ -1119,61 +2193,57 @@ export interface QwenFileEntry {
 async function createQwenChatSession(
   headers: Record<string, string>,
   model: string,
+  accountId?: string,
 ): Promise<string> {
   if (isAuthMockEnabled()) {
     return process.env.TEST_SESSION_ID || "mock-session";
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), config.timeouts.http);
+  const response = await requestQwenTextInBrowser(
+    accountId,
+    "POST",
+    "/api/v2/chats/new",
+    buildCapturedQwenHeaders(headers, {
+      referer: qwenUrl("/"),
+    }),
+    JSON.stringify({
+      title: "Nova Conversa",
+      models: [model],
+      chat_mode: "normal",
+      chat_type: "t2t",
+      timestamp: Date.now(),
+      project_id: "",
+    }),
+    { referrer: qwenUrl("/") },
+  );
 
-  try {
-    const response = await fetch(`${config.qwen.baseUrl}/api/v2/chats/new`, {
-      method: "POST",
-      headers: buildCapturedQwenHeaders(headers, {
-        referer: `${config.qwen.baseUrl}/c/new-chat`,
-      }),
-      body: JSON.stringify({
-        title: "Nova Conversa",
-        models: [model],
-        chat_mode: "normal",
-        chat_type: "t2t",
-        timestamp: Date.now(),
-        project_id: "",
-      }),
-      signal: controller.signal,
-    });
-
-    const { raw, json } = await readJsonTextResponse(response, {
-      strict: true,
-    });
-    if (!response.ok) {
-      throw new QwenUpstreamError(
-        `Qwen create chat failed: ${response.status} ${response.statusText} - ${raw.substring(0, 300)}`,
-        "CreateChatFailed",
-        response.status >= 500 ? 502 : response.status,
-      );
-    }
-
-    const chatId =
-      json?.chat_id ||
-      json?.id ||
-      json?.data?.chat_id ||
-      json?.data?.id ||
-      json?.data?.chat?.id;
-
-    if (!chatId || typeof chatId !== "string") {
-      throw new QwenUpstreamError(
-        `Qwen create chat returned unexpected payload: ${raw.substring(0, 300)}`,
-        "CreateChatInvalidResponse",
-        502,
-      );
-    }
-
-    return chatId;
-  } finally {
-    clearTimeout(timeoutId);
+  const { raw, json } = await readJsonTextResponse(response, {
+    strict: true,
+  });
+  if (!response.ok) {
+    throw new QwenUpstreamError(
+      `Qwen create chat failed: ${response.status} ${response.statusText} - ${raw.substring(0, 300)}`,
+      "CreateChatFailed",
+      response.status >= 500 ? 502 : response.status,
+    );
   }
+
+  const chatId =
+    json?.chat_id ||
+    json?.id ||
+    json?.data?.chat_id ||
+    json?.data?.id ||
+    json?.data?.chat?.id;
+
+  if (!chatId || typeof chatId !== "string") {
+    throw new QwenUpstreamError(
+      `Qwen create chat returned unexpected payload: ${raw.substring(0, 300)}`,
+      "CreateChatInvalidResponse",
+      502,
+    );
+  }
+
+  return chatId;
 }
 
 /**
@@ -1182,30 +2252,23 @@ async function createQwenChatSession(
  */
 async function fetchUnusedChats(
   headers: Record<string, string>,
+  accountId?: string,
 ): Promise<string[]> {
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(
-      () => controller.abort(),
-      config.timeouts.http,
+    const response = await requestQwenTextInBrowser(
+      accountId,
+      "GET",
+      "/api/v2/chats/?page=1&exclude_project=true",
+      buildCapturedQwenHeaders(headers, {
+        extra: {
+          accept: "application/json, text/plain, */*",
+          "x-request-id": crypto.randomUUID(),
+          source: "web",
+        },
+      }),
+      undefined,
+      { referrer: qwenUrl("/settings/chats") },
     );
-
-    const response = await fetch(
-      `${config.qwen.baseUrl}/api/v2/chats/?page=1&exclude_project=true`,
-      {
-        method: "GET",
-        headers: buildCapturedQwenHeaders(headers, {
-          extra: {
-            accept: "application/json, text/plain, */*",
-            "x-request-id": crypto.randomUUID(),
-            source: "web",
-          },
-        }),
-        signal: controller.signal,
-      },
-    );
-
-    clearTimeout(timeoutId);
 
     if (!response.ok) return [];
 
@@ -1308,7 +2371,7 @@ async function acquireNewQwenChatSession(
     }
   }
 
-  const created = await createQwenChatSession(headers, model);
+  const created = await createQwenChatSession(headers, model, accountId);
   logger.debug("[Qwen] created fresh chat", {
     accountId: accountId || "global",
     model,
@@ -1338,7 +2401,7 @@ async function refillQwenChatPool(
     const existingIds = new Set(precreatedChatSessions.get(key) ?? []);
     let reused = 0;
     try {
-      const unusedChats = await fetchUnusedChats(headers);
+      const unusedChats = await fetchUnusedChats(headers, accountId);
       for (const chatId of unusedChats) {
         if ((precreatedChatSessions.get(key)?.length ?? 0) >= targetSize) break;
         if (existingIds.has(chatId)) continue;
@@ -1369,7 +2432,7 @@ async function refillQwenChatPool(
         await sleep(300 + Math.floor(Math.random() * 700));
       }
       isFirst = false;
-      const chatId = await createQwenChatSession(headers, model);
+      const chatId = await createQwenChatSession(headers, model, accountId);
       const current = precreatedChatSessions.get(key) ?? [];
       current.push(chatId);
       precreatedChatSessions.set(key, current);
@@ -1422,7 +2485,7 @@ export async function warmQwenChatPool(
   const { headers } = await getQwenHeaders(false, accountId);
   await refillQwenChatPool(
     headers,
-    modelId.replace("-no-thinking", ""),
+    mapClientModelToQwen(modelId),
     accountId,
   );
 }
@@ -1460,14 +2523,7 @@ function parseQwenJsonError(
     return null;
   }
 
-  // Helper: exponential backoff with jitter, capped by config
-  const antiBotDelay = (attempt: number) => {
-    const base = config.antiBot.baseDelayMs;
-    const max = config.antiBot.maxDelayMs;
-    const exp = Math.min(base * Math.pow(2, attempt - 1), max);
-    const jitter = exp * 0.3 * Math.random();
-    return Math.floor(exp + jitter);
-  };
+
 
   const retryDelay = (attempt: number) => {
     const base = config.retry.baseDelayMs;
@@ -1485,10 +2541,9 @@ function parseQwenJsonError(
       retStr.includes("FAIL_SYS_USER_VALIDATE") ||
       retStr.includes("RGV587_ERROR")
     ) {
-      const attempt = errorJson?.data?.retryCount ?? 1;
       return new RetryableQwenStreamError(
         `Qwen anti-bot: ${retStr.substring(0, 200)}`,
-        antiBotDelay(attempt),
+        0,
       );
     }
   }
@@ -1514,10 +2569,9 @@ function parseQwenJsonError(
       details.includes("RGV587_ERROR") ||
       details.includes("user validate"))
   ) {
-    const attempt = errorJson?.data?.retryCount ?? 1;
     return new RetryableQwenStreamError(
       `Qwen anti-bot: ${details}`,
-      antiBotDelay(attempt),
+      0,
     );
   }
 
@@ -1585,6 +2639,66 @@ function parseQwenJsonError(
   return null;
 }
 
+const UPSTREAM_RESPONSE_PREVIEW_BYTES = 8 * 1024;
+
+function isHtmlResponseContentType(contentType: string): boolean {
+  const normalized = contentType.toLowerCase();
+  return (
+    normalized.includes("text/html") ||
+    normalized.includes("application/xhtml+xml")
+  );
+}
+
+function isHtmlResponseBody(value: string): boolean {
+  return /^\s*(?:<!doctype\s+html|<html\b)/i.test(value);
+}
+
+function isWafChallengeResponse(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return (
+    normalized.includes("aliyun_waf") ||
+    normalized.includes("_____tmd_____") ||
+    normalized.includes("fail_sys_user_validate") ||
+    normalized.includes("rgv587_error") ||
+    normalized.includes("denyfromx5") ||
+    normalized.includes("captcha") ||
+    normalized.includes("security verification")
+  );
+}
+
+async function readResponsePreview(
+  response: Response,
+  maxBytes = UPSTREAM_RESPONSE_PREVIEW_BYTES,
+): Promise<string> {
+  if (!response.body) return "";
+
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let bytesRead = 0;
+
+  try {
+    while (bytesRead < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+
+      const chunk = Buffer.from(value);
+      const remaining = maxBytes - bytesRead;
+      if (chunk.byteLength > remaining) {
+        chunks.push(chunk.subarray(0, remaining));
+        bytesRead += remaining;
+        break;
+      }
+      chunks.push(chunk);
+      bytesRead += chunk.byteLength;
+    }
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 export async function createQwenStream(
   prompt: string,
   enableThinking: boolean,
@@ -1605,6 +2719,54 @@ export async function createQwenStream(
   createdNewChat: boolean;
   tokenEstimationContext: TokenEstimationContext;
 }> {
+  // Serialize streams per account: one active stream at a time per browser context
+  const streamLockKey = accountId || "global";
+  const releaseStreamLock = await acquireAccountStreamLock(streamLockKey);
+  let streamLockReleased = false;
+  const releaseStreamLockOnce = () => {
+    if (streamLockReleased) return;
+    streamLockReleased = true;
+    releaseStreamLock();
+  };
+
+  try {
+    return await createQwenStreamInternal(
+      prompt,
+      enableThinking,
+      modelId,
+      forcedParentId,
+      accountId,
+      files,
+      options,
+      releaseStreamLockOnce,
+    );
+  } catch (error) {
+    releaseStreamLockOnce();
+    throw error;
+  }
+}
+
+async function createQwenStreamInternal(
+  prompt: string,
+  enableThinking: boolean,
+  modelId: string,
+  forcedParentId: string | null | undefined,
+  accountId: string | undefined,
+  files: QwenFileEntry[] | undefined,
+  options: {
+    chatSessionId?: string | null;
+    forceNewChat?: boolean;
+  } | undefined,
+  releaseStreamLock: () => void,
+): Promise<{
+  stream: ReadableStream;
+  headers: Record<string, string>;
+  uiSessionId: string;
+  controller: AbortController;
+  accountId: string;
+  createdNewChat: boolean;
+  tokenEstimationContext: TokenEstimationContext;
+}> {
   // A new logical chat session should reuse the warmed header cache when available.
   // Header recapture is much more expensive and should be reserved for real refresh/login cases,
   // not for ordinary first prompts that simply need parent_id reset.
@@ -1613,7 +2775,10 @@ export async function createQwenStream(
     accountId,
   );
   const { headers, parentMessageId } = captured;
-  const model = modelId.replace("-no-thinking", "");
+  let activeHeaders = headers;
+  // The upstream always receives the real base model ID. Reasoning mode is
+  // selected exclusively by feature_config, not by a synthetic model suffix.
+  const model = mapClientModelToQwen(modelId);
   let createdNewChat = false;
   let chatSessionId: string | null | undefined;
   let leasedWarmChat = false;
@@ -1651,6 +2816,12 @@ export async function createQwenStream(
     releaseWarmChat(accountId, model, chatSessionId);
   };
 
+  // Combined cleanup: release warm chat AND stream lock
+  const releaseStreamResources = () => {
+    releaseLeasedWarmChat();
+    releaseStreamLock();
+  };
+
   const wrapUpstreamStream = (
     stream: ReadableStream<Uint8Array>,
     controller: AbortController,
@@ -1666,18 +2837,18 @@ export async function createQwenStream(
             if (!reader) throw new Error("Stream reader was not initialized");
             const { done, value } = await reader.read();
             if (done) {
-              releaseLeasedWarmChat();
+              releaseStreamResources();
               streamController.close();
               return;
             }
             streamController.enqueue(value);
           } catch (error) {
-            releaseLeasedWarmChat();
+            releaseStreamResources();
             streamController.error(error);
           }
         },
         cancel(reason) {
-          releaseLeasedWarmChat();
+          releaseStreamResources();
           return stream.cancel(reason);
         },
       });
@@ -1707,8 +2878,8 @@ export async function createQwenStream(
       controller,
       dynamicIdleTimeoutMs,
       `Qwen stream ${chatSessionId || "unknown"}`,
-      releaseLeasedWarmChat,
-      releaseLeasedWarmChat,
+      releaseStreamResources,
+      releaseStreamResources,
     );
   };
 
@@ -1737,35 +2908,40 @@ export async function createQwenStream(
 
   const timestamp = Math.floor(Date.now() / 1000);
   const fid = uuidv4();
+  const childId = uuidv4();
 
   const payload: QwenPayload = {
     stream: true,
     version: "2.1",
     incremental_output: true,
+    chatId: chatSessionId || null,
+    parentId: actualParentId ?? "",
     chat_id: chatSessionId || null,
     chat_mode: "normal",
     model: model,
     parent_id: actualParentId,
     messages: [
       {
+        id: null,
         fid: fid,
         parentId: actualParentId,
-        childrenIds: [],
+        childrenIds: [childId],
         role: "user",
         content: prompt,
         user_action: "chat",
         files: files || [],
         timestamp: timestamp,
         models: [model],
+        model: "",
         chat_type: "t2t",
         feature_config: {
           thinking_enabled: enableThinking,
           output_schema: "phase",
           research_mode: "normal",
           auto_thinking: false,
-          thinking_mode: "Thinking",
-          thinking_format: "summary",
-          auto_search: false,
+          thinking_mode: enableThinking ? "Thinking" : "Fast",
+          ...(enableThinking ? { thinking_format: "summary" } : {}),
+          auto_search: true,
         },
         extra: {
           meta: {
@@ -1810,36 +2986,82 @@ export async function createQwenStream(
   }
 
   const payloadMB = payloadSize / (1024 * 1024);
-  const dynamicTimeoutMs =
-    enableThinking || modelId.includes("thinking")
-      ? Math.max(
-          config.timeouts.reasoningModelTimeout,
-          BASE_TIMEOUT_MS + Math.ceil(payloadMB * TIMEOUT_PER_MB),
-        )
-      : BASE_TIMEOUT_MS + Math.ceil(payloadMB * TIMEOUT_PER_MB);
+  const dynamicTimeoutMs = enableThinking
+    ? Math.max(
+        config.timeouts.reasoningModelTimeout,
+        BASE_TIMEOUT_MS + Math.ceil(payloadMB * TIMEOUT_PER_MB),
+      )
+    : BASE_TIMEOUT_MS + Math.ceil(payloadMB * TIMEOUT_PER_MB);
+  // Keep the total generation budget separate from the browser bridge startup
+  // and first-response-header deadlines. The bridge releases the account page
+  // mutex immediately; this budget only bounds the request lifecycle.
+  const browserStreamBudgetMs = Math.max(
+    config.timeouts.page,
+    Math.min(
+      dynamicTimeoutMs,
+      config.timeouts.totalRequestTimeout > 0
+        ? config.timeouts.totalRequestTimeout
+        : dynamicTimeoutMs,
+    ),
+  );
 
   const url = chatSessionId
-    ? `${config.qwen.baseUrl}/api/v2/chat/completions?chat_id=${chatSessionId}`
-    : `${config.qwen.baseUrl}/api/v2/chat/completions`;
+    ? qwenUrl(`/api/v2/chat/completions?chat_id=${encodeURIComponent(chatSessionId)}`)
+    : qwenUrl("/api/v2/chat/completions");
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), dynamicTimeoutMs);
 
   try {
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: "POST",
-        headers: buildCapturedQwenHeaders(headers, {
+    const fetchCompletion = (requestHeaders: Record<string, string>) =>
+      createQwenBrowserResponse(
+        accountId,
+        url,
+        "POST",
+        buildCapturedQwenHeaders(requestHeaders, {
           chatSessionId,
           extra: {
             "x-accel-buffering": "no",
           },
         }),
-        body: payloadJson,
-        signal: controller.signal,
+        payloadJson,
+        controller.signal,
+        qwenUrl(
+          chatSessionId
+            ? `/c/${encodeURIComponent(chatSessionId)}`
+            : "/",
+        ),
+        browserStreamBudgetMs,
+      );
+
+    let response!: Response;
+    let captchaRecoveryAttempted = false;
+    const retryAfterCaptchaRecovery = async (
+      label: string,
+      challengeBody: string,
+    ): Promise<boolean> => {
+      if (captchaRecoveryAttempted || !accountId) return false;
+      captchaRecoveryAttempted = true;
+
+      const solved = await recoverBaxiaCaptcha(accountId, label, {
+        challengeBody,
       });
-    } catch (error) {
+      if (!solved) return false;
+
+      // The challenge may have rotated bx-* values or session cookies. Refresh
+      // them only after the visible challenge was solved, then replay the same
+      // payload on the same account.
+      const refreshed = await getQwenHeaders(true, accountId);
+      activeHeaders = refreshed.headers;
+      if (config.captcha.retryDelayMs > 0) {
+        await sleep(config.captcha.retryDelayMs);
+      }
+      response = await fetchCompletion(activeHeaders);
+      return true;
+    };
+
+    let captchaMetadataRetryAttempted = false;
+    const throwFetchCompletionError = (error: unknown): never => {
       const errorMsg = error instanceof Error ? error.message : String(error);
       // Treat network errors (fetch failed, timeout, DNS, etc.) as retryable
       if (
@@ -1855,45 +3077,223 @@ export async function createQwenStream(
       throw withCreatedChatMetadata(
         error instanceof Error ? error : new Error(errorMsg),
       );
-    } finally {
-      clearTimeout(timeoutId);
+    };
+
+    try {
+      response = await fetchCompletion(activeHeaders);
+    } catch (error) {
+      // The challenge was solved while waiting for headers, but the original
+      // background fetch did not resume. Replay the same payload on the same
+      // account with fresh headers instead of failing as an unknown error.
+      if (
+        (error as any)?.captchaSolvedDuringMetadata &&
+        accountId &&
+        !captchaMetadataRetryAttempted
+      ) {
+        captchaMetadataRetryAttempted = true;
+        logger.warn(
+          "[Qwen] Completion headers timed out after captcha recovery; retrying with fresh headers",
+          {
+            accountId,
+            chatId: chatSessionId ?? "new",
+          },
+        );
+        const refreshed = await getQwenHeaders(true, accountId);
+        activeHeaders = refreshed.headers;
+        if (config.captcha.retryDelayMs > 0) {
+          await sleep(config.captcha.retryDelayMs);
+        }
+        try {
+          response = await fetchCompletion(activeHeaders);
+        } catch (retryError) {
+          throwFetchCompletionError(retryError);
+        }
+      } else {
+        throwFetchCompletionError(error);
+      }
     }
 
-    const responseContentType = response.headers.get("content-type") || "";
-    if (response.ok && responseContentType.includes("application/json")) {
-      const errText = await response.text().catch(() => "");
+    let responseContentType = response.headers.get("content-type") || "";
+    let retriedNonSseResponse = false;
+
+    while (true) {
+      responseContentType = response.headers.get("content-type") || "";
+
+      const isNonSseSuccessResponse =
+        response.ok &&
+        responseContentType.trim().length > 0 &&
+        !responseContentType.includes("text/event-stream") &&
+        !responseContentType.includes("application/json") &&
+        Boolean(response.body);
 
       if (
-        errText.includes("FAIL_SYS_USER_VALIDATE") ||
-        errText.includes("_____tmd_____") ||
-        errText.includes("RGV587_ERROR")
+        isHtmlResponseContentType(responseContentType) ||
+        isNonSseSuccessResponse
       ) {
+        const preview = await readResponsePreview(response);
+        const htmlBody = isHtmlResponseBody(preview);
+        const antiBotChallenge = isWafChallengeResponse(preview);
         logger.warn(
-          "[Qwen] TMD challenge detected in 200 OK; account will rotate.",
+          htmlBody || isHtmlResponseContentType(responseContentType)
+            ? "[Qwen] Completion returned HTML instead of SSE"
+            : "[Qwen] Completion returned a non-SSE body",
+          {
+            accountId: accountId ?? "global",
+            chatId: chatSessionId ?? "new",
+            status: response.status,
+            contentType: responseContentType,
+            antiBotChallenge,
+            previewBytes: Buffer.byteLength(preview, "utf8"),
+          },
         );
+
+        if (
+          antiBotChallenge &&
+          (await retryAfterCaptchaRecovery(
+            `chat ${chatSessionId ?? "new"}`,
+            preview,
+          ))
+        ) {
+          retriedNonSseResponse = true;
+          continue;
+        }
+
+        if (!antiBotChallenge && !retriedNonSseResponse) {
+          retriedNonSseResponse = true;
+          const refreshed = await getQwenHeaders(true, accountId);
+          activeHeaders = refreshed.headers;
+          response = await fetchCompletion(activeHeaders);
+          continue;
+        }
 
         throw withCreatedChatMetadata(
           new QwenUpstreamError(
-            "Qwen TMD anti-bot challenge detected. Account needs recovery.",
-            "FAIL_SYS_USER_VALIDATE",
-            403,
+            antiBotChallenge
+              ? "Qwen returned an anti-bot challenge instead of an SSE response."
+              : "Qwen returned an HTML response instead of an SSE response.",
+            antiBotChallenge
+              ? "waf_challenge"
+              : htmlBody || isHtmlResponseContentType(responseContentType)
+                ? "non_sse_html_response"
+                : "non_sse_response",
+            502,
           ),
         );
       }
 
-      throw withCreatedChatMetadata(
-        parseQwenJsonError(errText, response.status, accountId) ??
-          new QwenUpstreamError(
-            `Qwen returned non-stream JSON response: ${errText.substring(0, 300)}`,
-            "NonStreamJsonResponse",
-            502,
-          ),
-      );
+      if (
+        response.status === 200 &&
+        !responseContentType.includes("text/event-stream") &&
+        (!response.body || response.headers.get("content-length") === "0")
+      ) {
+        if (!retriedNonSseResponse) {
+          logger.warn(
+            "[Qwen] Completion returned an empty non-stream 200 response; retrying with fresh headers.",
+            {
+              accountId: accountId ?? "global",
+              chatId: chatSessionId ?? "new",
+              contentType: responseContentType || null,
+            },
+          );
+          retriedNonSseResponse = true;
+          const refreshed = await getQwenHeaders(true, accountId);
+          activeHeaders = refreshed.headers;
+          response = await fetchCompletion(activeHeaders);
+          continue;
+        }
+        break;
+      }
+
+      if (response.ok && responseContentType.includes("application/json")) {
+        const errText = await response.text().catch(() => "");
+
+        const htmlResponse = isHtmlResponseBody(errText);
+        const antiBotChallenge = isWafChallengeResponse(errText);
+        if (antiBotChallenge || htmlResponse) {
+          logger.warn(
+            "[Qwen] Completion returned an HTML or anti-bot challenge body instead of SSE.",
+            {
+              accountId: accountId ?? "global",
+              chatId: chatSessionId ?? "new",
+              antiBotChallenge,
+              previewBytes: Buffer.byteLength(errText, "utf8"),
+            },
+          );
+
+          if (
+            antiBotChallenge &&
+            (await retryAfterCaptchaRecovery(
+              `chat ${chatSessionId ?? "new"}`,
+              errText,
+            ))
+          ) {
+            retriedNonSseResponse = true;
+            continue;
+          }
+
+          if (!antiBotChallenge && !retriedNonSseResponse) {
+            retriedNonSseResponse = true;
+            const refreshed = await getQwenHeaders(true, accountId);
+            activeHeaders = refreshed.headers;
+            response = await fetchCompletion(activeHeaders);
+            continue;
+          }
+
+          throw withCreatedChatMetadata(
+            new QwenUpstreamError(
+              antiBotChallenge
+                ? "Qwen returned an anti-bot challenge instead of an SSE response."
+                : "Qwen returned an HTML response instead of an SSE response.",
+              antiBotChallenge ? "waf_challenge" : "non_sse_html_response",
+              502,
+            ),
+          );
+        }
+
+        throw withCreatedChatMetadata(
+          parseQwenJsonError(errText, response.status, accountId) ??
+            new QwenUpstreamError(
+              `Qwen returned non-stream JSON response: ${errText.substring(0, 300)}`,
+              "NonStreamJsonResponse",
+              502,
+            ),
+        );
+      }
+
+      break;
     }
 
     if (!response.ok || !response.body) {
-      const errText = await response.text().catch(() => "");
       const contentType = response.headers.get("content-type") || "";
+      const errText = contentType.includes("application/json")
+        ? await response.text().catch(() => "")
+        : await readResponsePreview(response);
+      const antiBotChallenge = isWafChallengeResponse(errText);
+
+      if (
+        antiBotChallenge &&
+        (await retryAfterCaptchaRecovery(
+          `chat ${chatSessionId ?? "new"}`,
+          errText,
+        ))
+      ) {
+        const recoveredContentType = response.headers.get("content-type") || "";
+        if (
+          response.ok &&
+          response.body &&
+          recoveredContentType.includes("text/event-stream")
+        ) {
+          return {
+            stream: wrapUpstreamStream(response.body, controller),
+            headers: activeHeaders,
+            uiSessionId: chatSessionId || "",
+            controller,
+            accountId: accountId ?? "global",
+            createdNewChat,
+            tokenEstimationContext,
+          };
+        }
+      }
 
       // Handle 502/503/504 as retryable upstream unavailability
       if (
@@ -1933,15 +3333,19 @@ export async function createQwenStream(
         }
       }
       throw withCreatedChatMetadata(
-        new Error(
-          `Failed to fetch from Qwen: ${response.status} ${response.statusText} - ${errText}`,
+        new QwenUpstreamError(
+          `Qwen completion request failed: ${response.status} ${response.statusText}`,
+          isWafChallengeResponse(errText)
+            ? "waf_challenge"
+            : "completion_http_error",
+          502,
         ),
       );
     }
 
     return {
       stream: wrapUpstreamStream(response.body, controller),
-      headers,
+      headers: activeHeaders,
       uiSessionId: chatSessionId || "",
       controller,
       accountId: accountId ?? "global",
@@ -1949,7 +3353,9 @@ export async function createQwenStream(
       tokenEstimationContext,
     };
   } catch (error) {
-    releaseLeasedWarmChat();
+    releaseStreamResources();
     throw error;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }

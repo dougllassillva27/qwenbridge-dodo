@@ -31,6 +31,7 @@ export function markAccountRateLimited(
   accountId: string,
   cooldownMs?: number,
   reason?: string,
+  options: { silent?: boolean } = {},
 ): void {
   const duration = cooldownMs ?? DEFAULT_COOLDOWN_MS;
   const until = Date.now() + duration;
@@ -53,9 +54,11 @@ export function markAccountRateLimited(
     }
   }
 
-  	console.log(
-  		`⏱️  [AccountManager] Cooldown set | ${accountId} | reason=${cooldownReason} | ${Math.round(duration / 1000)}s | until=${formatDateTimeBR(until)}`,
-  	);
+  if (!options.silent) {
+    console.log(
+      `⏱️  [AccountManager] Cooldown set | ${accountId} | reason=${cooldownReason} | ${Math.round(duration / 1000)}s | until=${formatDateTimeBR(until)}`,
+    );
+  }
 }
 
 export function clearAccountCooldown(accountId: string): void {
@@ -99,7 +102,7 @@ function isAccountOnCooldown(accountId: string): boolean {
   return getAccountCooldownInfo(accountId) !== null;
 }
 
-function syncCooldownsFromDb(accounts: QwenAccount[]): void {
+export function syncCooldownsFromDb(accounts: QwenAccount[]): void {
   const now = Date.now();
   for (const account of accounts) {
     if (account.cooldown_until && account.cooldown_until > now) {

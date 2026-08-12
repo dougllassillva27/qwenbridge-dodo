@@ -11,6 +11,8 @@ import { getAccountCooldownInfo } from "../core/account-manager.js";
 import { app as modelsApp } from "./models.js";
 import { chatCompletions, chatCompletionsStop } from "../routes/chat.js";
 import { uploadFile } from "../routes/upload.js";
+import { imagesGenerations } from "../routes/images.js";
+import { videosGenerations, videoTaskStatus } from "../routes/videos.js";
 import { anthropicApp } from "../routes/anthropic/index.js";
 import { responsesApp } from "../routes/responses/index.js";
 import { sendOpenAIError } from "./error-helpers.js";
@@ -26,6 +28,11 @@ let stopPromise: Promise<void> | null = null;
 let signalHandlersInstalled = false;
 
 const app = new Hono();
+
+function formatAccountId(accountId: string): string {
+  const normalized = accountId.trim();
+  return normalized.length > 12 ? `${normalized.slice(0, 12)}…` : normalized;
+}
 
 // Module-level accessor for cross-module cache access
 export function getCache(): MemoryCache | undefined {
@@ -107,6 +114,9 @@ app.route("", modelsApp);
 app.post("/v1/chat/completions", chatCompletions);
 app.post("/v1/chat/completions/stop", chatCompletionsStop);
 app.post("/v1/upload", uploadFile);
+app.post("/v1/images/generations", imagesGenerations);
+app.post("/v1/videos/generations", videosGenerations);
+app.get("/v1/tasks/status/:taskId", videoTaskStatus);
 
 // Anthropic API compatible routes
 app.route("", anthropicApp);
@@ -135,18 +145,17 @@ app.get("/health", async (c) => {
     },
   });
 });
-
-// [Dodo] Endpoint para Dashboard Tauri Proxy-Launcher
+// [Dodo] Handler consolidado para Dashboard do Proxy Launcher
 const accountsHandler = async (c: Context) => {
   const error = verifyApiKey(c);
   if (error) return error;
 
-  const { loadAccounts } = await import("../core/accounts.ts");
+  const { listAccounts } = await import("../core/accounts.ts");
   const { getAccountCooldownInfo } = await import("../core/account-manager.ts");
   const { accountTokenUsage, metrics } = await import("../core/metrics.ts");
   const { getHeapUsageSnapshot } = await import("../core/memory-usage.ts");
 
-  const accounts = loadAccounts();
+  const accounts = listAccounts();
   const heap = getHeapUsageSnapshot();
   const requestsCount = metrics.get("requests.total")?.value || 0;
   const errorsCount = metrics.get("requests.errors")?.value || 0;
@@ -154,7 +163,7 @@ const accountsHandler = async (c: Context) => {
   let activeCount = 0;
   let cooldownCount = 0;
 
-  const result = accounts.map((acc) => {
+  const result = accounts.map((acc: any) => {
     const cooldownInfo = getAccountCooldownInfo(acc.id);
     const usage = accountTokenUsage[acc.id] || { prompt: 0, completion: 0, total: 0 };
     const isCooldown = Boolean(cooldownInfo);
@@ -167,7 +176,7 @@ const accountsHandler = async (c: Context) => {
 
     return {
       id: acc.id,
-      email: acc.email,
+      email: maskEmail(acc.email),
       status: isCooldown ? "cooldown" : "ready",
       cooldown_until: cooldownUntil,
       cooldownUntil: cooldownUntil,
@@ -186,7 +195,7 @@ const accountsHandler = async (c: Context) => {
     requests: requestsCount,
     ram_mb: Math.round(heap.heapUsed / (1024 * 1024)),
     stream_errors: errorsCount,
-    totalTokens: Object.values(accountTokenUsage).reduce((acc, curr) => acc + curr.total, 0),
+    totalTokens: Object.values(accountTokenUsage).reduce((acc, curr) => acc + (curr.total || 0), 0),
     accounts: result,
   });
 };
@@ -206,6 +215,27 @@ app.get("/accounts", async (c) => {
 app.get("/metrics/accounts", async (c) => {
   c.header("Access-Control-Allow-Origin", "*");
   return accountsHandler(c);
+});
+
+// Token TTL diagnostics: inspect real cookie/header lifetimes
+app.get("/diagnostics/tokens", async (c) => {
+  const error = verifyApiKey(c);
+  if (error) return error;
+
+  const { getTokenDiagnostics } = await import("../services/playwright.ts");
+  const accountId = c.req.query("accountId");
+
+  try {
+    const diagnostics = await getTokenDiagnostics(accountId);
+    return c.json(diagnostics);
+  } catch (err) {
+    return c.json(
+      {
+        error: err instanceof Error ? err.message : String(err),
+      },
+      500,
+    );
+  }
 });
 
 app.get("/metrics", (c) => {
@@ -274,6 +304,18 @@ async function prepareQwenRuntime(params: {
     modelId: string,
   ) => Promise<void>;
 }): Promise<boolean> {
+  if (params.accountId) {
+    const { getAccountCooldownInfo } =
+      await import("../core/account-manager.ts");
+    const cooldownInfo = getAccountCooldownInfo(params.accountId);
+    if (cooldownInfo) {
+      console.warn(
+        `⚠️ [Server] Account not ready | account=${formatAccountId(params.accountId)} | cooldown=${Math.ceil(cooldownInfo.remainingMs / 1000)}s | reason=${cooldownInfo.reason}`,
+      );
+      return false;
+    }
+  }
+
   try {
     await params.initAuth();
     await params.disableNativeTools(params.accountId).catch(() => {});
@@ -284,7 +326,7 @@ async function prepareQwenRuntime(params: {
       const cooldownInfo = getAccountCooldownInfo(params.accountId);
       if (cooldownInfo) {
         console.warn(
-          `⚠️  [Server] Account not ready: cooldown ${Math.ceil(cooldownInfo.remainingMs / 1000)}s (${cooldownInfo.reason})`,
+          `⚠️ [Server] Account not ready | account=${formatAccountId(params.accountId)} | cooldown=${Math.ceil(cooldownInfo.remainingMs / 1000)}s | reason=${cooldownInfo.reason}`,
         );
         return false;
       }
@@ -292,6 +334,15 @@ async function prepareQwenRuntime(params: {
     return true;
   } catch (error) {
     console.warn(`❌ ${params.failureMessage}`, getErrorMessage(error));
+    if (params.accountId) {
+      const { markAccountRateLimited } =
+        await import("../core/account-manager.ts");
+      markAccountRateLimited(
+        params.accountId,
+        config.concurrency.initFailureCooldownMs,
+        "AuthInitFailed",
+      );
+    }
     return false;
   }
 }
@@ -496,58 +547,134 @@ export async function startServer(options?: {
       await import("../core/accounts.ts");
     const accounts = loadAccounts();
 
-    // Clear stale cooldowns from previous sessions on startup
-    const { clearAccountCooldown } = await import("../core/account-manager.ts");
-    for (const account of accounts) {
-      clearAccountCooldown(account.id);
-    }
+    // Restore persisted cooldowns (e.g. daily quota windows) from the database
+    // instead of wiping them on restart — retrying a still-rate-limited account
+    // wastes a request and immediately re-trips the same limit. Expired
+    // entries are dropped lazily by the cooldown lookup.
+    const { syncCooldownsFromDb } =
+      await import("../core/account-manager.ts");
+    syncCooldownsFromDb(accounts);
+
+    const { getAccountsByPriority } =
+      await import("../core/account-priority.ts");
 
     const { disableNativeTools, warmQwenChatPool } =
       await import("../services/qwen.ts");
-    const { initPlaywrightForAccount } =
+    const { initPlaywrightForAccount, isPlaywrightInitialized } =
       await import("../services/playwright.ts");
 
     const BATCH_SIZE = config.playwright.initBatchSize;
 
     if (accounts.length > 0) {
-      let readyAccountIndex = -1;
+      let readyAccountId: string | null = null;
       const totalAccounts = accounts.length;
-      for (let i = 0; i < accounts.length; i++) {
+
+      // Warm accounts in priority order (recently successful accounts first),
+      // skipping accounts still on cooldown, so the startup account matches
+      // the one request routing will pick first.
+      const warmOrder = getAccountsByPriority(accounts).filter(
+        (account) => !getAccountCooldownInfo(account.id),
+      );
+
+      for (let i = 0; i < warmOrder.length; i++) {
         const ok = await prepareAccountRuntime(
-          accounts[i],
+          warmOrder[i],
           getAccountCredentials,
           initPlaywrightForAccount,
           disableNativeTools,
           warmQwenChatPool,
         );
         if (ok) {
-          console.log(`✅ [Server] Account ready (${i + 1}/${totalAccounts}): ${maskEmail(accounts[i].email)}`);
-          readyAccountIndex = i;
+          console.log(`✅ [Server] Account ready (${i + 1}/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`);
+          readyAccountId = warmOrder[i].id;
           break;
         }
       }
 
       const remainingAccounts = accounts.filter(
-        (_account, index) => index !== readyAccountIndex,
+        (account) => account.id !== readyAccountId,
       );
-      if (readyAccountIndex === -1) {
+      if (readyAccountId === null) {
         console.warn(
           `⚠️  [Server] No account ready during startup; continuing in background`,
         );
       }
-      void prepareRemainingAccountsInBackground({
-        accounts: remainingAccounts,
-        batchSize: BATCH_SIZE,
-        totalAccounts,
-        getAccountCredentials,
-        initPlaywrightForAccount,
-        disableNativeTools,
-        warmQwenChatPool,
-      }).catch((error) => {
-        console.warn(
-          `❌ [Server] Background account preparation failed: ${getErrorMessage(error)}`,
+
+      if (config.playwright.prepareAllOnStartup || readyAccountId === null) {
+        if (config.playwright.prepareAllOnStartup && remainingAccounts.length > 0) {
+          console.log(
+            `🪶 [Server] Preparing ${remainingAccounts.length} standby account(s) in background`,
+          );
+        }
+        void prepareRemainingAccountsInBackground({
+          accounts: remainingAccounts,
+          batchSize: BATCH_SIZE,
+          totalAccounts,
+          getAccountCredentials,
+          initPlaywrightForAccount,
+          disableNativeTools,
+          warmQwenChatPool,
+        }).catch((error) => {
+          console.warn(
+            `❌ [Server] Background account preparation failed: ${getErrorMessage(error)}`,
+          );
+        });
+      } else if (remainingAccounts.length > 0) {
+        console.log(
+          `🪶 [Server] ${remainingAccounts.length} standby account(s) will initialize on demand`,
         );
-      });
+
+        // Validate standby accounts in background: check login, add to priority,
+        // but keep browser closed until actually needed
+        void (async () => {
+          const { validateAccountLogin } = await import("../services/playwright.ts");
+          const { ensureAccountInPriority } = await import("../core/account-priority.ts");
+
+          let validated = 0;
+          let failed = 0;
+
+          for (const account of remainingAccounts) {
+            try {
+              // Add to priority list first (initial priority based on config order)
+              ensureAccountInPriority(account.id);
+
+              // Validate login in background
+              const ok = await validateAccountLogin(
+                account,
+                config.playwright.headless,
+                config.playwright.browser,
+              );
+
+              if (ok) {
+                validated++;
+                console.log(
+                  `✅ [Server] Standby account validated: ${maskEmail(account.email)}`,
+                );
+              } else {
+                failed++;
+                console.warn(
+                  `⚠️  [Server] Standby account login failed: ${maskEmail(account.email)}`,
+                );
+              }
+            } catch (error) {
+              failed++;
+              console.warn(
+                `⚠️  [Server] Standby account validation error: ${maskEmail(account.email)}: ${getErrorMessage(error)}`,
+              );
+            }
+          }
+
+          if (validated > 0 || failed > 0) {
+            console.log(
+              `🪶 [Server] Standby validation complete: ${validated} ok, ${failed} failed`,
+            );
+          }
+        })().catch((error) => {
+          console.warn(
+            `❌ [Server] Background standby validation failed: ${getErrorMessage(error)}`,
+          );
+        });
+      }
     } else {
       console.warn(
         `⚠️  [Server] No Qwen accounts configured. Add accounts with npm run login before sending requests.`,
@@ -575,7 +702,9 @@ export async function startServer(options?: {
 
     const started = buildStartedServerInfo();
     const accountCount = accounts.length;
-    const readyCount = accounts.filter(acc => !getAccountCooldownInfo(acc.id)).length;
+    const warmCount = accounts.filter((account) =>
+      isPlaywrightInitialized(account.id),
+    ).length;
 
     // API key display: just show if it's set or not
     const apiKey = process.env.API_KEY || config.apiKey;
@@ -608,7 +737,7 @@ export async function startServer(options?: {
 |${blank()}|
 |${row("Endpoint", endpoint)}|
 |${row("Port", String(started.port))}|
-|${row("Accounts", `${readyCount}/${accountCount}`)}|
+|${row("Accounts", `${warmCount}/${accountCount} warm`)}|
 |${row("API Key", apiKeyDisplay)}|
 |${row("Status", "● Online")}|
 |${blank()}|

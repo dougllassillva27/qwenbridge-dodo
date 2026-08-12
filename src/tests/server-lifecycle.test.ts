@@ -17,11 +17,8 @@ function isPortAvailable(port: number): Promise<boolean> {
 }
 
 test("server lifecycle starts and stops without accounts or HTTP fallback", async (t) => {
-  const port = Number(process.env.PORT || "3000");
-  if (!(await isPortAvailable(port))) {
-    t.skip(`port ${port} is not available`);
-    return;
-  }
+  // [Dodo] Usar porta dinamica para evitar conflito com o QwenBridge principal rodando na 3000
+  const port = 0;
 
   const db = getDatabase();
   const existing = db

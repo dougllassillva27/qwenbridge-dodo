@@ -21,11 +21,18 @@ import {
 } from "./streaming.ts";
 import { config } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
+import { getContextMeterHeaders, type ContextMeterMode } from "../../services/context-meter.ts";
 import {
   getLogicalThreadState,
   RetryableQwenStreamError,
 } from "../../services/qwen.ts";
-import { classifyRetryAction } from "./retry-policy.ts";
+import {
+  classifyRetryAction,
+  shouldRetryChatInProgressOnSameAccount,
+  shouldRetryInvalidInputOnSameAccount,
+} from "./retry-policy.ts";
+import { classifyMediaModel } from "../../services/media-generation.ts";
+import { handleMediaChatCompletion } from "./media.ts";
 
 
 
@@ -51,6 +58,7 @@ export async function chatCompletions(c: Context) {
       body,
       isStream,
       systemPrompt,
+      toolInstructions,
       prompt,
       currentPrompt,
       modelId,
@@ -66,10 +74,25 @@ export async function chatCompletions(c: Context) {
       ? (body as any).tools
       : [];
 
+    // Intercept image/video generation models: they bypass the text chat flow
+    // and are handled by the native media pipeline (qwen-image-*, wan2.*).
+    const rawModel = typeof body.model === "string" ? body.model.trim() : "";
+    const mediaKind = rawModel ? classifyMediaModel(rawModel) : null;
+    if (mediaKind) {
+      return handleMediaChatCompletion({
+        c,
+        body,
+        model: rawModel,
+        kind: mediaKind,
+        isStream,
+      });
+    }
+
     stepStartedAt = Date.now();
     const ctx = await buildFinalContext({
       messages,
       systemPrompt,
+      toolInstructions,
       prompt,
       currentPrompt,
       modelId,
@@ -79,16 +102,10 @@ export async function chatCompletions(c: Context) {
     });
     mark("context", stepStartedAt);
 
-    // Acquire per-chat lock to prevent concurrent requests to the same Qwen chat
-    // Only lock when we have an explicit conversation key (allowThreadReuse)
-    stepStartedAt = Date.now();
-    if (ctx.allowThreadReuse && ctx.sessionId) {
-      const existingThread = getLogicalThreadState(ctx.sessionId);
-      const chatId = existingThread?.chatSessionId;
-      if (chatId) {
-        releaseChatLock = await acquireChatLock(chatId);
-      }
-    }
+    // Chat lock is acquired AFTER stream creation (below) to avoid holding it
+    // during account selection, retries, and anti-bot recovery which can take
+    // 30s+. Holding it here caused 190s+ lock contention cascading to all
+    // subsequent requests on the same chat.
     mark("lock", stepStartedAt);
 
     let finalPrompt = ctx.finalPrompt;
@@ -126,17 +143,25 @@ export async function chatCompletions(c: Context) {
     });
 
     stepStartedAt = Date.now();
-    // fullPrompt always carries system + full conversation history so account
-    // failover / forceNewChat can rebuild upstream context without deltas only.
-    const fullPromptForRequest = ctx.requestPersonalizationInstruction
-      ? parsed.prompt
-      : parsed.systemPrompt + parsed.prompt;
+    // Full replay must retain system instructions even when personalization was
+    // requested: its update can fail or be invalidated after a profile refresh.
+    const fullPromptForRequest = [
+      parsed.systemPrompt,
+      parsed.toolInstructions,
+      parsed.prompt,
+    ]
+      .filter((part) => part.trim().length > 0)
+      .join("\n\n");
+    const initialContextMode: ContextMeterMode = ctx.existingThread
+      ? "delta"
+      : "full";
 
     let streamResult = await acquireUpstreamStream({
       finalPrompt,
       fullPrompt: fullPromptForRequest,
       isThinkingModel: ctx.isThinkingModel,
-      model: body.model,
+      model: modelId,
+      contextModelId: modelId,
       shouldResetUpstreamThread: ctx.shouldResetUpstreamThread,
       allFiles: files,
       isNewSession: ctx.isNewSession,
@@ -150,6 +175,9 @@ export async function chatCompletions(c: Context) {
       fullMessageCount: parsed.messageCount,
       toolsCount: declaredTools.length || undefined,
       requestPersonalizationInstruction: ctx.requestPersonalizationInstruction,
+      contextMode: initialContextMode,
+      requestSignal: c.req.raw.signal,
+      messages,
     });
 
 
@@ -159,11 +187,6 @@ export async function chatCompletions(c: Context) {
     c.header("X-QwenBridge-Timing", formatTimingHeader(timings));
 
     if ("error" in streamResult) {
-      // Release per-chat lock on error (no stream to complete)
-      if (releaseChatLock) {
-        releaseChatLock();
-        releaseChatLock = null;
-      }
       if (streamResult.allOnCooldown) {
         const err: any = new Error(
           `All configured accounts are on cooldown. Retry in about ${Math.max(
@@ -177,8 +200,24 @@ export async function chatCompletions(c: Context) {
       throw streamResult.error || new Error("All accounts failed");
     }
 
+    for (const [name, value] of Object.entries(
+      getContextMeterHeaders(streamResult.tokenEstimationContext.contextMeter),
+    )) {
+      c.header(name, value);
+    }
+
+    // Acquire per-chat lock now that we have a stream, to serialize concurrent
+    // writes to the same upstream Qwen chat session.
+    if (ctx.allowThreadReuse && ctx.sessionId) {
+      const existingThread = getLogicalThreadState(ctx.sessionId);
+      const chatId = existingThread?.chatSessionId;
+      if (chatId) {
+        releaseChatLock = await acquireChatLock(chatId);
+      }
+    }
+
     console.log(
-      `📤 [Chat] Request | ${streamResult.activeAccountLabel} | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
+      `📤 [Chat] Request | ${streamResult.activeAccountLabel} | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
     );
 
     const onAssistantComplete: ((event: AssistantCompleteEvent) => Promise<void> | void) | undefined = undefined;
@@ -197,17 +236,39 @@ export async function chatCompletions(c: Context) {
       shouldParseToolCalls,
       declaredTools,
       tokenEstimationContext: streamResult.tokenEstimationContext,
+      midStreamRetry: {
+        fullPrompt: fullPromptForRequest,
+        isThinkingModel: ctx.isThinkingModel,
+        contextModelId: modelId,
+        allFiles: files,
+        isNewSession: ctx.isNewSession,
+        sessionId: ctx.sessionId,
+        useThreadNative: ctx.useThreadNative,
+        updateLogicalThread: ctx.updateLogicalThread,
+        allowThreadReuse: ctx.allowThreadReuse,
+        messageCount: msgCount,
+        fullMessageCount: parsed.messageCount,
+        toolsCount: declaredTools.length || undefined,
+        requestPersonalizationInstruction:
+          ctx.requestPersonalizationInstruction,
+        contextMode: initialContextMode as ContextMeterMode,
+        releaseAccountLease: streamResult.releaseAccountLease,
+        messages,
+      },
       onAssistantComplete,
       onStreamComplete: () => {
         if (releaseChatLock) {
           releaseChatLock();
           releaseChatLock = null;
         }
+        streamResult.releaseAccountLease();
       },
     };
 
     // Retry loop for mid-stream/create-stream failures (generic policy)
         let streamProcessingRetries = Math.max(0, config.retry.maxAttempts - 1);
+        let invalidInputSameAccountRetries = 0;
+        let chatInProgressSameAccountRetries = 0;
         let currentStreamResult = streamResult;
         let currentParams = params;
 
@@ -217,7 +278,9 @@ export async function chatCompletions(c: Context) {
               ? await processStreamingResponse(currentParams)
               : await processNonStreamingResponse(currentParams);
           } catch (streamErr: any) {
-            const policy = classifyRetryAction(streamErr);
+            const policy = classifyRetryAction(streamErr, {
+              requestAborted: c.req.raw.signal.aborted,
+            });
 
             // Prefer explicit RetryableQwenStreamError OR generic retryable policy
             const canRetry =
@@ -235,12 +298,39 @@ export async function chatCompletions(c: Context) {
               `[Chat] Stream processing error, retrying with new stream | reason=${policy.reason} | ${streamErr.message?.substring(0, 150)} | retries left: ${streamProcessingRetries}`,
             );
 
-            const switchAccount = policy.switchAccount;
+            // Recover a generic invalid_input on the same account once by
+            // creating a clean upstream chat. A second failure may rotate.
+            const retryInvalidInputOnSameAccount =
+              shouldRetryInvalidInputOnSameAccount(
+                policy.reason,
+                invalidInputSameAccountRetries > 0,
+              );
+            if (retryInvalidInputOnSameAccount) {
+              invalidInputSameAccountRetries++;
+            }
+            const retryChatInProgressOnSameAccount =
+              shouldRetryChatInProgressOnSameAccount(
+                policy.reason,
+                chatInProgressSameAccountRetries > 0,
+              );
+            if (retryChatInProgressOnSameAccount) {
+              chatInProgressSameAccountRetries++;
+            }
+            const switchAccount =
+              (policy.switchAccount && !retryInvalidInputOnSameAccount) ||
+              (policy.reason === "chat_in_progress" &&
+                !retryChatInProgressOnSameAccount);
             const forceRetryNewChat = policy.forceNewChat;
             const retryWithFullPrompt = policy.retryWithFullPrompt;
+            const retryFiles = policy.dropFiles ? [] : files;
 
-            // Mark current account for cooldown when policy requests it
-            if (policy.accountCooldownMs || policy.accountCooldownReason) {
+            // Do not cooldown an account when the policy is retrying it in
+            // place (temporary load shedding). A cooldown here would make the
+            // subsequent preferred-account retry skip that same account.
+            if (
+              policy.switchAccount &&
+              (policy.accountCooldownMs || policy.accountCooldownReason)
+            ) {
               const { markAccountRateLimited } =
                 await import("../../core/account-manager.ts");
               markAccountRateLimited(
@@ -250,11 +340,12 @@ export async function chatCompletions(c: Context) {
               );
             }
 
-            // Release current chat lock
+            // Release current chat lock and account lease before retrying
             if (releaseChatLock) {
               releaseChatLock();
               releaseChatLock = null;
             }
+            currentStreamResult.releaseAccountLease();
 
             // Account switch always rebuilds full history; same-account retry
             // only does so when the policy asks for forceNewChat/full prompt.
@@ -289,9 +380,10 @@ export async function chatCompletions(c: Context) {
               finalPrompt: retryFinalPrompt,
               fullPrompt: fullPromptForRequest,
               isThinkingModel: ctx.isThinkingModel,
-              model: body.model,
+              model: modelId,
+              contextModelId: modelId,
               shouldResetUpstreamThread: ctx.shouldResetUpstreamThread,
-              allFiles: files,
+              allFiles: retryFiles,
               isNewSession: ctx.isNewSession,
               sessionId: ctx.sessionId,
               useThreadNative: ctx.useThreadNative,
@@ -310,15 +402,27 @@ export async function chatCompletions(c: Context) {
               toolsCount: declaredTools.length || undefined,
               requestPersonalizationInstruction:
                 ctx.requestPersonalizationInstruction,
+              contextMode: needsFullPromptOnRetry ? "replay" : initialContextMode,
+              requestSignal: c.req.raw.signal,
+              messages,
             });
 
             if ("error" in newStreamResult) {
-              // Can't get new stream, fail with original error
-              throw streamErr;
+              // Prefer a local preflight error over the upstream error that
+              // triggered the replay (for example, an oversized full context).
+              throw newStreamResult.error ?? streamErr;
+            }
+
+            for (const [name, value] of Object.entries(
+              getContextMeterHeaders(
+                newStreamResult.tokenEstimationContext?.contextMeter,
+              ),
+            )) {
+              c.header(name, value);
             }
 
             console.log(
-              `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry`,
+              `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars | chat=${newStreamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry`,
             );
 
             // Re-acquire chat lock for new stream
@@ -345,12 +449,34 @@ export async function chatCompletions(c: Context) {
               shouldParseToolCalls,
               declaredTools,
               tokenEstimationContext: newStreamResult.tokenEstimationContext,
+              midStreamRetry: {
+                fullPrompt: fullPromptForRequest,
+                isThinkingModel: ctx.isThinkingModel,
+                contextModelId: modelId,
+                allFiles: retryFiles,
+                isNewSession: ctx.isNewSession,
+                sessionId: ctx.sessionId,
+                useThreadNative: ctx.useThreadNative,
+                updateLogicalThread: ctx.updateLogicalThread,
+                allowThreadReuse: ctx.allowThreadReuse,
+                messageCount: retryMessageCount,
+                fullMessageCount: parsed.messageCount,
+                toolsCount: declaredTools.length || undefined,
+                requestPersonalizationInstruction:
+                  ctx.requestPersonalizationInstruction,
+                contextMode: needsFullPromptOnRetry
+                  ? "replay"
+                  : initialContextMode,
+                releaseAccountLease: newStreamResult.releaseAccountLease,
+                messages,
+              },
               onAssistantComplete,
               onStreamComplete: () => {
                 if (releaseChatLock) {
                   releaseChatLock();
                   releaseChatLock = null;
                 }
+                newStreamResult.releaseAccountLease();
               },
             };
             continue;
@@ -363,6 +489,16 @@ export async function chatCompletions(c: Context) {
       releaseChatLock();
       releaseChatLock = null;
     }
+
+    // The client is already gone; do not turn expected cancellation into a
+    // misleading 500/internal_server_error log or retry response.
+    if (c.req.raw.signal.aborted) {
+      logger.debug("[chat] request aborted before response", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return new Response(null, { status: 499 });
+    }
+
     return handleChatCompletionsError(c, err);
   } finally {
     // Lock released via onStreamComplete when stream finishes

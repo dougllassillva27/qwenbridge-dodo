@@ -2,6 +2,8 @@ import { EventEmitter } from "events";
 import { config } from "./config.js";
 import { getHeapUsageSnapshot } from "./memory-usage.js";
 
+// [Dodo] Mapeamento em tempo real de tokens consumidos por conta
+export const accountTokenUsage: Record<string, { prompt: number, completion: number, total: number }> = {};
 interface MetricPoint {
   value: number;
   timestamp: number;
@@ -37,6 +39,12 @@ export class Metrics extends EventEmitter {
       // Stream metrics
       ["streams.active", "gauge", "Active SSE streams"],
       ["streams.errors", "counter", "Stream errors"],
+
+      // CAPTCHA / anti-bot metrics
+      ["captcha.challenges.detected", "counter", "Detected CAPTCHA challenges"],
+      ["captcha.solves.succeeded", "counter", "Successful CAPTCHA solves"],
+      ["captcha.solves.failed", "counter", "Failed CAPTCHA solves"],
+      ["captcha.solve.duration", "histogram", "CAPTCHA solve duration (ms)"],
 
       // Memory metrics
       ["memory.heap.used", "gauge", "Heap memory used (bytes)"],
@@ -244,20 +252,3 @@ export class Metrics extends EventEmitter {
 }
 
 export const metrics = new Metrics();
-
-// [Dodo] Token usage por conta é usado pelo dashboard Tauri via /accounts e /metrics/accounts
-export const accountTokenUsage: Record<string, { prompt: number; completion: number; total: number }> = {};
-
-export function recordAccountTokens(
-  accountId: string,
-  prompt: number,
-  completion: number,
-  total: number,
-): void {
-  if (!accountTokenUsage[accountId]) {
-    accountTokenUsage[accountId] = { prompt: 0, completion: 0, total: 0 };
-  }
-  accountTokenUsage[accountId].prompt += prompt;
-  accountTokenUsage[accountId].completion += completion;
-  accountTokenUsage[accountId].total += total;
-}

@@ -26,6 +26,7 @@ export interface ParsedRequest {
   conversationKey: string | null;
   hasExplicitConversationKey: boolean;
   systemPrompt: string;
+  toolInstructions: string;
   prompt: string;
   currentPrompt: string;
   allFiles: QwenFileEntry[];
@@ -60,7 +61,8 @@ export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
     currentFiles,
   } = await buildPromptFromMessages(messages, uploadHeaders);
 
-  const shouldParseToolCalls = injectToolInstructions(systemPromptParts, body);
+  const toolInstructions = injectToolInstructions(body);
+  const shouldParseToolCalls = toolInstructions.length > 0;
 
   const systemPrompt = systemPromptParts.join("");
   const prompt = promptParts.join("");
@@ -76,6 +78,7 @@ export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
     conversationKey,
     hasExplicitConversationKey: conversationKey !== null,
     systemPrompt,
+    toolInstructions,
     prompt,
     currentPrompt,
     allFiles,
@@ -126,6 +129,7 @@ async function buildPromptFromMessages(
     let contentStr = "";
 
     if (Array.isArray(msg.content)) {
+      const isCurrentMessage = i >= currentStartIndex;
       const imageParts = (msg.content as any[]).filter(
         (p: any) =>
           (p.type === "image_url" && p.image_url?.url) ||
@@ -134,7 +138,7 @@ async function buildPromptFromMessages(
           (p.type === "file_url" && p.file_url?.url),
       );
 
-      if (imageParts.length > 0) {
+      if (imageParts.length > 0 && isCurrentMessage) {
         try {
           if (!uploadHeaders) {
             const { cookie, userAgent, bxV, bxUa, bxUmidtoken } =
@@ -153,7 +157,7 @@ async function buildPromptFromMessages(
           );
           contentStr = text;
           allFiles.push(...files);
-          if (i >= currentStartIndex) currentFiles.push(...files);
+          currentFiles.push(...files);
         } catch (err: unknown) {
           const errMsg = err instanceof Error ? err.message : "Unknown error";
           console.error("[Chat] Failed to process images:", errMsg);
@@ -417,15 +421,12 @@ function getCurrentPromptStartIndex(messages: Message[]): number {
   return last;
 }
 
-function injectToolInstructions(
-  systemPromptParts: string[],
-  body: OpenAIRequest,
-): boolean {
+function injectToolInstructions(body: OpenAIRequest): string {
   const bodyAny = body as any;
   const declaredTools = Array.isArray(bodyAny.tools) ? bodyAny.tools : [];
   const shouldParseToolCalls = declaredTools.length > 0;
 
-  if (!shouldParseToolCalls) return false;
+  if (!shouldParseToolCalls) return "";
 
   if (isToolcallDebugEnabled()) {
     logger.debug("[chat] tools provided in request", {
@@ -450,7 +451,6 @@ function injectToolInstructions(
   const toolsJson = JSON.stringify(formattedTools, null, 2);
 
   const instructions = buildToolInstructions(toolsJson, bodyAny.tool_choice);
-  systemPromptParts.push(instructions);
 
   if (
     isToolcallDebugEnabled() &&
@@ -463,5 +463,5 @@ function injectToolInstructions(
     });
   }
 
-  return true;
+  return instructions;
 }

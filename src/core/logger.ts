@@ -32,50 +32,6 @@ export interface LogEntry {
   data?: Record<string, unknown>;
 }
 
-export function formatDateTimeBR(date: Date = new Date()): string {
-  const day = String(date.getDate()).padStart(2, "0");
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const year = date.getFullYear();
-  const hours = String(date.getHours()).padStart(2, "0");
-  const minutes = String(date.getMinutes()).padStart(2, "0");
-  const seconds = String(date.getSeconds()).padStart(2, "0");
-  return `[${day}/${month}/${year} ${hours}:${minutes}:${seconds}]`;
-}
-
-export function setupGlobalConsoleTimestamps(): void {
-  if ((globalThis as any).__console_timestamps_installed) return;
-  (globalThis as any).__console_timestamps_installed = true;
-
-  const originalLog = console.log;
-  const originalWarn = console.warn;
-  const originalError = console.error;
-  const originalInfo = console.info;
-
-  function wrapArgs(args: any[]): any[] {
-    if (args.length === 0) return args;
-    const prefix = formatDateTimeBR();
-    if (typeof args[0] === "string") {
-      // Avoid double-timestamping if line already starts with [DD/MM/YYYY or ISO
-      if (
-        /^\[\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2}\]/.test(args[0]) ||
-        /^\d{4}-\d{2}-\d{2}T/.test(args[0])
-      ) {
-        return args;
-      }
-      return [`${prefix} ${args[0]}`, ...args.slice(1)];
-    }
-    return [prefix, ...args];
-  }
-
-  console.log = (...args: any[]) => originalLog.apply(console, wrapArgs(args));
-  console.warn = (...args: any[]) => originalWarn.apply(console, wrapArgs(args));
-  console.error = (...args: any[]) => originalError.apply(console, wrapArgs(args));
-  console.info = (...args: any[]) => originalInfo.apply(console, wrapArgs(args));
-}
-
-// Automatically install global console timestamps on import
-setupGlobalConsoleTimestamps();
-
 export class Logger {
   private minLevel: LogLevel;
   private context?: string;
@@ -91,7 +47,7 @@ export class Logger {
   }
 
   private formatEntry(entry: LogEntry): string {
-    const timestamp = formatDateTimeBR(entry.timestamp);
+    const timestamp = entry.timestamp.toISOString();
     const pad = (str: string): string => str.padStart(5, " ");
     const colorCode =
       entry.level === "error"

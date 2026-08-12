@@ -776,9 +776,11 @@ test("stream: malformed nameless tool_call restores lead-in text", async () => {
       result.content.startsWith("Need tool result: "),
       `Expected content to start with lead-in text, got: ${result.content}`,
     );
+    // Error feedback should NOT be injected into content — it goes back to
+    // Qwen via auto-retry instead of being shown to the user.
     assert.ok(
-      result.content.includes("[ERROR]"),
-      `Expected error feedback for malformed tool call, got: ${result.content}`,
+      !result.content.includes("[TOOL CALL ERROR]"),
+      `Expected no error feedback in content (should retry internally), got: ${result.content}`,
     );
     assert.strictEqual(result.toolCalls.length, 0);
     assert.strictEqual(result.finishReason, "stop");
@@ -829,6 +831,52 @@ test("non-stream: XML parameter tool_call is supported", async () => {
       { path: "a.txt" },
     );
     assert.strictEqual(body.choices[0].finish_reason, "tool_calls");
+  } finally {
+    restore();
+  }
+});
+
+test("stream: plural tool_calls wrapper is parsed across SSE fragments", async () => {
+  const first =
+    '<tool_calls>\n{"name":"read_file","arguments":{"path":"a.txt"}}';
+  const complete = `${first}\n</tool_call>`;
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content: first.slice(0, 18) } }],
+      })}`,
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content: first } }],
+      })}`,
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content: complete } }],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "read a file" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const result = await collectStreamResult(res);
+    assert.strictEqual(result.content, "");
+    assert.strictEqual(result.toolCalls.length, 1);
+    assert.strictEqual(result.toolCalls[0].name, "read_file");
+    assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
+      path: "a.txt",
+    });
+    assert.strictEqual(result.finishReason, "tool_calls");
   } finally {
     restore();
   }

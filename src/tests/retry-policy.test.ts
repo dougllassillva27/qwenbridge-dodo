@@ -8,6 +8,8 @@ import {
   classifyRetryAction,
   isTerminalLocalError,
   parseSseErrorFromBuffer,
+  shouldRetryChatInProgressOnSameAccount,
+  shouldRetryInvalidInputOnSameAccount,
   throwFromSseUpstreamError,
   toRetryableStreamError,
 } from "../routes/chat/retry-policy.ts";
@@ -16,7 +18,12 @@ import {
   QwenUpstreamError,
   RetryableQwenStreamError,
 } from "../services/qwen.ts";
-import { ValidationError, AuthError } from "../core/errors.ts";
+import {
+  ValidationError,
+  AuthError,
+  ContextLengthExceededError,
+} from "../core/errors.ts";
+import { parseQwenErrorPayload } from "../routes/chat/errors.ts";
 
 test("classifyRetryAction: unknown upstream errors are retryable by default", () => {
   const err = Object.assign(new Error("brand new qwen failure xyz"), {
@@ -41,6 +48,64 @@ test("classifyRetryAction: terminal local errors are not retryable", () => {
   assert.equal(auth.retryable, false);
 });
 
+test("classifyRetryAction: context length is terminal and does not rotate accounts", () => {
+  const err = new ContextLengthExceededError("Input is too large");
+  const action = classifyRetryAction(err);
+
+  assert.equal(action.retryable, false);
+  assert.equal(action.switchAccount, false);
+  assert.equal(action.reason, "terminal_local");
+});
+
+test("classifyRetryAction: aborted request is not retried", () => {
+  const action = classifyRetryAction(new Error("Aborted before acquiring account lease"), {
+    requestAborted: true,
+  });
+
+  assert.equal(action.retryable, false);
+  assert.equal(action.switchAccount, false);
+  assert.equal(action.reason, "client_abort");
+});
+
+test("classifyRetryAction: failed account initialization cools and rotates", () => {
+  const action = classifyRetryAction(
+    new Error("Header capture returned incomplete anti-fraud headers for account"),
+  );
+
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.forceNewChat, false);
+  assert.equal(action.accountCooldownReason, "AuthInitFailed");
+  assert.ok(action.accountCooldownMs! >= 30_000);
+  assert.equal(action.reason, "account_initialization_failed");
+});
+
+test("classifyRetryAction: account lease timeout is retryable without rebuilding chat", () => {
+  const action = classifyRetryAction(
+    new Error("Account abc busy: timed out after 30000ms waiting for a free slot"),
+  );
+
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.forceNewChat, false);
+  assert.equal(action.retryWithFullPrompt, false);
+  assert.equal(action.reason, "account_busy");
+});
+
+test("classifyRetryAction: stuck Playwright page is account initialization failure", () => {
+  const action = classifyRetryAction(
+    new Error(
+      "Playwright page operation timed out for account abc after 120000ms",
+    ),
+  );
+
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.forceNewChat, false);
+  assert.equal(action.accountCooldownReason, "AuthInitFailed");
+  assert.equal(action.reason, "account_initialization_failed");
+});
+
 test("classifyRetryAction: invalid_input forces new chat + full prompt + switch", () => {
   const err = Object.assign(
     new Error("invalid_input: Entrada ou anexo inválido. Verifique e tente novamente."),
@@ -54,10 +119,52 @@ test("classifyRetryAction: invalid_input forces new chat + full prompt + switch"
   assert.equal(action.reason, "invalid_input");
 });
 
-test("classifyRetryAction: quota prefers account switch", () => {
+test("invalid_input retries a clean chat once before account rotation", () => {
+  assert.equal(
+    shouldRetryInvalidInputOnSameAccount("invalid_input", false),
+    true,
+  );
+  assert.equal(
+    shouldRetryInvalidInputOnSameAccount("invalid_input", true),
+    false,
+  );
+  assert.equal(
+    shouldRetryInvalidInputOnSameAccount("anti_bot", false),
+    false,
+  );
+});
+
+test("chat_in_progress rotates after one same-account retry", () => {
+  assert.equal(
+    shouldRetryChatInProgressOnSameAccount("chat_in_progress", false),
+    true,
+  );
+  assert.equal(
+    shouldRetryChatInProgressOnSameAccount("chat_in_progress", true),
+    false,
+  );
+  assert.equal(
+    shouldRetryChatInProgressOnSameAccount("quota_or_rate_limit", false),
+    false,
+  );
+});
+
+test("classifyRetryAction: temporary quota (alta demanda) retries same account", () => {
   const err = Object.assign(
     new Error("quota_limit: O serviço está com alta demanda no momento."),
     { upstreamCode: "quota_limit", upstreamStatus: 502 },
+  );
+  const action = classifyRetryAction(err);
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, false);
+  assert.equal(action.accountCooldownReason, "RateLimitTemporary");
+  assert.equal(action.reason, "quota_or_rate_limit");
+});
+
+test("classifyRetryAction: real quota exhaustion prefers account switch", () => {
+  const err = Object.assign(
+    new Error("RateLimited: You've reached the upper limit for today's usage."),
+    { upstreamCode: "RateLimited", upstreamStatus: 429 },
   );
   const action = classifyRetryAction(err);
   assert.equal(action.retryable, true);
@@ -65,10 +172,44 @@ test("classifyRetryAction: quota prefers account switch", () => {
   assert.equal(action.reason, "quota_or_rate_limit");
 });
 
+test("classifyRetryAction: WAF challenges retry the same account immediately", () => {
+  const err = Object.assign(
+    new Error("Qwen returned an anti-bot challenge instead of an SSE response."),
+    { upstreamCode: "waf_challenge" },
+  );
+  const action = classifyRetryAction(err);
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, false);
+  assert.equal(action.retryAfterMs, 0);
+  assert.equal(action.accountCooldownMs, undefined);
+  assert.equal(action.accountCooldownReason, undefined);
+  assert.equal(action.reason, "anti_bot");
+});
+
+test("parseQwenErrorPayload sanitizes an HTML WAF page", () => {
+  const parsed = parseQwenErrorPayload(
+    '<!doctype html><meta name="aliyun_waf_aa" content="do-not-expose-this-page">',
+  );
+
+  assert.deepEqual(parsed, {
+    code: "waf_challenge",
+    details: "Qwen returned an anti-bot challenge instead of an SSE response.",
+    message:
+      "Qwen upstream error: Qwen returned an anti-bot challenge instead of an SSE response.",
+    status: 502,
+  });
+  assert.doesNotMatch(parsed!.message, /aliyun_waf|do-not-expose-this-page/i);
+});
+
 test("classifyRetryAction: network / abort / upstream error classes retry with switch", () => {
   const network = classifyRetryAction(new QwenNetworkError("fetch failed"));
   assert.equal(network.retryable, true);
   assert.equal(network.switchAccount, true);
+
+  const browserNetwork = classifyRetryAction(new Error("network error"));
+  assert.equal(browserNetwork.retryable, true);
+  assert.equal(browserNetwork.switchAccount, true);
+  assert.equal(browserNetwork.reason, "network");
   assert.equal(network.forceNewChat, true);
   assert.equal(network.reason, "network");
 

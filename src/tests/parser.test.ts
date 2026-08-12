@@ -74,6 +74,74 @@ test("StreamingToolParser: basic tool call", () => {
   assert.strictEqual(result.toolCalls[0].name, "t1");
 });
 
+test("StreamingToolParser: does not close inside a JSON string", () => {
+  const parser = new StreamingToolParser([
+    {
+      type: "function",
+      function: {
+        name: "write",
+        parameters: {
+          type: "object",
+          properties: { content: { type: "string" } },
+        },
+      },
+    },
+  ]);
+  const content = 'const marker = "</tool_call>";';
+  const result = parser.feed(
+    `<tool_call>${JSON.stringify({
+      name: "write",
+      arguments: { content },
+    })}</tool_call>`,
+  );
+
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "write");
+  assert.strictEqual(result.toolCalls[0].arguments.content, content);
+});
+
+test("StreamingToolParser: recovers double-escaped JSON tool calls", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const escaped =
+    '{\\"name\\":\\"read_file\\",\\"arguments\\":{\\"path\\":\\"a.txt\\"}}';
+  const result = parser.feed(`<tool_call>${escaped}</tool_call>`);
+
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "read_file");
+  assert.deepStrictEqual(result.toolCalls[0].arguments, { path: "a.txt" });
+});
+
+test("StreamingToolParser: drops residual environment details after tool calls", () => {
+  const parser = new StreamingToolParser();
+  const input =
+    '<tool_call>{"name":"edit_file","arguments":{"path":"a.txt","edits":[]}}</tool_call>\n</environment_details>\nCurrent time: 2026-07-18T15:26:30-03:00\nWorking directory: /tmp/project\n</environment_details>';
+
+  const result = parser.feed(input);
+  const flushed = parser.flush();
+
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "edit_file");
+  assert.strictEqual(result.text + flushed.text, "");
+});
+
+test("StreamingToolParser: drops fragmented environment details after tool calls", () => {
+  const parser = new StreamingToolParser();
+  const input =
+    '<tool_call>{"name":"edit_file","arguments":{"path":"a.txt","edits":[]}}</tool_call>\n</environment_details>\nCurrent time: x\n</environment_details>';
+  let text = "";
+  let toolCalls = 0;
+
+  for (const char of input) {
+    const result = parser.feed(char);
+    text += result.text;
+    toolCalls += result.toolCalls.length;
+  }
+  text += parser.flush().text;
+
+  assert.strictEqual(toolCalls, 1);
+  assert.strictEqual(text, "");
+});
+
 test("StreamingToolParser: multiple tool calls", () => {
   const parser = new StreamingToolParser();
 
@@ -339,6 +407,47 @@ test("StreamingToolParser: parses double-escaped JSON argument strings", () => {
   assert.deepStrictEqual(result.toolCalls[0].arguments.edits, [
     { old_text: "a", new_text: "b" },
   ]);
+});
+
+test("StreamingToolParser: accepts plural tool_calls tags across fragments", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const input = [
+    '<tool_calls>\n{"name":"read_file","arguments":{"path":"a.txt"}}\n</tool_call>',
+    '\n<tool_calls>\n{"name":"read_file","arguments":{"path":"b.txt"}}\n</tool_calls>',
+  ].join("");
+  let text = "";
+  const toolCalls = [] as ReturnType<StreamingToolParser["feed"]>["toolCalls"];
+
+  for (let index = 0; index < input.length; index += 3) {
+    const result = parser.feed(input.slice(index, index + 3));
+    text += result.text;
+    toolCalls.push(...result.toolCalls);
+  }
+  const flushed = parser.flush();
+  text += flushed.text;
+  toolCalls.push(...flushed.toolCalls);
+
+  assert.strictEqual(text, "");
+  assert.deepStrictEqual(
+    toolCalls.map((toolCall) => toolCall.name),
+    ["read_file", "read_file"],
+  );
+  assert.deepStrictEqual(toolCalls.map((toolCall) => toolCall.arguments), [
+    { path: "a.txt" },
+    { path: "b.txt" },
+  ]);
+});
+
+test("StreamingToolParser: parses plural Hermes/XML tool calls", () => {
+  const parser = new StreamingToolParser(TOOLS);
+  const result = parser.feed(
+    '<tool_calls name="read_file"><parameter name="path">a.txt</parameter></tool_calls>',
+  );
+
+  assert.strictEqual(result.text, "");
+  assert.strictEqual(result.toolCalls.length, 1);
+  assert.strictEqual(result.toolCalls[0].name, "read_file");
+  assert.deepStrictEqual(result.toolCalls[0].arguments, { path: "a.txt" });
 });
 
 test("StreamingToolParser: parses JSON-stringified nested argument fields", () => {

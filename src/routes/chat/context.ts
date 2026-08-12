@@ -1,5 +1,10 @@
 import { config } from "../../core/config.ts";
+import { logger } from "../../core/logger.ts";
 import { getModelContextWindow } from "../../core/model-registry.ts";
+import {
+  assertPromptWithinLimits,
+  isRequestPersonalizationWithinLimit,
+} from "../../core/prompt-limits.ts";
 import type { Message } from "../../utils/types.ts";
 import { estimateTokenCount } from "../../utils/context-truncation.ts";
 import { deriveSessionId } from "../../utils/session-id.ts";
@@ -27,6 +32,7 @@ export interface FinalContext {
 export interface BuildContextParams {
   messages: Message[];
   systemPrompt: string;
+  toolInstructions: string;
   prompt: string;
   currentPrompt: string;
   modelId: string;
@@ -41,6 +47,7 @@ export async function buildFinalContext(
   const {
     messages,
     systemPrompt,
+    toolInstructions,
     prompt,
     currentPrompt,
     modelId,
@@ -52,6 +59,9 @@ export async function buildFinalContext(
   const modelContextWindow = getModelContextWindow(modelId);
   const useThreadNative = true;
   const isNewSession = !messages.some((m) => m.role === "assistant");
+  const completeInstructions = [systemPrompt.trim(), toolInstructions.trim()]
+    .filter(Boolean)
+    .join("\n\n");
 
   // Thread reuse is allowed when:
   // 1. Thread-native mode is active
@@ -68,7 +78,7 @@ export async function buildFinalContext(
   const sessionId = (conversationKey || useThreadNative)
     ? deriveSessionId(
         messages,
-        conversationKey ? systemPrompt : "",
+        conversationKey ? completeInstructions : "",
         conversationKey ?? "implicit-thread",
       )
     : null;
@@ -85,21 +95,39 @@ export async function buildFinalContext(
     (!existingThread && !hasTrailingToolResult ? prompt : currentPrompt) ||
     prompt;
   const isTitleGenerationRequest = detectTitleGenerationRequest(messages);
-  const useRequestPersonalization =
+  const requestedPersonalization =
     config.qwen.personalizationFromRequest && !isTitleGenerationRequest;
+  const personalizationInstruction = completeInstructions;
+  const useRequestPersonalization =
+    requestedPersonalization &&
+    isRequestPersonalizationWithinLimit(personalizationInstruction);
+  if (requestedPersonalization && !useRequestPersonalization) {
+    logger.warn(
+      "[chat] system instructions and tools exceed the personalization payload limit; sending them inline",
+      {
+        instructionBytes: Buffer.byteLength(personalizationInstruction, "utf8"),
+        maxPersonalizationBytes: config.qwen.maxPersonalizationBytes,
+      },
+    );
+  }
   const estimatedTokens = estimateTokenCount(
-    systemPrompt + activePrompt,
+    completeInstructions + activePrompt,
   );
-  // Send instructions in prompt for NEW chats to establish context immediately,
-  // even when personalization is active. For continuations, rely on account-level
-  // personalization to avoid redundancy.
+  // Send the complete instruction block in the prompt for NEW chats to establish
+  // context immediately. Continuations rely on the account-level personalization.
   const isNewChat = !existingThread;
   const shouldSendInstructions = !useRequestPersonalization || isNewChat;
 
   const finalPrompt =
-    shouldSendInstructions && systemPrompt
-      ? `${systemPrompt}\n${activePrompt}`
+    shouldSendInstructions && completeInstructions
+      ? `${completeInstructions}\n${activePrompt}`
       : activePrompt;
+
+  // Truncation is deferred to tryCreateStreamWithRetry, which runs after the
+  // account is selected and the real model context window has been synced from
+  // Qwen's /api/models catalog. The early context build only performs the byte
+  // limit check; the authoritative token check happens downstream.
+  assertPromptWithinLimits(finalPrompt, modelId, { checkModelContext: false });
 
   const isThinkingModel = enableThinking;
   const shouldResetUpstreamThread = false;
@@ -119,7 +147,7 @@ export async function buildFinalContext(
     modelContextWindow,
     isTitleGenerationRequest,
     requestPersonalizationInstruction: useRequestPersonalization
-      ? systemPrompt.trim()
+      ? personalizationInstruction
       : null,
     hasExplicitConversationKey,
     allowThreadReuse,

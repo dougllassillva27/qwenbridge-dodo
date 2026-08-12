@@ -47,6 +47,15 @@ async function ensurePlaywrightInitialized(accountId: string): Promise<void> {
     config.playwright.headless,
     config.playwright.browser,
   );
+
+  // Standby accounts are initialized lazily. Apply the same account-level
+  // settings that startup preparation would apply.
+  try {
+    const { disableNativeTools } = await import("./qwen.ts");
+    await disableNativeTools(accountId).catch(() => {});
+  } catch {
+    // Non-fatal: chat creation will still work with default account settings.
+  }
 }
 
 export async function getBasicHeaders(accountId?: string): Promise<{
@@ -75,6 +84,33 @@ export async function getBasicHeaders(accountId?: string): Promise<{
 
   await ensurePlaywrightInitialized(resolvedAccountId);
   return getPlaywrightBasicHeaders(resolvedAccountId);
+}
+
+export function isTokenExpiringSoon(
+  cookie: string,
+  minutesBeforeExpiry = 5,
+): boolean {
+  const tokenMatch = cookie.match(/token=([^;]+)/);
+  if (!tokenMatch) return false;
+
+  try {
+    const token = decodeURIComponent(tokenMatch[1]);
+    const segments = token.split(".");
+    // Some Qwen deployments use opaque cookies. Treating those as expired
+    // forces expensive header capture on every personalization request.
+    if (segments.length !== 3 || !segments[1]) return false;
+
+    const payloadJson = Buffer.from(segments[1], "base64url").toString("utf-8");
+    const payload = JSON.parse(payloadJson);
+    const exp = payload.exp;
+    if (typeof exp !== "number" || !Number.isFinite(exp)) return false;
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const thresholdSec = minutesBeforeExpiry * 60;
+    return exp - nowSec < thresholdSec;
+  } catch {
+    return false;
+  }
 }
 
 export async function getQwenHeaders(

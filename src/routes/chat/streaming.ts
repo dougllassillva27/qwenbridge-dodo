@@ -60,7 +60,7 @@ function firstString(...values: unknown[]): string | null {
   return null;
 }
 
-const STREAM_READ_TIMEOUT_MS = 120_000; // 120 seconds (2 min) idle timeout for SSE chunks
+const STREAM_READ_TIMEOUT_MS = 45_000; // 45 seconds idle timeout for SSE chunks
 
 function readWithTimeout<T>(
   promise: Promise<T>,
@@ -542,6 +542,7 @@ export async function processNonStreamingResponse(
       context: tokenEstimationContext,
     });
 
+    recordAccountTokens(activeAccountId, usage.prompt_tokens, usage.completion_tokens);
     scheduleAssistantComplete(onAssistantComplete, {
       sessionId: logicalSessionId,
       accountId: activeAccountId,
@@ -1400,7 +1401,8 @@ export async function processStreamingResponse(
         await streamWriter.write(payload);
         flushBuffer = null;
 
-        scheduleAssistantComplete(onAssistantComplete, {
+        recordAccountTokens(activeAccountId, usage.prompt_tokens, usage.completion_tokens);
+    scheduleAssistantComplete(onAssistantComplete, {
           sessionId: logicalSessionId,
           accountId: activeAccountId,
           chatSessionId: currentUiSessionId,
@@ -1524,4 +1526,16 @@ export function handleChatCompletionsError(c: Context, err: unknown): Response {
   console.error(`❌ [Chat] Error | ${status} ${code} | ${message}`);
 
   return sendOpenAIError(c, err);
+}
+
+// [Dodo] Funcao de registro de tokens injetada
+import { accountTokenUsage } from "../../core/metrics.ts";
+
+export function recordAccountTokens(accountId: string, promptTokens: number, completionTokens: number): void {
+  if (!accountTokenUsage[accountId]) {
+    accountTokenUsage[accountId] = { prompt: 0, completion: 0, total: 0 };
+  }
+  accountTokenUsage[accountId].prompt += promptTokens;
+  accountTokenUsage[accountId].completion += completionTokens;
+  accountTokenUsage[accountId].total += (promptTokens + completionTokens);
 }

@@ -23,6 +23,64 @@ function sseResponse(...chunks: string[]): Response {
   });
 }
 
+function delayedSseResponse(firstChunk: string, ...laterChunks: string[]): Response {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      controller.enqueue(encoder.encode(firstChunk));
+      timer = setTimeout(() => {
+        timer = null;
+        try {
+          for (const chunk of laterChunks) {
+            controller.enqueue(encoder.encode(chunk));
+          }
+          controller.close();
+        } catch (_e) {
+          // Stream was cancelled before timer fired — ignore
+        }
+      }, 5);
+      if (typeof timer === "object" && timer !== null && "unref" in timer) {
+        (timer as NodeJS.Timeout).unref();
+      }
+    },
+    cancel() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
+function erroringSseResponse(firstChunk: string, message = "network error"): Response {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      controller.enqueue(encoder.encode(firstChunk));
+      timer = setTimeout(() => {
+        timer = null;
+        controller.error(new Error(message));
+      }, 5);
+    },
+    cancel() {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
 function setupQwenFetchMock(
   completionHandler: (
     callIndex: number,
@@ -86,6 +144,35 @@ async function postChat(messages: any[], stream = false) {
   });
   return app.fetch(req);
 }
+
+test("stream: network error while reading retries before emitting output", async () => {
+  const mock = setupQwenFetchMock((callIndex) => {
+    if (callIndex === 1) {
+      return erroringSseResponse(
+        'data: {"response.created":{"chat_id":"chat-network-before-error","response_id":"resp-network-before-error"}}\n\n',
+      );
+    }
+    return sseResponse(
+      'data: {"response.created":{"chat_id":"chat-network-recovered","response_id":"resp-network-recovered"}}\n\n',
+      'data: {"response_id":"resp-network-recovered","choices":[{"delta":{"phase":"answer","content":"network-recovered"}}]}\n\n',
+      "data: [DONE]\n\n",
+    );
+  });
+
+  try {
+    const res = await postChat([{ role: "user", content: "network retry" }], true);
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.match(text, /network-recovered/);
+    assert.match(text, /data: \[DONE\]/);
+    assert.ok(
+      mock.getCompletionCalls() >= 2,
+      `expected a retry after network error, got ${mock.getCompletionCalls()} completion call(s)`,
+    );
+  } finally {
+    mock.restore();
+  }
+});
 
 test("stream: internal_error mid-stream retries and succeeds", async () => {
   const mock = setupQwenFetchMock((callIndex) => {
@@ -163,6 +250,36 @@ test("stream: quota_limit mid-stream retries instead of hard fail", async () => 
     assert.equal(res.status, 200);
     const text = await res.text();
     assert.match(text, /quota-recovered/);
+    assert.ok(mock.getCompletionCalls() >= 2);
+  } finally {
+    mock.restore();
+  }
+});
+
+test("stream: quota_limit after response.created retries inside committed SSE", async () => {
+  const mock = setupQwenFetchMock((callIndex) => {
+    if (callIndex === 1) {
+      return delayedSseResponse(
+        'data: {"response.created":{"chat_id":"chat-before-quota","response_id":"resp-before-quota"}}\n\n',
+        'data: {"error":{"code":"quota_limit","details":"O serviço está com alta demanda no momento. Tente novamente mais tarde."}}\n\n',
+      );
+    }
+    return sseResponse(
+      'data: {"response.created":{"chat_id":"chat-after-quota","response_id":"resp-after-quota"}}\n\n',
+      'data: {"response_id":"resp-after-quota","choices":[{"delta":{"phase":"answer","content":"transparent-recovery-ok"}}]}\n\n',
+      "data: [DONE]\n\n",
+    );
+  });
+
+  try {
+    const res = await postChat(
+      [{ role: "user", content: "quota after stream commit" }],
+      true,
+    );
+    assert.equal(res.status, 200);
+    const text = await res.text();
+    assert.match(text, /transparent-recovery-ok/);
+    assert.match(text, /data: \[DONE\]/);
     assert.ok(mock.getCompletionCalls() >= 2);
   } finally {
     mock.restore();

@@ -1,419 +1,521 @@
-/*
- * Browser-side recovery for Alibaba TMD / sufei-punish challenges on chat.qwen.ai.
- *
- * Based on local captures under network/captcha:
- * - punish page loads g.alicdn.com/bsop-static/sufei-punish
- * - widget target #nocaptcha
- * - endpoints /bx/_____tmd_____/punish and /bx/_____tmd_____/verify/
- * - success often sets x5sec cookie and restores normal chat page
- *
- * Strategy (optimized, non-blocking for other accounts):
- * 1) soft refresh of session headers
- * 2) detect punish/captcha UI in the account Playwright page
- * 3) attempt NoCaptcha slider drag when present
- * 4) wait for challenge clear + recapture bx-* headers
- * 5) fail closed so existing cooldown/profile-reset path can run
- */
+import type { Locator, Page } from "playwright";
+import { humanDrag, sleep } from "./human-behavior.ts";
+import { minimizeWindow, restoreWindow } from "./playwright.ts";
 
-import type { Frame, Page } from "playwright";
-import { config } from "../core/config.ts";
-import { humanDelay, sleep, subtlePageActivity } from "./human-behavior.ts";
-import {
-  isPlaywrightInitialized,
-  minimizeWindow,
-  refreshHeaders,
-  restoreWindow,
-  withAccountPage,
-} from "./playwright.ts";
+export const BAXIA_DIALOG_SELECTOR = ".baxia-dialog";
+export const BAXIA_CONTENT_SELECTOR = "#baxia-dialog-content";
 
-export interface CaptchaSolveResult {
-  success: boolean;
-  method:
-    | "disabled"
-    | "skipped_recent"
-    | "headers_only"
-    | "slider"
-    | "wait_cleared"
-    | "failed";
-  detail?: string;
-  durationMs: number;
+const CAPTCHA_EVENT_EMOJI: Record<string, string> = {
+  dialog_detected: "🛡️",
+  challenge_opened: "🚪",
+  recovery_skipped: "⏭️",
+  iframe_found: "🖼️",
+  challenge_detected: "🧩",
+  challenge_not_found: "🔎",
+  solve_started: "🛠️",
+  slider_found: "🎚️",
+  attempt_bounds_unavailable: "📍",
+  attempt_geometry: "📐",
+  attempt_not_solved: "⚠️",
+  attempt_failed: "💥",
+  slider_not_found: "❌",
+  solve_succeeded: "✅",
+  solve_failed: "❌",
+  recovery_succeeded: "✅",
+  recovery_not_solved: "⚠️",
+  recovery_failed: "❌",
+};
+
+const captchaDebugEnabled = process.env.CAPTCHA_DEBUG === "true";
+
+function formatCaptchaLogValue(value: string | number | boolean): string {
+  if (typeof value === "string") {
+    return JSON.stringify(value.replace(/\s+/g, " ").slice(0, 160));
+  }
+  return String(value);
 }
 
-const SLIDER_SELECTORS = [
-  "#nc_1_n1z",
-  ".nc_iconfont.btn_slide",
-  ".btn_slide",
-  "#nc_1_n1t .nc_iconfont",
-  ".nc-container .btn_slide",
-  ".slidetounlock",
-  ".nc_scale span",
-  "#nocaptcha .btn_slide",
-  '[class*="btn_slide"]',
-  ".yidun_slider",
-  ".yidun_slide_indicator",
-];
+export function logBaxiaCaptcha(
+  event: string,
+  fields: Record<string, string | number | boolean> = {},
+  important = false,
+): void {
+  if (!important && !captchaDebugEnabled) return;
 
-const CHALLENGE_SELECTORS = [
+  const suffix = Object.entries(fields)
+    .map(([key, value]) => `${key}=${formatCaptchaLogValue(value)}`)
+    .join(" ");
+  const emoji = CAPTCHA_EVENT_EMOJI[event] ?? "ℹ️";
+  const line = `${emoji} [Captcha] ${event}${suffix ? ` | ${suffix}` : ""}`;
+
+  if (important) {
+    console.warn(line);
+  } else {
+    console.log(line);
+  }
+}
+
+const BAXIA_IFRAME_SELECTORS = [
+  `${BAXIA_DIALOG_SELECTOR} ${BAXIA_CONTENT_SELECTOR} iframe`,
+  `${BAXIA_CONTENT_SELECTOR} iframe`,
+  "iframe#baxia-dialog-content",
+  'iframe[src*="_____tmd_____/punish"]',
+] as const;
+
+const BAXIA_DOCUMENT_SELECTORS = [
   "#nocaptcha",
-  "punish-component",
-  "#captcha-loading",
-  ".nc-container",
-  ".nc_wrapper",
+  "#baxia-punish .nc-container",
   "#baxia-punish",
-  'iframe[src*="punish"]',
-  'iframe[src*="_____tmd_____"]',
-  'iframe[src*="nocaptcha"]',
-  'iframe[src*="captcha"]',
-];
+] as const;
 
-const lastSolveAt = new Map<string, number>();
-const inFlight = new Map<string, Promise<CaptchaSolveResult>>();
+/**
+ * Kept as a public selector for callers that need to identify a Baxia iframe.
+ * The current Baxia page may use #baxia-dialog-content as a container around
+ * the iframe, while older versions used the id directly on the iframe.
+ */
+export const BAXIA_IFRAME_SELECTOR = BAXIA_IFRAME_SELECTORS.join(", ");
 
-export function isCaptchaSolverEnabled(): boolean {
-  return config.captchaSolver.enabled;
-}
+const BAXIA_SLIDER_SELECTOR =
+  "#nc_1_n1z, .nc_1_n1z, .btn_slide, .nc_wrapper .btn_slide, ._nc .btn_slide, .nc-container .btn_slide";
+const BAXIA_TRACK_SELECTOR =
+  "#nc_1_n1t, .nc_scale, .nc_wrapper .nc_scale, ._nc .nc_scale, .nc-container .nc_scale";
+const BAXIA_SUCCESS_SELECTOR =
+  ".btn_ok, .nc_ok, .nc_success, .nc_result, .nc_wrapper.nc-success, .nc_wrapper.success, [data-nc-lang=\"SUCCESS\"], [data-nc-lang=\"success\"], #nc-loading-circle";
 
-export function looksLikeAntiBotChallengeText(text: string): boolean {
-  const lower = text.toLowerCase();
-  return (
-    lower.includes("fail_sys_user_validate") ||
-    lower.includes("rgv587_error") ||
-    lower.includes("_____tmd_____") ||
-    lower.includes("x5secdata") ||
-    lower.includes("punish") ||
-    lower.includes("nocaptcha") ||
-    lower.includes("captcha") ||
-    lower.includes("security verification") ||
-    lower.includes("verify you are human") ||
-    lower.includes("human verification") ||
-    lower.includes("denyfromx5")
+/**
+ * A challenge served to a background fetch never renders anything: the WAF
+ * answers the XHR with the punish document instead of the expected payload, so
+ * the solver has no visible slider to drive. The body carries the challenge
+ * URL, which the account page can open to make the same challenge visible.
+ */
+export function extractBaxiaChallengeUrl(
+  body: string,
+  baseUrl: string,
+): string | null {
+  if (!body) return null;
+
+  // The URL arrives wrapped in JSON, an HTML attribute or a meta refresh, each
+  // with its own escaping. Normalize before matching so one pattern covers all.
+  const normalized = body
+    .replace(/\\u002f/gi, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/gi, "&");
+
+  const candidates = normalized.match(
+    /(?:https?:)?\/\/[^\s"'`\\<>()]*(?:_____tmd_____|x5secdata=)[^\s"'`\\<>()]*|\/[^\s"'`\\<>()]*(?:_____tmd_____|x5secdata=)[^\s"'`\\<>()]*/gi,
   );
-}
+  if (!candidates) return null;
 
-async function pageHasChallengeSignals(page: Page): Promise<{
-  challenged: boolean;
-  reason: string;
-}> {
-  if (page.isClosed()) {
-    return { challenged: false, reason: "page_closed" };
-  }
-
-  const url = page.url();
-  if (
-    /_____tmd_____|\/bx\/|punish|x5secdata|captcha|nocaptcha/i.test(url)
-  ) {
-    return { challenged: true, reason: `url:${url.slice(0, 120)}` };
-  }
-
-  for (const selector of CHALLENGE_SELECTORS) {
-    try {
-      const el = await page.$(selector);
-      if (el && (await el.isVisible().catch(() => false))) {
-        return { challenged: true, reason: `selector:${selector}` };
-      }
-    } catch {
-      // continue
-    }
-  }
-
+  let base: URL;
   try {
-    const bodySnippet = await page.evaluate(() => {
-      const text = document.body?.innerText?.slice(0, 1500) || "";
-      const html = document.documentElement?.innerHTML?.slice(0, 2500) || "";
-      return `${text}\n${html}`;
-    });
-    if (looksLikeAntiBotChallengeText(bodySnippet)) {
-      return { challenged: true, reason: "body_markers" };
-    }
+    base = new URL(baseUrl);
   } catch {
-    // ignore
+    return null;
   }
 
-  return { challenged: false, reason: "none" };
-}
-
-async function hasX5secCookie(page: Page): Promise<boolean> {
-  try {
-    const cookies = await page.context().cookies();
-    return cookies.some((c) => c.name.toLowerCase().includes("x5sec"));
-  } catch {
-    return false;
-  }
-}
-
-async function tryDragSlider(
-  root: Page | Frame,
-): Promise<{ ok: boolean; selector?: string }> {
-  for (const selector of SLIDER_SELECTORS) {
+  for (const candidate of candidates) {
+    let url: URL;
     try {
-      const handle = await root.$(selector);
-      if (!handle) continue;
-      const visible = await handle.isVisible().catch(() => false);
-      if (!visible) continue;
-
-      const box = await handle.boundingBox();
-      if (!box) continue;
-
-      const page = "page" in root && typeof (root as Frame).page === "function"
-        ? (root as Frame).page()
-        : (root as Page);
-
-      const startX = box.x + Math.min(12, box.width / 2);
-      const startY = box.y + box.height / 2;
-      const distance = Math.max(260, Math.floor(box.width + 220));
-
-      await page.mouse.move(startX, startY, {
-        steps: 4 + Math.floor(Math.random() * 4),
-      });
-      await sleep(humanDelay(40, 120));
-      await page.mouse.down();
-
-      // Human-ish multi-step drag
-      const steps = 18 + Math.floor(Math.random() * 10);
-      for (let i = 1; i <= steps; i++) {
-        const progress = i / steps;
-        // Ease-out with light noise
-        const eased = 1 - Math.pow(1 - progress, 2.2);
-        const x = startX + distance * eased + (Math.random() - 0.5) * 2.2;
-        const y = startY + (Math.random() - 0.5) * 3.5;
-        await page.mouse.move(x, y, { steps: 1 });
-        await sleep(8 + Math.floor(Math.random() * 18));
-      }
-
-      await page.mouse.up();
-      await sleep(humanDelay(500, 1200));
-      return { ok: true, selector };
+      url = new URL(candidate, base);
     } catch {
-      // try next selector
+      continue;
+    }
+    // The body is attacker-influenced content. Only the Qwen origin itself may
+    // be opened in the authenticated account page.
+    if (url.protocol !== base.protocol || url.host !== base.host) continue;
+    return url.toString();
+  }
+  return null;
+}
+
+export interface BaxiaSolverOptions {
+  maxAttempts?: number;
+  waitForMs?: number;
+  retryDelayMs?: number;
+  settleMs?: number;
+  sliderTimeoutMs?: number;
+}
+
+interface BaxiaLocatorContext {
+  locator(selector: string): Locator;
+}
+
+interface BaxiaChallengeTarget {
+  /** Null means the NC document is the top-level document, not an iframe. */
+  iframeSelector: string | null;
+  locator: Locator;
+}
+
+const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_RETRY_DELAY_MS = 1_000;
+const DEFAULT_SETTLE_MS = 2_000;
+const DEFAULT_SLIDER_TIMEOUT_MS = 5_000;
+
+async function isVisible(locator: Locator): Promise<boolean> {
+  return locator.isVisible().catch(() => false);
+}
+
+async function findVisibleLocator(
+  page: Page,
+  selectors: readonly string[],
+): Promise<{ selector: string; locator: Locator } | null> {
+  for (const selector of selectors) {
+    const candidate = page.locator(selector).first();
+    if (await isVisible(candidate)) {
+      return { selector, locator: candidate };
     }
   }
-  return { ok: false };
+  return null;
 }
 
-async function attemptSliderOnPage(page: Page): Promise<{
-  ok: boolean;
-  selector?: string;
-}> {
-  const direct = await tryDragSlider(page);
-  if (direct.ok) return direct;
-
-  for (const frame of page.frames()) {
-    if (frame === page.mainFrame()) continue;
-    const framed = await tryDragSlider(frame);
-    if (framed.ok) return framed;
-  }
-  return { ok: false };
+async function findVisibleIframe(
+  page: Page,
+): Promise<BaxiaChallengeTarget | null> {
+  const iframe = await findVisibleLocator(page, BAXIA_IFRAME_SELECTORS);
+  return iframe
+    ? { iframeSelector: iframe.selector, locator: iframe.locator }
+    : null;
 }
 
-async function waitForChallengeClear(
+async function findVisibleDocument(
+  page: Page,
+): Promise<BaxiaChallengeTarget | null> {
+  const documentTarget = await findVisibleLocator(
+    page,
+    BAXIA_DOCUMENT_SELECTORS,
+  );
+  return documentTarget
+    ? { iframeSelector: null, locator: documentTarget.locator }
+    : null;
+}
+
+async function detectBaxiaChallenge(
   page: Page,
   timeoutMs: number,
+): Promise<{
+  dialogLocator: Locator;
+  contentLocator: Locator;
+  target: BaxiaChallengeTarget;
+} | null> {
+  const dialogLocator = page.locator(BAXIA_DIALOG_SELECTOR).first();
+  const contentLocator = page.locator(BAXIA_CONTENT_SELECTOR).first();
+  const topLevelRootLocator = page.locator("#baxia-punish").first();
+  const deadline = Date.now() + timeoutMs;
+  let dialogReported = false;
+
+  while (true) {
+    const dialogVisible = await isVisible(dialogLocator);
+    const contentVisible = await isVisible(contentLocator);
+    if ((dialogVisible || contentVisible) && !dialogReported) {
+      logBaxiaCaptcha("dialog_detected");
+      dialogReported = true;
+    }
+
+    const iframe = await findVisibleIframe(page);
+    if (iframe) {
+      logBaxiaCaptcha("iframe_found");
+      return { dialogLocator, contentLocator, target: iframe };
+    }
+
+    const documentTarget = await findVisibleDocument(page);
+    if (documentTarget) {
+      logBaxiaCaptcha("challenge_detected", { scope: "top_level" });
+      return {
+        dialogLocator,
+        // In this mode #baxia-punish/#nocaptcha is the challenge surface.
+        contentLocator: (await isVisible(topLevelRootLocator))
+          ? topLevelRootLocator
+          : documentTarget.locator,
+        target: documentTarget,
+      };
+    }
+
+    if (Date.now() >= deadline) break;
+    await sleep(Math.min(100, Math.max(1, deadline - Date.now())));
+  }
+
+  if (dialogReported) {
+    logBaxiaCaptcha("challenge_not_found", { scope: "dialog" });
+  }
+  return null;
+}
+
+async function hasSolvedState(
+  challengeLocator: Locator,
+  dialogLocator: Locator,
+  contentLocator: Locator,
+  frame: BaxiaLocatorContext,
 ): Promise<boolean> {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const signal = await pageHasChallengeSignals(page);
-    if (!signal.challenged) {
-      // Prefer also seeing chat shell / non-punish host path
-      const url = page.url();
-      if (!/_____tmd_____|punish/i.test(url)) {
-        return true;
-      }
-    }
-    if (await hasX5secCookie(page)) {
-      // Cookie alone is promising; give UI a moment to settle
-      await sleep(400);
-      const after = await pageHasChallengeSignals(page);
-      if (!after.challenged) return true;
-    }
-    await sleep(350);
+  const [challengeVisible, dialogVisible, contentVisible] = await Promise.all([
+    isVisible(challengeLocator),
+    isVisible(dialogLocator),
+    isVisible(contentLocator),
+  ]);
+
+  // Baxia calls hide(true) on the outer dialog after it receives the success
+  // message. Treat the challenge as solved only after its visible surfaces are
+  // gone, which avoids refreshing headers while the postMessage is in flight.
+  if (!challengeVisible && !dialogVisible && !contentVisible) return true;
+
+  for (const selector of BAXIA_SUCCESS_SELECTOR.split(", ")) {
+    if (await isVisible(frame.locator(selector.trim()))) return true;
   }
   return false;
 }
 
-async function softSessionWarmup(page: Page): Promise<void> {
-  await page
-    .goto("https://chat.qwen.ai/", {
-      waitUntil: "domcontentloaded",
-      timeout: config.timeouts.navigation,
-    })
-    .catch(() => {});
-  await sleep(humanDelay(400, 900));
-  await subtlePageActivity(page).catch(() => {});
+async function waitForSolvedState(
+  challengeLocator: Locator,
+  dialogLocator: Locator,
+  contentLocator: Locator,
+  frame: BaxiaLocatorContext,
+  timeoutMs: number,
+): Promise<boolean> {
+  if (await hasSolvedState(challengeLocator, dialogLocator, contentLocator, frame)) {
+    return true;
+  }
+  if (timeoutMs <= 0) return false;
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await sleep(Math.min(100, Math.max(1, deadline - Date.now())));
+    if (
+      await hasSolvedState(
+        challengeLocator,
+        dialogLocator,
+        contentLocator,
+        frame,
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function sanitizeCaptchaErrorDetail(error: unknown): string {
+  const message =
+    error instanceof Error ? error.message || error.name : String(error);
+  return message
+    .replace(/https?:\/\/[^\s"'`<>]+/gi, "<url>")
+    .replace(/\/[^\s"'`<>]*_____tmd_____[^\s"'`<>]*/gi, "<challenge-path>")
+    .replace(/x5secdata=[^\s"'`<>]*/gi, "x5secdata=<redacted>")
+    .replace(/data:image\/[^\s"'`<>]+/gi, "<image-data>")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 220);
 }
 
 /**
- * Attempt to recover an account blocked by TMD/captcha using its Playwright page.
- * Single-flight per account; respects min interval between solves.
+ * Solve a Baxia/TMD slider challenge already present in the account page.
+ *
+ * This adapter interacts only with the visible first-party NC challenge. It
+ * supports both the usual iframe dialog and a challenge document rendered
+ * directly in the page. It does not capture screenshots, HTML, cookies, or
+ * challenge tokens.
  */
-export async function recoverAntiBotChallenge(
-  accountId: string,
-): Promise<CaptchaSolveResult> {
-  const started = Date.now();
+export async function solveBaxiaCaptcha(
+  page: Page,
+  options: BaxiaSolverOptions = {},
+): Promise<boolean> {
+  const waitForMs = Math.max(0, options.waitForMs ?? 0);
+  const maxAttempts = Math.max(
+    1,
+    Math.min(5, options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS),
+  );
+  const retryDelayMs = Math.max(
+    0,
+    options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS,
+  );
+  const settleMs = Math.max(0, options.settleMs ?? DEFAULT_SETTLE_MS);
+  const sliderTimeoutMs = Math.max(
+    500,
+    options.sliderTimeoutMs ?? DEFAULT_SLIDER_TIMEOUT_MS,
+  );
 
-  if (!config.captchaSolver.enabled) {
-    return {
-      success: false,
-      method: "disabled",
-      detail: "CAPTCHA_SOLVER_ENABLED=false",
-      durationMs: 0,
-    };
-  }
+  const detected = await detectBaxiaChallenge(page, waitForMs);
+  if (!detected) return false;
 
-  if (!isPlaywrightInitialized(accountId)) {
-    return {
-      success: false,
-      method: "failed",
-      detail: "playwright_not_initialized",
-      durationMs: Date.now() - started,
-    };
-  }
+  // [Dodo] Captcha detectado! Trazer janela para frente para resolução manual ou via IA
+  await restoreWindow(page);
 
-  const existing = inFlight.get(accountId);
-  if (existing) return existing;
+  const scope = detected.target.iframeSelector ? "iframe" : "top_level";
+  let lastGeometry: { track?: number; slider?: number; distance?: number } = {};
+  let lastReason = "unknown";
+  let lastStage = "detect";
+  let lastDetail = "";
 
-  const last = lastSolveAt.get(accountId) ?? 0;
-  if (Date.now() - last < config.captchaSolver.minIntervalMs) {
-    return {
-      success: false,
-      method: "skipped_recent",
-      detail: `min_interval_${config.captchaSolver.minIntervalMs}ms`,
-      durationMs: Date.now() - started,
-    };
-  }
+  logBaxiaCaptcha("solve_started", { scope });
 
-  const promise = (async (): Promise<CaptchaSolveResult> => {
-    lastSolveAt.set(accountId, Date.now());
-    const budgetMs = config.captchaSolver.timeoutMs;
-    const deadline = Date.now() + budgetMs;
+  // A frame selector is deliberately narrowed to the first matching iframe.
+  // This matters when an old hidden Baxia iframe remains in the page after a
+  // previous challenge. A null selector means the NC document is top-level.
+  const frameSelector = detected.target.iframeSelector
+    ? `${detected.target.iframeSelector} >> nth=0`
+    : null;
+  let sliderFoundReported = false;
+  let sliderMissingReported = false;
 
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let stage = "slider_wait";
     try {
-      // Phase 1: warm page + capture fresh anti-fraud headers
-      await withAccountPage(accountId, async (page) => {
-        await softSessionWarmup(page);
-      });
-      await refreshHeaders(accountId);
+      const frame: BaxiaLocatorContext = frameSelector
+        ? page.frameLocator(frameSelector)
+        : page;
+      const slider = frame.locator(BAXIA_SLIDER_SELECTOR);
+      await slider.waitFor({ state: "visible", timeout: sliderTimeoutMs });
+      if (!sliderFoundReported) {
+        logBaxiaCaptcha("slider_found");
+        sliderFoundReported = true;
+      }
 
-      let signal = await withAccountPage(accountId, (page) =>
-        pageHasChallengeSignals(page),
-      );
-
-      // Phase 2: if challenge not visible yet, force a tiny in-page completions
-      // probe so Alibaba may render punish page / widgets.
-      if (!signal.challenged && Date.now() < deadline) {
-        await withAccountPage(accountId, async (page) => {
-          await page
-            .evaluate(async () => {
-              try {
-                await fetch("/api/v2/chat/completions", {
-                  method: "POST",
-                  credentials: "include",
-                  headers: {
-                    accept: "application/json, text/plain, */*",
-                    "content-type": "application/json",
-                    source: "web",
-                  },
-                  body: JSON.stringify({
-                    stream: false,
-                    model: "qwen3.5-flash",
-                    messages: [{ role: "user", content: "ping" }],
-                  }),
-                });
-              } catch {
-                // ignore; we only care if a challenge UI appears
-              }
-            })
-            .catch(() => {});
-          await sleep(humanDelay(500, 1000));
+      stage = "geometry";
+      const sliderBox = await slider.boundingBox();
+      if (!sliderBox) {
+        lastReason = "bounds_unavailable";
+        logBaxiaCaptcha("attempt_bounds_unavailable", { attempt });
+      } else {
+        const track = frame.locator(BAXIA_TRACK_SELECTOR);
+        const trackBox = await track.boundingBox();
+        const trackWidth = trackBox?.width ?? 300;
+        const dragDistance = Math.max(0, trackWidth - sliderBox.width);
+        lastGeometry = {
+          track: Math.round(trackWidth),
+          slider: Math.round(sliderBox.width),
+          distance: Math.round(dragDistance),
+        };
+        logBaxiaCaptcha("attempt_geometry", {
+          attempt,
+          ...lastGeometry,
         });
-        signal = await withAccountPage(accountId, (page) =>
-          pageHasChallengeSignals(page),
-        );
-      }
 
-      if (!signal.challenged) {
-        // Headers refresh alone is still valuable against stale bx tokens
-        return {
-          success: true,
-          method: "headers_only",
-          detail: "no_visible_challenge_after_refresh",
-          durationMs: Date.now() - started,
-        };
-      }
-
-      console.log(
-        `🧩 [Captcha] Challenge detected for ${accountId} (${signal.reason}); restoring window to solve...`,
-      );
-      await withAccountPage(accountId, (page) => restoreWindow(page));
-
-      // Phase 3: slider attempts within remaining budget
-      let sliderSelector: string | undefined;
-      for (
-        let attempt = 0;
-        attempt < config.captchaSolver.maxSliderAttempts &&
-        Date.now() < deadline;
-        attempt++
-      ) {
-        const dragged = await withAccountPage(accountId, (page) =>
-          attemptSliderOnPage(page),
-        );
-        if (dragged.ok) {
-          sliderSelector = dragged.selector;
-          break;
+        if (dragDistance > 0) {
+          stage = "drag";
+          await humanDrag(
+            page,
+            sliderBox.x + sliderBox.width / 2,
+            sliderBox.y + sliderBox.height / 2,
+            sliderBox.x + sliderBox.width / 2 + dragDistance,
+            sliderBox.y + sliderBox.height / 2,
+          );
         }
-        await sleep(humanDelay(250, 600));
       }
 
-      const remaining = Math.max(800, deadline - Date.now());
-      const cleared = await withAccountPage(accountId, (page) =>
-        waitForChallengeClear(page, remaining),
-      );
-
-      await refreshHeaders(accountId);
-
-      // Re-minimize window after challenge resolution
-      await withAccountPage(accountId, (page) => minimizeWindow(page));
-
-      if (cleared) {
-        console.log(
-          `✅ [Captcha] Challenge cleared for ${accountId}${sliderSelector ? ` via ${sliderSelector}` : ""}`,
+      stage = "settle";
+      if (
+        await waitForSolvedState(
+          detected.target.locator,
+          detected.dialogLocator,
+          detected.contentLocator,
+          frame,
+          settleMs,
+        )
+      ) {
+        logBaxiaCaptcha(
+          "solve_succeeded",
+          {
+            scope,
+            attempt,
+            ...lastGeometry,
+          },
+          true,
         );
-        return {
-          success: true,
-          method: sliderSelector ? "slider" : "wait_cleared",
-          detail: sliderSelector || signal.reason,
-          durationMs: Date.now() - started,
-        };
+        // [Dodo] Captcha resolvido! Esconder janela novamente
+        await minimizeWindow(page);
+        return true;
       }
 
-      console.warn(
-        `❌ [Captcha] Failed to clear challenge for ${accountId} (${signal.reason})`,
-      );
-      return {
-        success: false,
-        method: "failed",
-        detail: `challenge_uncleared:${signal.reason}`,
-        durationMs: Date.now() - started,
-      };
+      lastReason = "not_solved";
+      logBaxiaCaptcha("attempt_not_solved", { attempt });
     } catch (error) {
-      return {
-        success: false,
-        method: "failed",
-        detail: error instanceof Error ? error.message : String(error),
-        durationMs: Date.now() - started,
-      };
+      const errorKind = error instanceof Error ? error.name : "UnknownError";
+      const detail = sanitizeCaptchaErrorDetail(error);
+      if (!sliderFoundReported && !sliderMissingReported) {
+        lastReason = "slider_not_found";
+        logBaxiaCaptcha("slider_not_found", { attempt, stage, detail });
+        sliderMissingReported = true;
+      } else {
+        lastReason = errorKind;
+      }
+      lastStage = stage;
+      lastDetail = detail;
+      // Include only a sanitized detail: full Playwright errors can contain
+      // challenge URLs or page data that should not reach application logs.
+      logBaxiaCaptcha("attempt_failed", {
+        attempt,
+        stage,
+        error: errorKind,
+        detail,
+      });
     }
-  })();
 
-  inFlight.set(accountId, promise);
-  try {
-    return await promise;
-  } finally {
-    inFlight.delete(accountId);
+    if (attempt < maxAttempts && retryDelayMs > 0) {
+      await sleep(retryDelayMs);
+    }
   }
+
+  if (!sliderFoundReported && !sliderMissingReported) {
+    lastReason = "slider_not_found";
+    logBaxiaCaptcha("slider_not_found");
+  }
+  logBaxiaCaptcha(
+    "solve_failed",
+    {
+      scope,
+      attempts: maxAttempts,
+      reason: lastReason,
+      stage: lastStage,
+      detail: lastDetail || lastReason,
+    },
+    true,
+  );
+  // [Dodo] Captcha falhou! Esconder janela novamente
+  await minimizeWindow(page);
+  return false;
 }
 
-/** Test helper — clear per-account solve throttles. */
-export function resetCaptchaSolverStateForTests(): void {
-  lastSolveAt.clear();
-  inFlight.clear();
+export interface BaxiaCaptchaWatcher {
+  stop(): void;
+  promise: Promise<boolean>;
+}
+
+/**
+ * Watch for a challenge that appears while a browser fetch is still waiting
+ * for response metadata. The watcher intentionally does not hold the account
+ * page mutex: the browser-side fetch already returned from page.evaluate and
+ * the page must remain interactive while the challenge is displayed.
+ */
+export function startBaxiaCaptchaWatcher(
+  page: Page,
+  timeoutMs: number,
+  options: Omit<BaxiaSolverOptions, "waitForMs"> = {},
+): BaxiaCaptchaWatcher {
+  let stopped = false;
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+
+  const promise = (async (): Promise<boolean> => {
+    while (!stopped && Date.now() < deadline) {
+      try {
+        if (page.isClosed()) break;
+        const solved = await solveBaxiaCaptcha(page, {
+          ...options,
+          waitForMs: 0,
+        });
+        if (solved) return true;
+      } catch {
+        // A page reset/close is handled by the owning browser request.
+      }
+
+      if (!stopped && Date.now() < deadline) {
+        await sleep(Math.min(250, Math.max(1, deadline - Date.now())));
+      }
+    }
+    return false;
+  })();
+
+  return {
+    stop: () => {
+      stopped = true;
+    },
+    promise,
+  };
 }

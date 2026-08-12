@@ -6,6 +6,7 @@
  */
 
 import { config } from "../../core/config.ts";
+import { logger } from "../../core/logger.ts";
 import {
   QwenNetworkError,
   QwenUpstreamError,
@@ -158,6 +159,36 @@ export function isInvalidInputError(err: unknown): boolean {
   );
 }
 
+/** Prefer a clean chat on the current account before paying the cost of replaying
+ * the full context on another account. Callers keep their own per-request count. */
+export function shouldRetryInvalidInputOnSameAccount(
+  reason: string,
+  alreadyRetried: boolean,
+): boolean {
+  return reason === "invalid_input" && !alreadyRetried;
+}
+
+/** Keep one retry on the current account while an upstream generation settles;
+ * subsequent chat_in_progress failures must be allowed to rotate accounts. */
+export function shouldRetryChatInProgressOnSameAccount(
+  reason: string,
+  alreadyRetried: boolean,
+): boolean {
+  return reason === "chat_in_progress" && !alreadyRetried;
+}
+
+export function isAccountInitializationError(err: unknown): boolean {
+  const message = errMessage(err).toLowerCase();
+  return (
+    message.includes("header capture returned incomplete anti-fraud headers") ||
+    message.includes("required qwen anti-fraud headers are unavailable") ||
+    message.includes("playwright not initialized for account") ||
+    message.includes("playwright page unavailable") ||
+    message.includes("playwright page operation timed out") ||
+    message.includes("playwright re-initialization timed out")
+  );
+}
+
 export function isQuotaLikeError(err: unknown): boolean {
   // Chat-not-exist / invalid attachment must never look like quota.
   if (isChatNotExistError(err) || isInvalidInputError(err)) return false;
@@ -192,14 +223,16 @@ export function isQuotaLikeError(err: unknown): boolean {
 }
 
 export function isAntiBotError(err: unknown): boolean {
-  if (err instanceof RetryableQwenStreamError) {
-    return errMessage(err).toLowerCase().includes("anti-bot");
-  }
   const code = errCode(err);
+  const codeLower = code.toLowerCase();
   const message = errMessage(err).toLowerCase();
+  if (err instanceof RetryableQwenStreamError) {
+    return codeLower === "waf_challenge" || message.includes("anti-bot");
+  }
   return (
     code === "FAIL_SYS_USER_VALIDATE" ||
     code === "RGV587_ERROR" ||
+    codeLower === "waf_challenge" ||
     message.includes("fail_sys_user_validate") ||
     message.includes("rgv587_error") ||
     message.includes("_____tmd_____") ||
@@ -216,16 +249,21 @@ function classifyQuotaCooldown(message: string): {
   accountCooldownMs?: number;
   accountCooldownReason: string;
 } {
+  const lower = message.toLowerCase();
   const hourHint = message.match(/Wait about (\d+) hour/i);
   const temporary =
-    message.toLowerCase().includes("rate increased too quickly") ||
-    message.toLowerCase().includes("request rate increased too quickly");
+    lower.includes("rate increased too quickly") ||
+    lower.includes("request rate increased too quickly") ||
+    lower.includes("alta demanda") ||
+    lower.includes("high demand") ||
+    lower.includes("tente novamente mais tarde") ||
+    lower.includes("try again later");
 
   return {
     accountCooldownMs: hourHint
       ? parseInt(hourHint[1], 10) * 60 * 60 * 1000
       : temporary
-        ? 5 * 60 * 1000
+        ? 2 * 60 * 1000
         : undefined,
     accountCooldownReason: temporary
       ? "RateLimitTemporary"
@@ -246,6 +284,29 @@ export function isChatNotExistError(err: unknown): boolean {
 
 export function isChatInProgressError(err: unknown): boolean {
   return errMessage(err).toLowerCase().includes("in progress");
+}
+
+/**
+ * Browser fetch and ReadableStream failures often arrive as plain Error
+ * instances, especially when the stream is consumed outside Playwright.
+ * Keep this matcher narrow so local programming errors are not retried as
+ * account/network failures.
+ */
+export function isNetworkLikeError(err: unknown): boolean {
+  if (err instanceof QwenNetworkError) return true;
+  const message = errMessage(err).toLowerCase();
+  return (
+    message === "network error" ||
+    message.includes("failed to fetch") ||
+    message.includes("fetch failed") ||
+    message.includes("network connection was lost") ||
+    message.includes("connection reset") ||
+    message.includes("connection closed") ||
+    message.includes("socket hang up") ||
+    message.includes("econnreset") ||
+    message.includes("econnrefused") ||
+    message.includes("etimedout")
+  );
 }
 
 /**
@@ -306,6 +367,34 @@ export function classifyRetryAction(
     };
   }
 
+  const message = errMessage(err).toLowerCase();
+  if (isAccountInitializationError(err)) {
+    return {
+      retryable: true,
+      switchAccount: true,
+      forceNewChat: false,
+      retryWithFullPrompt: false,
+      retryAfterMs: Math.min(baseDelayMs, 1_000),
+      accountCooldownMs: config.concurrency.initFailureCooldownMs,
+      accountCooldownReason: "AuthInitFailed",
+      reason: "account_initialization_failed",
+    };
+  }
+
+  if (
+    message.includes("waiting for a free slot") ||
+    message.includes("busy: timed out")
+  ) {
+    return {
+      retryable: true,
+      switchAccount: true,
+      forceNewChat: false,
+      retryWithFullPrompt: false,
+      retryAfterMs: Math.min(baseDelayMs, 1_000),
+      reason: "account_busy",
+    };
+  }
+
   // Specialized recoveries first (even if wrapped as RetryableQwenStreamError)
     // Corrupted chat history must win over broad "invalid input" matches.
     if (isCorruptedChatHistoryError(err)) {
@@ -325,11 +414,14 @@ export function classifyRetryAction(
       const inProgress = isChatInProgressError(err);
       return {
         retryable: true,
-        switchAccount: inProgress ? typed.switchAccount !== false : false,
-        forceNewChat: true,
-        retryWithFullPrompt: true,
+        // chat_in_progress: do NOT switch immediately — the account is just
+        // temporarily busy. Escalation to switch happens in tryCreateStreamWithRetry
+        // after repeated failures on the same account.
+        switchAccount: inProgress ? false : false,
+        forceNewChat: !inProgress, // chat_not_exist needs a new chat; in_progress retries same first
+        retryWithFullPrompt: !inProgress,
         retryAfterMs: inProgress
-          ? Math.min(typed.retryAfterMs ?? baseDelayMs, 1500)
+          ? (typed.retryAfterMs ?? config.retry.chatInProgressDelayMs)
           : (typed.retryAfterMs ?? 0),
         reason: inProgress ? "chat_in_progress" : "chat_not_exist",
       };
@@ -349,15 +441,15 @@ export function classifyRetryAction(
     }
 
     if (isAntiBotError(err)) {
-      const typed = err as RetryableStreamError;
+      // WAF/captcha is only identified here. Retry the same request on the
+      // same account immediately; recovery, cooldown and account rotation are
+      // intentionally left out so the failure path stays observable.
       return {
         retryable: true,
-        switchAccount: typed.switchAccount !== false,
-        forceNewChat: typed.forceNewChat === true,
-        retryWithFullPrompt: typed.retryWithFullPrompt === true,
-        retryAfterMs: typed.retryAfterMs ?? config.antiBot.baseDelayMs,
-        accountCooldownMs: config.captchaSolver.failCooldownMs,
-        accountCooldownReason: "AntiBot",
+        switchAccount: false,
+        forceNewChat: false,
+        retryWithFullPrompt: false,
+        retryAfterMs: 0,
         reason: "anti_bot",
       };
     }
@@ -365,12 +457,15 @@ export function classifyRetryAction(
     if (isQuotaLikeError(err)) {
       const typed = err as RetryableStreamError;
       const quota = classifyQuotaCooldown(errMessage(err));
+      const isTemporary = quota.accountCooldownReason === "RateLimitTemporary";
       return {
         retryable: true,
-        switchAccount: typed.switchAccount !== false,
+        // Temporary load shedding: retry same account first, only switch on
+        // repeated failure. Real quota exhaustion: switch immediately.
+        switchAccount: isTemporary ? false : typed.switchAccount !== false,
         forceNewChat: typed.forceNewChat === true,
         retryWithFullPrompt: typed.retryWithFullPrompt === true,
-        retryAfterMs: typed.retryAfterMs ?? baseDelayMs,
+        retryAfterMs: typed.retryAfterMs ?? (isTemporary ? 3_000 : baseDelayMs),
         accountCooldownMs: quota.accountCooldownMs,
         accountCooldownReason: quota.accountCooldownReason,
         reason: "quota_or_rate_limit",
@@ -378,7 +473,7 @@ export function classifyRetryAction(
     }
 
     if (
-        err instanceof QwenNetworkError ||
+        isNetworkLikeError(err) ||
         err instanceof QwenUpstreamUnavailableError ||
         err instanceof QwenUpstreamError ||
         isAbortError(err)
@@ -391,13 +486,13 @@ export function classifyRetryAction(
           retryWithFullPrompt: typed.retryWithFullPrompt === true,
           retryAfterMs:
             typed.retryAfterMs ??
-            (err instanceof QwenNetworkError
+            (isNetworkLikeError(err)
               ? 3000
               : err instanceof QwenUpstreamUnavailableError
                 ? 2000
                 : Math.min(baseDelayMs * 2, 3000)),
           reason:
-            err instanceof QwenNetworkError
+            isNetworkLikeError(err)
               ? "network"
               : err instanceof QwenUpstreamUnavailableError
                 ? "upstream_unavailable"
@@ -479,21 +574,17 @@ export function throwFromSseUpstreamError(
   errCode: string,
   errDetails: string,
 ): never {
-  // Log full error details for debugging invalid_input errors
-  if (errCode.toLowerCase() === "invalid_input") {
-    console.error(
-      `[Upstream] invalid_input error details:`,
-      JSON.stringify(
-        {
-          code: errCode,
-          details: errDetails,
-          detailsLength: errDetails.length,
-          preview: errDetails.substring(0, 500),
-        },
-        null,
-        2,
-      ),
-    );
+  // Log upstream errors. Expected retryable codes (quota, rate limit, chat
+  // state) use warn level to avoid noisy stderr stack traces in production.
+  const expectedCodes = new Set([
+    "quota_limit",
+    "rate_limit",
+    "rate_limit_exceeded",
+    "chat_in_progress",
+    "invalid_input",
+  ]);
+  if (expectedCodes.has(errCode.toLowerCase())) {
+    logger.warn(`[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`);
   } else {
     console.error(
       `[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`,
@@ -513,22 +604,14 @@ export function throwFromSseUpstreamError(
       detailsLower.includes("invalid input") ||
       detailsLower.includes("invalid attachment"))
   ) {
-    // Detailed diagnostic logging for invalid_input errors
-    console.error(
-      `[Upstream] invalid_input mid-stream detected:`,
-      JSON.stringify(
-        {
-          code: errCode,
-          details: errDetails,
-          detailsLength: errDetails.length,
-          containsAttachment: detailsLower.includes("anexo") || detailsLower.includes("attachment"),
-          containsFile: detailsLower.includes("file") || detailsLower.includes("arquivo"),
-          timestamp: new Date().toISOString(),
-        },
-        null,
-        2,
-      ),
-    );
+    logger.warn("[Upstream] invalid_input mid-stream detected", {
+      code: errCode,
+      detailsLength: errDetails.length,
+      messageMentionsAttachment:
+        detailsLower.includes("anexo") || detailsLower.includes("attachment"),
+      messageMentionsFile:
+        detailsLower.includes("file") || detailsLower.includes("arquivo"),
+    });
 
     const error = new RetryableQwenStreamError(
       `Qwen retryable invalid input: ${errCode}: ${errDetails.substring(0, 200)}`,
@@ -549,7 +632,7 @@ export function throwFromSseUpstreamError(
   ) {
     const error = new RetryableQwenStreamError(
       `Qwen anti-bot: ${errCode}: ${errDetails}`,
-      config.antiBot.baseDelayMs,
+      0,
     ) as RetryableStreamError;
     error.upstreamCode = errCode;
     error.switchAccount = true;
@@ -565,8 +648,8 @@ export function parseSseErrorFromBuffer(
   const lines = buffer.split("\n");
   for (const line of lines) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith("data: ")) continue;
-    const dataStr = trimmed.slice(6);
+    if (!trimmed.startsWith("data:")) continue;
+    const dataStr = trimmed.slice(5).trimStart();
     if (!dataStr || dataStr === "[DONE]") continue;
     try {
       const chunk = JSON.parse(dataStr);

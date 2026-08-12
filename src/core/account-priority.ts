@@ -1,4 +1,9 @@
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "fs";
 import { join, resolve } from "path";
 
 interface PriorityData {
@@ -33,6 +38,7 @@ function loadPriority(): PriorityData {
 
 function savePriority(data: PriorityData): void {
   try {
+    mkdirSync(DATA_DIR, { recursive: true });
     writeFileSync(PRIORITY_FILE, JSON.stringify(data, null, 2), "utf-8");
     priorityCache = data;
   } catch (err) {
@@ -66,6 +72,25 @@ export function markAccountFailed(accountId: string): void {
   data.accountOrder = data.accountOrder.filter(id => id !== accountId);
   
   // Adiciona no final
+  data.accountOrder.push(accountId);
+  data.lastUpdated = Date.now();
+  
+  savePriority(data);
+}
+
+/**
+ * Adiciona conta à prioridade se não existir (prioridade inicial).
+ * Contas novas entram no final da lista, mantendo a ordem de configuração.
+ */
+export function ensureAccountInPriority(accountId: string): void {
+  const data = loadPriority();
+  
+  // Se já existe, não faz nada
+  if (data.accountOrder.includes(accountId)) {
+    return;
+  }
+  
+  // Adiciona no final (prioridade inicial baixa)
   data.accountOrder.push(accountId);
   data.lastUpdated = Date.now();
   
