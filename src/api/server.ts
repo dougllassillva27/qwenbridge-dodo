@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import net from "node:net";
 import { v4 as uuidv4 } from "uuid";
 import { Hono, type Context } from "hono";
 import { serve } from "@hono/node-server";
@@ -13,11 +14,13 @@ import { chatCompletions, chatCompletionsStop } from "../routes/chat.js";
 import { uploadFile } from "../routes/upload.js";
 import { imagesGenerations } from "../routes/images.js";
 import { videosGenerations, videoTaskStatus } from "../routes/videos.js";
-import { anthropicApp } from "../routes/anthropic/index.js";
 import { responsesApp } from "../routes/responses/index.js";
+import { completionsLegacy } from "../routes/completions.js";
 import { sendOpenAIError } from "./error-helpers.js";
 import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
+import { isAuthMockEnabled } from "../services/auth-playwright.js";
+import { anthropicApp } from "../routes/anthropic/index.js";
 
 // Module-level state (initialized in startServer)
 let cache: MemoryCache | undefined;
@@ -34,9 +37,34 @@ function formatAccountId(accountId: string): string {
   return normalized.length > 12 ? `${normalized.slice(0, 12)}…` : normalized;
 }
 
-// Module-level accessor for cross-module cache access
-export function getCache(): MemoryCache | undefined {
-  return cache;
+function buildPortInUseMessage(port: number, host: string): string {
+  return (
+    `❌ [Server] Port ${port} is already in use (${host}:${port}).` +
+    `\n   Another QwenBridge instance (or another program) is listening on this port.` +
+    `\n   Stop the other instance first, or start on another port: PORT=3001 npm start`
+  );
+}
+
+/**
+ * Pre-flight port check run BEFORE the slow account warmup so a conflicting
+ * listener fails in <1s with an explanatory message instead of crashing the
+ * process minutes later after the warmup completes.
+ */
+async function assertPortAvailable(): Promise<void> {
+  const { port, host } = config.server;
+  await new Promise<void>((resolve, reject) => {
+    const probe = net.createServer();
+    probe.once("error", (err: Error) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EADDRINUSE") {
+        reject(new Error(buildPortInUseMessage(port, host)));
+      } else {
+        reject(err);
+      }
+    });
+    probe.once("listening", () => probe.close(() => resolve()));
+    probe.listen(port, host);
+  });
 }
 
 export function setCacheForTesting(nextCache: MemoryCache | undefined): void {
@@ -44,9 +72,65 @@ export function setCacheForTesting(nextCache: MemoryCache | undefined): void {
 }
 
 // Middleware must be registered BEFORE routes
+
+// CORS: browser-based clients (OpenWebUI, web frontends on another origin)
+// preflight before the Authorization header is sent, so OPTIONS short-circuits
+// BEFORE the /v1/* auth middleware. Default is permissive (doc checklist item
+// 2); set CORS_ORIGIN to lock it down.
+const corsOrigin = process.env.CORS_ORIGIN || "*";
+app.use("*", async (c, next) => {
+  c.header("Access-Control-Allow-Origin", corsOrigin);
+  c.header(
+    "Access-Control-Allow-Methods",
+    "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+  );
+  c.header(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, X-Request-Id, x-api-key, OpenAI-Organization, OpenAI-Project, X-Client-Request-Id",
+  );
+  c.header(
+    "Access-Control-Expose-Headers",
+    "X-Request-Id, X-Response-Time, openai-version, openai-processing-ms, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, x-ratelimit-reset-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens",
+  );
+  if (c.req.method === "OPTIONS") {
+    // Hono does not merge c.header() values into a manually constructed
+    // Response, so the preflight carries its CORS headers explicitly.
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": corsOrigin,
+        "Access-Control-Allow-Methods":
+          "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+        "Access-Control-Allow-Headers":
+          "Authorization, Content-Type, X-Request-Id, x-api-key, OpenAI-Organization, OpenAI-Project, X-Client-Request-Id",
+        "Access-Control-Expose-Headers":
+          "X-Request-Id, X-Response-Time, openai-version, openai-processing-ms, x-ratelimit-limit-requests, x-ratelimit-remaining-requests, x-ratelimit-reset-requests, x-ratelimit-limit-tokens, x-ratelimit-remaining-tokens, x-ratelimit-reset-tokens",
+      },
+    });
+  }
+  await next();
+});
+
 app.use("*", async (c, next) => {
   const requestId = c.req.header("X-Request-Id") || uuidv4();
   c.header("X-Request-Id", requestId);
+
+  // OpenAI-shaped response headers (doc §5.2): API version, processing time,
+  // and static rate-limit windows so tools that parse x-ratelimit-* don't choke.
+  c.header("openai-version", "2020-10-01");
+  const ratelimit = config.server.rateLimit;
+  c.header("x-ratelimit-limit-requests", String(ratelimit.requests));
+  c.header(
+    "x-ratelimit-remaining-requests",
+    String(Math.max(0, ratelimit.requests - 1)),
+  );
+  c.header("x-ratelimit-reset-requests", "0");
+  c.header("x-ratelimit-limit-tokens", String(ratelimit.tokens));
+  c.header(
+    "x-ratelimit-remaining-tokens",
+    String(Math.max(0, ratelimit.tokens - 1)),
+  );
+  c.header("x-ratelimit-reset-tokens", "0");
 
   metrics.increment("requests.total");
   const start = Date.now();
@@ -54,6 +138,34 @@ app.use("*", async (c, next) => {
   const duration = Date.now() - start;
   metrics.histogram("latency.request", duration);
   c.header("X-Response-Time", `${duration}ms`);
+  c.header("openai-processing-ms", String(duration));
+});
+
+// [Dodo] Middleware de diagnóstico avançado — loga TODA requisição recebida
+// e TODA resposta de erro >= 400, independente do LOG_LEVEL.
+app.use("*", async (c, next) => {
+  const method = c.req.method;
+  const path = c.req.path;
+
+  // Não logar OPTIONS ou rotas de saúde para não poluir
+  if (method !== "OPTIONS" && path !== "/health") {
+    const ts = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+    console.log(`🔍 [Diag ${ts}] ${method} ${path}`);
+  }
+
+  await next();
+
+  const status = c.res.status;
+  if (status >= 400 && method !== "OPTIONS") {
+    const ts = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+    // Clona a resposta para ler o corpo sem consumir o stream original
+    let bodyText = "(unreadable)";
+    try {
+      const cloned = c.res.clone();
+      bodyText = await cloned.text();
+    } catch {}
+    console.error(`❌ [Diag ${ts}] ${method} ${path} → HTTP ${status}\n   Body: ${bodyText.slice(0, 500)}`);
+  }
 });
 
 function constantTimeStringEqual(provided: string, expected: string): boolean {
@@ -69,7 +181,7 @@ function constantTimeStringEqual(provided: string, expected: string): boolean {
 }
 
 /**
- * Accept OpenAI-style Bearer and Anthropic-style x-api-key.
+ * Accept OpenAI-style Bearer and x-api-key.
  * Either may authenticate when API_KEY is configured.
  */
 function extractProvidedApiKeys(c: Context): string[] {
@@ -111,18 +223,30 @@ app.use("/v1/*", async (c, next) => {
 
 // Routes
 app.route("", modelsApp);
+app.route("", anthropicApp); // [Dodo] Rota de compatibilidade Anthropic original restaurada do Github
 app.post("/v1/chat/completions", chatCompletions);
 app.post("/v1/chat/completions/stop", chatCompletionsStop);
+app.post("/v1/completions", completionsLegacy);
 app.post("/v1/upload", uploadFile);
 app.post("/v1/images/generations", imagesGenerations);
 app.post("/v1/videos/generations", videosGenerations);
 app.get("/v1/tasks/status/:taskId", videoTaskStatus);
 
-// Anthropic API compatible routes
-app.route("", anthropicApp);
-
 // OpenAI Responses API compatible routes
 app.route("", responsesApp);
+
+// Accept paths without the /v1 prefix via a 308 redirect (method + body are
+// preserved on redirect). Most clients append /v1 themselves; the redirect
+// covers the rest without duplicating handlers.
+const LEGACY_REDIRECTS: Array<[string, string]> = [
+  ["/chat/completions", "/v1/chat/completions"],
+  ["/completions", "/v1/completions"],
+  ["/responses", "/v1/responses"],
+  ["/models", "/v1/models"],
+];
+for (const [from, to] of LEGACY_REDIRECTS) {
+  app.all(from, (c) => c.redirect(to, 308));
+}
 
 app.get("/health", async (c) => {
   const status = await watchdog?.getStatus();
@@ -145,77 +269,45 @@ app.get("/health", async (c) => {
     },
   });
 });
-// [Dodo] Handler consolidado para Dashboard do Proxy Launcher
-const accountsHandler = async (c: Context) => {
-  const error = verifyApiKey(c);
-  if (error) return error;
 
-  const { listAccounts } = await import("../core/accounts.ts");
-  const { getAccountCooldownInfo } = await import("../core/account-manager.ts");
-  const { accountTokenUsage, metrics } = await import("../core/metrics.ts");
+// [Dodo] Handler para o Dashboard Tauri
+const accountsHandler = async (c: any) => {
+  const { loadConfiguredAccounts } = await import("../core/accounts.ts");
+  const { accountTokenUsage } = await import("../core/metrics.ts");
   const { getHeapUsageSnapshot } = await import("../core/memory-usage.ts");
-
-  const accounts = listAccounts();
-  const heap = getHeapUsageSnapshot();
-  const requestsCount = metrics.get("requests.total")?.value || 0;
-  const errorsCount = metrics.get("requests.errors")?.value || 0;
-
-  let activeCount = 0;
-  let cooldownCount = 0;
-
-  const result = accounts.map((acc: any) => {
-    const cooldownInfo = getAccountCooldownInfo(acc.id);
-    const usage = accountTokenUsage[acc.id] || { prompt: 0, completion: 0, total: 0 };
-    const isCooldown = Boolean(cooldownInfo);
-
-    if (isCooldown) cooldownCount++;
-    else activeCount++;
-
-    const cooldownUntil = cooldownInfo ? Date.now() + cooldownInfo.remainingMs : 0;
-    const cooldownReason = cooldownInfo ? cooldownInfo.reason : null;
-
+  
+  const configuredAccounts = loadConfiguredAccounts();
+  const accountsData = configuredAccounts.map(account => {
+    const memoryMB = Math.round(getHeapUsageSnapshot().heapUsed / 1024 / 1024);
+    const tokens = accountTokenUsage[account.id] || { prompt: 0, completion: 0, total: 0 };
     return {
-      id: acc.id,
-      email: maskEmail(acc.email),
-      status: isCooldown ? "cooldown" : "ready",
-      cooldown_until: cooldownUntil,
-      cooldownUntil: cooldownUntil,
-      cooldown_reason: cooldownReason,
-      cooldownReason: cooldownReason,
-      tokens: usage,
+      id: account.id,
+      email: account.email,
+      status: account.cooldown_until && account.cooldown_until > Date.now() ? "cooldown" : "active",
+      cooldown_until: account.cooldown_until,
+      cooldown_reason: account.cooldown_reason,
+      ram_mb: memoryMB,
+      stream_errors: 0,
+      tokens
     };
   });
-
+  
+  const activeCount = accountsData.filter(a => a.status === "active").length;
   return c.json({
-    total: accounts.length,
-    totalAccounts: accounts.length,
+    total: accountsData.length,
     active: activeCount,
-    activeAccounts: activeCount,
-    cooldown: cooldownCount,
-    requests: requestsCount,
-    ram_mb: Math.round(heap.heapUsed / (1024 * 1024)),
-    stream_errors: errorsCount,
-    totalTokens: Object.values(accountTokenUsage).reduce((acc, curr) => acc + (curr.total || 0), 0),
-    accounts: result,
+    cooldown: accountsData.length - activeCount,
+    accounts: accountsData
   });
 };
 
 app.options("/accounts", (c) => {
   c.header("Access-Control-Allow-Origin", "*");
   c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-  c.header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
   return c.body(null, 204);
 });
-
-app.get("/accounts", async (c) => {
-  c.header("Access-Control-Allow-Origin", "*");
-  return accountsHandler(c);
-});
-
-app.get("/metrics/accounts", async (c) => {
-  c.header("Access-Control-Allow-Origin", "*");
-  return accountsHandler(c);
-});
+app.get("/accounts", accountsHandler);
+app.get("/metrics/accounts", accountsHandler);
 
 // Token TTL diagnostics: inspect real cookie/header lifetimes
 app.get("/diagnostics/tokens", async (c) => {
@@ -467,12 +559,12 @@ async function cleanupServerResources(): Promise<void> {
   const { closeAllPlaywright } = await import("../services/playwright.ts");
   await closeAllPlaywright();
 
-  const { closeDatabase } = await import("../core/database.ts");
-  closeDatabase();
-
   const activeServer = server;
   server = undefined;
   if (activeServer?.close) {
+    // Drain in-flight requests BEFORE flushing: a request finishing during the
+    // drain can still call updateLogicalThreadState, and its debounced write
+    // must land in SQLite while the DB is still open.
     await new Promise<void>((resolve) => {
       try {
         if (activeServer.close.length > 0) {
@@ -486,10 +578,23 @@ async function cleanupServerResources(): Promise<void> {
       }
     });
   }
+
+  const { flushLogicalThreadState } = await import("../services/qwen.ts");
+  try {
+    // Debounced logical-thread upserts must land before the DB closes.
+    flushLogicalThreadState();
+  } catch {
+    // Persistence is best-effort; the in-memory cache already served this run.
+  }
+
+  const { closeDatabase } = await import("../core/database.ts");
+  closeDatabase();
 }
 
 async function handleSignal(signal: string): Promise<never> {
-  console.log(`🛑 [Server] Shutdown | ${signal}`);
+  console.log(
+    `🛑 [Server] Shutdown | ${signal}`,
+  );
   await stopServer();
   process.exit(0);
 }
@@ -547,6 +652,17 @@ export async function startServer(options?: {
       await import("../core/accounts.ts");
     const accounts = loadAccounts();
 
+    if (accounts.length === 0 && !isAuthMockEnabled()) {
+      throw new Error(
+        "❌ [Server] No Qwen accounts configured. Configure an account with `npm run login`, the QWEN_ACCOUNTS environment variable, or the accounts database before starting the server.",
+      );
+    }
+
+    // Fail fast on a taken port (the most common startup crash) BEFORE the
+    // slow account warmup — the previous behavior bound only after warmup and
+    // then crashed with a raw Node stack trace minutes into startup.
+    await assertPortAvailable();
+
     // Restore persisted cooldowns (e.g. daily quota windows) from the database
     // instead of wiping them on restart — retrying a still-rate-limited account
     // wastes a request and immediately re-trips the same limit. Expired
@@ -585,7 +701,9 @@ export async function startServer(options?: {
           warmQwenChatPool,
         );
         if (ok) {
-          console.log(`✅ [Server] Account ready (${i + 1}/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`);
+          console.log(
+            `✅ [Server] Account ready (${i + 1}/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
+          );
           readyAccountId = warmOrder[i].id;
           break;
         }
@@ -675,10 +793,6 @@ export async function startServer(options?: {
           );
         });
       }
-    } else {
-      console.warn(
-        `⚠️  [Server] No Qwen accounts configured. Add accounts with npm run login before sending requests.`,
-      );
     }
 
     watchdog = new Watchdog();
@@ -690,11 +804,32 @@ export async function startServer(options?: {
       await import("../services/session-keeper.ts");
     startSessionKeeper();
 
-    server = serve({
+    const { startLeaseSweepTimer } =
+      await import("../core/account-concurrency.ts");
+    startLeaseSweepTimer();
+
+    const serverInstance = serve({
       fetch: app.fetch,
       port: config.server.port,
       hostname: config.server.host,
     });
+    // Node's http.Server emits 'error' (EADDRINUSE and friends) asynchronously,
+    // AFTER serve() returns — with no listener the process crashes with a raw
+    // stack trace. The pre-flight check above catches the common case before
+    // warmup; this listener is the safety net for the rare race where the port
+    // is taken between the check and the bind.
+    serverInstance.on("error", (err: Error) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EADDRINUSE") {
+        console.error(
+          buildPortInUseMessage(config.server.port, config.server.host),
+        );
+      } else {
+        console.error(`❌ [Server] Listen failed: ${err.message}`);
+      }
+      process.exit(1);
+    });
+    server = serverInstance;
 
     if (options?.installSignalHandlers !== false) {
       installSignalHandlers();

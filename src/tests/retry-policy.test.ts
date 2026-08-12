@@ -14,14 +14,17 @@ import {
   toRetryableStreamError,
 } from "../routes/chat/retry-policy.ts";
 import {
+  getQwenErrorCode,
   QwenNetworkError,
   QwenUpstreamError,
   RetryableQwenStreamError,
 } from "../services/qwen.ts";
+import { classifyError } from "../api/error-classifier.ts";
 import {
   ValidationError,
   AuthError,
   ContextLengthExceededError,
+  ClientAbortedError,
 } from "../core/errors.ts";
 import { parseQwenErrorPayload } from "../routes/chat/errors.ts";
 
@@ -134,17 +137,25 @@ test("invalid_input retries a clean chat once before account rotation", () => {
   );
 });
 
-test("chat_in_progress rotates after one same-account retry", () => {
+test("chat_in_progress allows three same-account retries before rotating", () => {
   assert.equal(
-    shouldRetryChatInProgressOnSameAccount("chat_in_progress", false),
+    shouldRetryChatInProgressOnSameAccount("chat_in_progress", 0),
     true,
   );
   assert.equal(
-    shouldRetryChatInProgressOnSameAccount("chat_in_progress", true),
+    shouldRetryChatInProgressOnSameAccount("chat_in_progress", 1),
+    true,
+  );
+  assert.equal(
+    shouldRetryChatInProgressOnSameAccount("chat_in_progress", 2),
+    true,
+  );
+  assert.equal(
+    shouldRetryChatInProgressOnSameAccount("chat_in_progress", 3),
     false,
   );
   assert.equal(
-    shouldRetryChatInProgressOnSameAccount("quota_or_rate_limit", false),
+    shouldRetryChatInProgressOnSameAccount("quota_or_rate_limit", 0),
     false,
   );
 });
@@ -184,6 +195,28 @@ test("classifyRetryAction: WAF challenges retry the same account immediately", (
   assert.equal(action.accountCooldownMs, undefined);
   assert.equal(action.accountCooldownReason, undefined);
   assert.equal(action.reason, "anti_bot");
+});
+
+test("classifyRetryAction: Not_Found model not found is terminal (no retry)", () => {
+  const err = Object.assign(
+    new Error("Qwen upstream error: Not_Found: Model not found."),
+    { upstreamCode: "Not_Found", upstreamStatus: 404 },
+  );
+  const action = classifyRetryAction(err);
+  assert.equal(action.retryable, false);
+  assert.equal(action.switchAccount, false);
+  assert.equal(action.forceNewChat, false);
+  assert.equal(action.reason, "model_not_found");
+});
+
+test("classifyRetryAction: generic Qwen 404 for missing chat remains retryable", () => {
+  const err = Object.assign(
+    new Error("Qwen upstream error: Not_Found: chat is not exist."),
+    { upstreamCode: "Not_Found", upstreamStatus: 404 },
+  );
+  const action = classifyRetryAction(err);
+  assert.equal(action.retryable, true);
+  assert.equal(action.reason, "chat_not_exist");
 });
 
 test("parseQwenErrorPayload sanitizes an HTML WAF page", () => {
@@ -233,6 +266,58 @@ test("classifyRetryAction: network / abort / upstream error classes retry with s
   assert.equal(abortAction.switchAccount, true);
   assert.equal(abortAction.forceNewChat, true);
   assert.equal(abortAction.reason, "stream_aborted");
+});
+
+test("classifyRetryAction: superseded request (client aborted) is silent, not retried", () => {
+  // A same-session retry superseded this request's stream DURING creation.
+  // createQwenStreamInternal throws "client aborted before completion request"
+  // as a plain Error — the supersede aborted the lease signal, NOT the client's
+  // own request signal. This must NOT spin a full-context retry on another
+  // account (that produced the 597s stall): the newer request owns the session.
+  const superseded = new Error("client aborted before completion request");
+  const action = classifyRetryAction(superseded);
+  assert.equal(action.retryable, false);
+  assert.equal(action.switchAccount, false);
+  assert.equal(action.forceNewChat, false);
+  assert.equal(action.reason, "client_abort");
+
+  // The ClientAbortedError variants thrown by tryCreateStreamWithRetry must
+  // classify identically even without the requestAborted flag.
+  const variant = classifyRetryAction(
+    new ClientAbortedError("client aborted during stream creation"),
+  );
+  assert.equal(variant.retryable, false);
+  assert.equal(variant.switchAccount, false);
+  assert.equal(variant.reason, "client_abort");
+});
+
+test("classifyRetryAction: bare AbortError (idle/upstream) stays retryable", () => {
+  // Regression guard: only OUR "client aborted" markers are silent. A bare
+  // AbortError mid-stream is an idle/upstream timeout and must keep retrying.
+  const abort = Object.assign(new Error("This operation was aborted"), {
+    name: "AbortError",
+  });
+  const action = classifyRetryAction(abort);
+  assert.equal(action.retryable, true);
+  assert.equal(action.reason, "stream_aborted");
+});
+
+test("error classification keeps network and chat state out of rate limits", () => {
+  const network = new QwenNetworkError("network error");
+  assert.equal(getQwenErrorCode(network), "network_error");
+  const networkResult = classifyError(network);
+  assert.equal(networkResult.statusCode, 502);
+  assert.equal(networkResult.code, "upstream_unavailable");
+
+  const chatInProgress = new RetryableQwenStreamError(
+    "Qwen: The chat is in progress!",
+    2000,
+  );
+  chatInProgress.upstreamCode = "chat_in_progress";
+  assert.equal(getQwenErrorCode(chatInProgress), "chat_in_progress");
+  const chatResult = classifyError(chatInProgress);
+  assert.equal(chatResult.statusCode, 502);
+  assert.equal(chatResult.code, "upstream_unavailable");
 });
 
 test("classifyRetryAction: chat not exist is not treated as quota", () => {
@@ -310,6 +395,22 @@ test("throwFromSseUpstreamError maps any SSE error to RetryableQwenStreamError",
   assert.throws(
     () =>
       throwFromSseUpstreamError(
+        "RateLimited",
+        "Qwen: The chat is in progress!",
+      ),
+    (err: unknown) => {
+      assert.ok(err instanceof RetryableQwenStreamError);
+      assert.equal(
+        (err as RetryableQwenStreamError).upstreamCode,
+        "chat_in_progress",
+      );
+      return true;
+    },
+  );
+
+  assert.throws(
+    () =>
+      throwFromSseUpstreamError(
         "weird_new_code",
         "Completely novel upstream failure from tomorrow",
       ),
@@ -346,5 +447,61 @@ test("parseSseErrorFromBuffer extracts first data error chunk", () => {
       'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
     ),
     null,
+  );
+});
+
+test("classifyRetryAction: content moderation (data_inspection_failed) is not retryable", () => {
+  // Simulates the error thrown by throwFromSseUpstreamError for content moderation
+  const err = Object.assign(
+    new RetryableQwenStreamError(
+      "Qwen content moderation: data_inspection_failed: Aviso de segurança do conteúdo",
+      0,
+    ),
+    { upstreamCode: "data_inspection_failed", switchAccount: false },
+  );
+  const action = classifyRetryAction(err);
+
+  assert.equal(action.retryable, false);
+  assert.equal(action.switchAccount, false);
+  assert.equal(action.forceNewChat, false);
+  assert.equal(action.retryWithFullPrompt, false);
+  assert.equal(action.reason, "content_moderation");
+});
+
+test("classifyError: content moderation maps to ValidationError with content_policy_violation", () => {
+  const err = Object.assign(
+    new RetryableQwenStreamError(
+      "Qwen content moderation: data_inspection_failed: Aviso de segurança do conteúdo: os dados inseridos podem conter conteúdo inadequado!",
+      0,
+    ),
+    { upstreamCode: "data_inspection_failed" },
+  );
+  const classified = classifyError(err);
+
+  assert.equal(classified.statusCode, 400);
+  assert.equal((classified as any).code, "content_policy_violation");
+  assert.ok(classified.message.includes("Content rejected by Qwen safety filter"));
+  assert.ok(!classified.message.includes("data_inspection_failed"));
+});
+
+test("throwFromSseUpstreamError: data_inspection_failed throws non-retryable moderation error", () => {
+  assert.throws(
+    () =>
+      throwFromSseUpstreamError(
+        "data_inspection_failed",
+        "Aviso de segurança do conteúdo: os dados inseridos podem conter conteúdo inadequado!",
+      ),
+    (err: unknown) => {
+      const e = err as RetryableQwenStreamError & { switchAccount?: boolean };
+      assert.ok(e instanceof RetryableQwenStreamError);
+      assert.ok(e.message.includes("content moderation"));
+      assert.equal(e.upstreamCode, "data_inspection_failed");
+      assert.equal(e.switchAccount, false);
+      // Verify classifyRetryAction marks it non-retryable
+      const action = classifyRetryAction(e);
+      assert.equal(action.retryable, false);
+      assert.equal(action.reason, "content_moderation");
+      return true;
+    },
   );
 });

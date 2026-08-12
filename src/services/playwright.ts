@@ -18,6 +18,7 @@ import { hasActiveAccountLease } from "../core/account-concurrency.ts";
 import { config } from "../core/config.ts";
 import { maskEmail } from "../core/logger.ts";
 import { Mutex } from "../core/mutex.ts";
+import { getAccountsByPriority } from "../core/account-priority.ts";
 import {
   clearFingerprintCache,
   getFingerprintProfile,
@@ -83,7 +84,7 @@ export function buildChromiumLaunchArgs(viewport: {
     "--enable-webgl",
     "--ignore-gpu-blocklist",
     "--enable-accelerated-2d-canvas",
-    `--window-size=800,800`,
+    `--window-size=${viewport.width},${viewport.height}`,
     "--disable-extensions",
     "--disable-background-networking",
     "--disable-sync",
@@ -176,6 +177,7 @@ async function acquireAccountMutex(
 // Per-account browser contexts and pages
 const accountContexts = new Map<string, BrowserContext>();
 const accountPages = new Map<string, Page>();
+const cachedUserAgents = new Map<string, string>();
 
 // Header cache per account
 interface AccountHeaderCache {
@@ -215,6 +217,13 @@ const ACCOUNT_PAGE_OPERATION_TIMEOUT_MS = config.timeouts.page;
 const SESSION_PROBE_NAVIGATION_TIMEOUT_MS = 15_000;
 /** Grace period for the intercepted completion request after the send is triggered. */
 const HEADER_CAPTURE_TRIGGER_GRACE_MS = 15_000;
+/**
+ * First-send grace is short: the page is cold and the bx SDK has not computed
+ * its tokens yet, so a cold page almost never produces a request from the first
+ * send. Fail it fast and let the retry loop reload + re-send against the warm
+ * SDK instead of stalling the boot for the full 15s.
+ */
+const FIRST_TRIGGER_GRACE_MS = 3_000;
 /**
  * Sends (the initial one plus re-triggers) header capture may spend on getting a
  * completion request that actually carries the bx headers. The in-page SDK can
@@ -705,10 +714,22 @@ function getHeaderCache(accountId: string): AccountHeaderCache {
   return cache;
 }
 
+/**
+ * Headers the capture must produce before a request may reach Qwen. With
+ * QWEN_SEND_BX_UA=false (default, matching the real client) only the
+ * cookie/UA/bx-v trio is required; bx-ua/bx-umidtoken are captured but never
+ * injected, so their absence must not gate the pipeline.
+ */
+function requiredAntiBotHeaderKeys(): string[] {
+  return config.qwen.sendBxUa
+    ? ["cookie", "user-agent", "bx-ua", "bx-umidtoken", "bx-v"]
+    : ["cookie", "user-agent", "bx-v"];
+}
+
 export function hasRequiredQwenHeaders(
   headers: Record<string, string>,
 ): boolean {
-  return Boolean(headers["bx-ua"]?.trim() && headers["bx-umidtoken"]?.trim());
+  return requiredAntiBotHeaderKeys().every((key) => Boolean(headers[key]?.trim()));
 }
 
 /**
@@ -720,8 +741,9 @@ export function assertAntiBotHeaders(
   headers: Record<string, string>,
   label: string,
 ): void {
-  const required = ["cookie", "user-agent", "bx-ua", "bx-umidtoken", "bx-v"];
-  const missing = required.filter((key) => !headers[key]?.trim());
+  const missing = requiredAntiBotHeaderKeys().filter(
+    (key) => !headers[key]?.trim(),
+  );
   if (missing.length > 0) {
     throw new Error(
       `${label} missing required browser anti-bot headers: ${missing.join(", ")}`,
@@ -736,11 +758,11 @@ export function assertAntiBotHeaders(
  */
 async function tryLightweightCookieRefresh(
   accountId: string,
+  cache: AccountHeaderCache,
 ): Promise<boolean> {
   const page = accountPages.get(accountId);
   if (!page || page.isClosed()) return false;
 
-  const cache = getHeaderCache(accountId);
   if (!hasRequiredQwenHeaders(cache.headers)) return false;
 
   try {
@@ -798,16 +820,21 @@ export async function getBasicHeaders(accountId: string): Promise<{
   );
   try {
     touchAccountActivity(accountId);
-    // Get real user agent from browser
-    let userAgent = config.auth.userAgent;
+    // Get real user agent from browser. It is constant for the lifetime of the
+    // context, so it is fetched once and cached per account to avoid a CDP
+    // round-trip on every request.
+    let userAgent = cachedUserAgents.get(accountId) ?? "";
     try {
-      userAgent = await withTimeout(
-        page.evaluate(() => navigator.userAgent),
-        config.timeouts.page,
-        `User-agent lookup timed out for ${accountId}`,
-      );
+      if (!userAgent) {
+        userAgent = await withTimeout(
+          page.evaluate(() => navigator.userAgent),
+          config.timeouts.page,
+          `User-agent lookup timed out for ${accountId}`,
+        );
+        cachedUserAgents.set(accountId, userAgent);
+      }
     } catch {
-      // Use default
+      userAgent = config.auth.userAgent;
     }
 
     const cache = getHeaderCache(accountId);
@@ -819,12 +846,11 @@ export async function getBasicHeaders(accountId: string): Promise<{
       hadUsableHeaders &&
       headersAge < HEADER_CACHE_TTL * HEADER_REFRESH_THRESHOLD
     ) {
-      await tryLightweightCookieRefresh(accountId);
+      await tryLightweightCookieRefresh(accountId, cache);
       const bxUa = cache.headers["bx-ua"];
       const bxUmidtoken = cache.headers["bx-umidtoken"];
-      const bxV = cache.headers["bx-v"] || "2.5.36";
+      const bxV = cache.headers["bx-v"] || "2.5.37";
       const cookie = await getCookies(accountId);
-      touchAccountActivity(accountId);
       return { cookie, userAgent, bxV, bxUa, bxUmidtoken };
     }
 
@@ -832,21 +858,25 @@ export async function getBasicHeaders(accountId: string): Promise<{
     // Check if we can skip full recapture by verifying cookie validity.
     // This avoids expensive browser interaction when the 30-day token is fresh.
     if (hadUsableHeaders && headersAge > HEADER_CACHE_TTL) {
-      const [authValid, shortestValid] = await Promise.all([
-        isAuthTokenValid(accountId),
-        isShortestCookieValid(accountId),
-      ]);
-
-      if (authValid && shortestValid) {
+      // A single CDP cookies() snapshot feeds both validity checks and the
+      // cookie string (previously 3 round-trips: 2 validators + lightweight
+      // refresh).
+      const cookieSnapshot = await getCookieSnapshot(accountId);
+      if (
+        cookieSnapshot &&
+        isAuthTokenValidFrom(cookieSnapshot) &&
+        isShortestCookieValidFrom(cookieSnapshot)
+      ) {
         // Token is still valid - just refresh cookies, keep cached headers
-        await tryLightweightCookieRefresh(accountId);
+        const cookie = cookieSnapshot
+          .map((c) => `${c.name}=${c.value}`)
+          .join("; ");
+        cookieCaches.set(accountId, { cookie, timestamp: Date.now() });
         const bxUa = cache.headers["bx-ua"];
         const bxUmidtoken = cache.headers["bx-umidtoken"];
-        const bxV = cache.headers["bx-v"] || "2.5.36";
-        const cookie = await getCookies(accountId);
+        const bxV = cache.headers["bx-v"] || "2.5.37";
         // Update lastRefresh to extend the cache
         cache.lastRefresh = Date.now();
-        touchAccountActivity(accountId);
         console.log(
           `🔄 [Playwright] Skipped header recapture for ${accountId} (token still valid, age: ${Math.round(headersAge / 60000)} min)`,
         );
@@ -885,7 +915,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
 
     if (!hasRequiredQwenHeaders(cache.headers)) {
       console.log(
-        `🔄 [Playwright] Missing bx-ua/bx-umidtoken for ${accountId}, triggering header interception...`,
+        `🔄 [Playwright] Missing required anti-bot headers for ${accountId}, triggering header interception...`,
       );
       try {
         await refreshHeadersInternal(accountId);
@@ -909,7 +939,6 @@ export async function getBasicHeaders(accountId: string): Promise<{
     // Read cookie AFTER all refreshes (re-login may have updated it)
     const cookie = await getCookies(accountId);
 
-    touchAccountActivity(accountId);
     return {
       cookie,
       userAgent,
@@ -924,7 +953,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
 
 export async function initPlaywrightForAccount(
   account: QwenAccount,
-  headless = false,
+  headless = true,
   browserType: BrowserType = "chromium",
 ): Promise<void> {
   if (accountPages.has(account.id)) {
@@ -954,6 +983,15 @@ export async function initPlaywrightForAccount(
     // Use playwright-extra with stealth if available, otherwise regular chromium
     const engineToUse = chromiumWithStealth || engine;
 
+    // [Dodo] LAUNCHER_WINDOW_X validation and args injection
+    const launchArgs = buildChromiumLaunchArgs(fingerprint.viewport);
+    const cx = parseInt(process.env.LAUNCHER_WINDOW_X as string);
+    const cy = parseInt(process.env.LAUNCHER_WINDOW_Y as string);
+    if (!isNaN(cx) && !isNaN(cy)) {
+      launchArgs.push(`--window-position=${cx - 400},${cy - 550}`);
+    }
+    launchArgs.push("--start-minimized");
+
     const acctContext = await engineToUse.launchPersistentContext(profilePath, {
       headless: false,
       channel,
@@ -972,7 +1010,7 @@ export async function initPlaywrightForAccount(
         "sec-ch-ua-platform": '"Windows"',
       },
       ignoreDefaultArgs: ["--enable-automation", "--enable-blink-features"],
-      args: buildChromiumLaunchArgs(fingerprint.viewport),
+      args: launchArgs,
     });
 
     try {
@@ -1000,6 +1038,7 @@ export async function initPlaywrightForAccount(
       acctPage.setDefaultNavigationTimeout(config.timeouts.navigation);
       accountContexts.set(account.id, acctContext);
       accountPages.set(account.id, acctPage);
+      installContextDeathHandlers(account.id, acctContext, acctPage);
       touchAccountActivity(account.id);
 
       // Check if already logged in
@@ -1010,10 +1049,8 @@ export async function initPlaywrightForAccount(
           c.name.toLowerCase().includes("session"),
       );
 
-      let didLogin = false;
       if (!hasAuthCookie && account.email && account.password) {
         await loginToQwen(account.id, account.email, account.password);
-        didLogin = true;
       }
 
       // Navigate to the stable chat page to validate the session and populate cookies.
@@ -1033,7 +1070,6 @@ export async function initPlaywrightForAccount(
                 `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
               );
               await loginToQwen(account.id, account.email, account.password);
-              didLogin = true;
             } else {
               console.warn(
                 `[Playwright] Session expired for account ${account.id} but no credentials available.`,
@@ -1419,7 +1455,6 @@ export async function captureQwenHeaders(
 
   touchAccountActivity(accountId);
   const cache = getHeaderCache(accountId);
-  await restoreWindow(page);
 
   return new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -1429,6 +1464,8 @@ export async function captureQwenHeaders(
     let sawIncompleteHeaders = false;
     let headersCaptured = false;
     let retriggerRequested = false;
+    let lastAttemptGraceTimedOut = false;
+    let graceTimeoutCount = 0;
     let wakeTriggerLoop: (() => void) | undefined;
     const deadline = Date.now() + timeoutMs;
     const remainingBudgetMs = () => deadline - Date.now();
@@ -1454,6 +1491,21 @@ export async function captureQwenHeaders(
       // A trigger loop parked between attempts has to be released, otherwise it
       // stays pending forever behind an already-settled capture.
       wakeTrigger();
+      // When a trigger grace period expired (page fired no completion request),
+      // log the OUTCOME so the operator can see whether the retry loop
+      // recovered or the account is being rotated into cooldown — the bare
+      // per-attempt warning leaves that dangling.
+      if (graceTimeoutCount > 0) {
+        if (headersCaptured) {
+          console.log(
+            `✅ [Playwright] Header capture recovered for ${accountId} after ${graceTimeoutCount} silent send(s)`,
+          );
+        } else {
+          console.warn(
+            `❌ [Playwright] Header capture failed for ${accountId} after ${graceTimeoutCount} silent send(s): ${error?.message ?? "no completion request"}`,
+          );
+        }
+      }
       if (error) reject(error);
       else resolve();
     };
@@ -1490,29 +1542,37 @@ export async function captureQwenHeaders(
     // or the UI is blocked and never will. Waiting out the whole header budget
     // past this point only stalls the caller and, during account init, buys a
     // five-minute cooldown for nothing.
-    const armTriggerGrace = () => {
+    const armTriggerGrace = (attempt: number) => {
       // A capture that already landed is only waiting out its settle delay, so
       // the send that produced it must not arm a deadline against it.
       if (settled || headersCaptured) return;
       if (timeout) clearTimeout(timeout);
+      // The FIRST send types into a page whose bx SDK may not have computed its
+      // tokens yet — a cold page almost never produces a request from the first
+      // send, so waiting out the full 15s grace is pure stall. Fail it fast and
+      // let the retry loop reload + re-send (warm SDK) instead. Never exceed the
+      // caller-provided grace (tests inject tiny windows and expect them held).
+      const firstSendGraceMs = Math.min(FIRST_TRIGGER_GRACE_MS, triggerGraceMs);
       timeout = setTimeout(
-        async () => {
+        () => {
+          graceTimeoutCount++;
           console.warn(
-            `⏱️  [Playwright] Header capture produced no completion request for ${accountId}`,
+            `⏱️  [Playwright] Header capture produced no completion request for ${accountId} (attempt ${graceTimeoutCount})`,
           );
-          try {
-             const html = await page.content();
-             const fsModule = await import('fs');
-             fsModule.writeFileSync('qwen_debug_dump.html', html);
-             console.warn('🚨 [DEBUG] HTML DUMPED TO qwen_debug_dump.html 🚨');
-          } catch(e) {
-             console.error('DUMP ERROR:', e);
-          }
-          settle(
-            captureFailure(new Error(`Header capture timed out for ${accountId}`)),
-          );
+          // The page is likely blocked by WAF/captcha or in a broken state.
+          // Instead of settling immediately, trigger a retry with a page
+          // reload so the next attempt starts from a fresh state.
+          lastAttemptGraceTimedOut = true;
+          retriggerRequested = true;
+          wakeTrigger();
         },
-        Math.max(1, Math.min(remainingBudgetMs(), triggerGraceMs)),
+        Math.max(
+          1,
+          Math.min(
+            remainingBudgetMs(),
+            attempt === 1 ? firstSendGraceMs : triggerGraceMs,
+          ),
+        ),
       );
     };
 
@@ -1587,21 +1647,17 @@ export async function captureQwenHeaders(
     };
 
     /** Type the probe message and send it, then wait out the grace window. */
-    const triggerSend = async () => {
+    const triggerSend = async (attempt: number) => {
       if (settled) return;
       await clearVisibleChallenge(page);
       if (settled) return;
 
       const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
-      try {
-        await page.focus(inputSelector, { timeout: 5000 });
-        if (settled) return;
-        await page.fill(inputSelector, "", { timeout: 5000 });
-        if (settled) return;
-        await page.type(inputSelector, "a", { delay: 100, timeout: 5000 });
-      } catch (err) {
-        console.warn("[Playwright] Timeout ignorado de caixa de texto");
-      }
+      await page.focus(inputSelector);
+      if (settled) return;
+      await page.fill(inputSelector, "");
+      if (settled) return;
+      await page.type(inputSelector, "a", { delay: 100 });
       if (settled) return;
       await sleep(2000);
       if (settled) return;
@@ -1640,7 +1696,7 @@ export async function captureQwenHeaders(
         await page.keyboard.press("Enter");
       }
 
-      armTriggerGrace();
+      armTriggerGrace(attempt);
     };
 
     /** Park until the interception asks for another send, or the capture ends. */
@@ -1665,9 +1721,15 @@ export async function captureQwenHeaders(
         armOverallDeadline();
 
         try {
-          if (attempt === 1) await openChatPage();
+          // Navigate on the first attempt, or reload when the previous attempt
+          // produced no completion request (the page is likely blocked by
+          // WAF/captcha and needs a fresh load).
+          if (attempt === 1 || lastAttemptGraceTimedOut) {
+            lastAttemptGraceTimedOut = false;
+            await openChatPage();
+          }
           if (settled) return;
-          await triggerSend();
+          await triggerSend(attempt);
         } catch (error) {
           console.warn(
             `❌ [Playwright] Error triggering header capture for ${accountId}: ${getErrorMessage(error)}`,
@@ -1688,9 +1750,13 @@ export async function captureQwenHeaders(
         if (remainingBudgetMs() <= 0) break;
       }
 
-      // Attempts (or the budget) spent on requests that never carried the
-      // headers: a page stuck that way has to fail instead of sending forever.
-      settle(incompleteHeadersError());
+      // Distinguish between "requests fired but lacked bx headers" and "no
+      // request fired at all" so the caller gets an actionable diagnosis.
+      settle(
+        sawIncompleteHeaders
+          ? incompleteHeadersError()
+          : new Error(`Header capture timed out for ${accountId}`),
+      );
     };
 
     armOverallDeadline();
@@ -1719,59 +1785,65 @@ export async function captureQwenHeaders(
   });
 }
 
+type CookieSnapshot = Awaited<ReturnType<BrowserContext["cookies"]>>;
+
+/**
+ * Fetch the account context cookies once. The snapshot feeds every validity
+ * check and the cookie string build, avoiding repeated CDP round-trips.
+ */
+async function getCookieSnapshot(
+  accountId: string,
+): Promise<CookieSnapshot | null> {
+  const context = accountContexts.get(accountId);
+  if (!context) return null;
+
+  try {
+    return await withTimeout(
+      context.cookies(),
+      config.timeouts.page,
+      `Cookie snapshot timed out for ${accountId}`,
+    );
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Check if the auth token cookie is still valid.
  * Used to skip unnecessary header recaptures when the token is still fresh.
  * Returns true if the token cookie exists and is not expired.
  */
-async function isAuthTokenValid(accountId: string): Promise<boolean> {
-  try {
-    const context = accountContexts.get(accountId);
-    if (!context) return false;
+function isAuthTokenValidFrom(cookies: CookieSnapshot): boolean {
+  const tokenCookie = cookies.find(
+    (c) =>
+      c.name === "token" && (c.domain === ".qwen.ai" || c.domain === "qwen.ai"),
+  );
 
-    const cookies = await context.cookies();
-    const tokenCookie = cookies.find(
-      (c) => c.name === "token" && (c.domain === ".qwen.ai" || c.domain === "qwen.ai"),
-    );
+  if (!tokenCookie) return false;
 
-    if (!tokenCookie) return false;
+  // Session cookie (expires = -1) is valid as long as browser is open
+  if (tokenCookie.expires === -1) return true;
 
-    // Session cookie (expires = -1) is valid as long as browser is open
-    if (tokenCookie.expires === -1) return true;
-
-    // Check if expired (with 5-min safety margin)
-    const now = Date.now();
-    const expiresAt = tokenCookie.expires * 1000;
-    return expiresAt > now + 5 * 60 * 1000;
-  } catch {
-    return false;
-  }
+  // Check if expired (with 5-min safety margin)
+  const expiresAt = tokenCookie.expires * 1000;
+  return expiresAt > Date.now() + 5 * 60 * 1000;
 }
 
 /**
  * Check if the shortest-lived cookie (acw_tc) is still valid.
  * This is the 24-min cookie that gates some requests.
  */
-async function isShortestCookieValid(accountId: string): Promise<boolean> {
-  try {
-    const context = accountContexts.get(accountId);
-    if (!context) return false;
+function isShortestCookieValidFrom(cookies: CookieSnapshot): boolean {
+  const acwCookie = cookies.find(
+    (c) => c.name === "acw_tc" && c.domain.includes("qwen.ai"),
+  );
 
-    const cookies = await context.cookies();
-    const acwCookie = cookies.find(
-      (c) => c.name === "acw_tc" && c.domain.includes("qwen.ai"),
-    );
+  if (!acwCookie) return true; // If missing, assume OK (will be refreshed by browser)
 
-    if (!acwCookie) return true; // If missing, assume OK (will be refreshed by browser)
+  if (acwCookie.expires === -1) return true;
 
-    if (acwCookie.expires === -1) return true;
-
-    const now = Date.now();
-    const expiresAt = acwCookie.expires * 1000;
-    return expiresAt > now + 60 * 1000; // 1-min safety margin
-  } catch {
-    return false;
-  }
+  const expiresAt = acwCookie.expires * 1000;
+  return expiresAt > Date.now() + 60 * 1000; // 1-min safety margin
 }
 
 async function refreshHeadersInternal(
@@ -2010,6 +2082,41 @@ export function getIdlePlaywrightAccountIds(idleMs: number): string[] {
   });
 }
 
+/**
+ * Order context-eviction candidates so the MOST valuable contexts survive.
+ * Pure ordering: unranked accounts first, then ranked accounts from LOWEST to
+ * HIGHEST priority, then oldest activity. The priority file is kept in
+ * "most recently successful first" order (markAccountSuccessful moves the
+ * account to the top), so the accounts actually being used stay warm instead
+ * of the last-created ones from the warmup (which previously made the FIRST
+ * used account pay a ~12s context recreation).
+ */
+export function orderContextsForEviction(
+  accountIds: string[],
+  priorityRank: (id: string) => number | undefined,
+  activity: (id: string) => number,
+): string[] {
+  return [...accountIds].sort((a, b) => {
+    const rankA = priorityRank(a) ?? Number.MAX_SAFE_INTEGER;
+    const rankB = priorityRank(b) ?? Number.MAX_SAFE_INTEGER;
+    if (rankA !== rankB) return rankB - rankA; // lowest priority first
+    return (activity(a) ?? 0) - (activity(b) ?? 0); // oldest activity first
+  });
+}
+
+function priorityOrderForEviction(accountIds: string[]): string[] {
+  const ranked = getAccountsByPriority(accountIds.map((id) => ({ id })));
+  const rank = new Map<string, number>();
+  for (const [index, account] of ranked.entries()) {
+    rank.set(account.id, index);
+  }
+  return orderContextsForEviction(
+    accountIds,
+    (id) => rank.get(id),
+    (id) => lastAccountActivity.get(id) ?? 0,
+  );
+}
+
 export async function closeIdlePlaywrightAccounts(
   idleMs: number,
 ): Promise<number> {
@@ -2023,12 +2130,12 @@ export async function closeIdlePlaywrightAccounts(
     return 0;
   }
 
-  const candidates = getIdlePlaywrightAccountIds(idleMs)
-    .map((accountId) => ({
-      accountId,
-      lastActivity: lastAccountActivity.get(accountId) ?? 0,
-    }))
-    .sort((a, b) => a.lastActivity - b.lastActivity);
+  const candidates = priorityOrderForEviction(
+    getIdlePlaywrightAccountIds(idleMs),
+  ).map((accountId) => ({
+    accountId,
+    lastActivity: lastAccountActivity.get(accountId) ?? 0,
+  }));
 
   let closed = 0;
   for (const candidate of candidates) {
@@ -2063,15 +2170,16 @@ export async function evictIdlePlaywrightContextsToLimit(): Promise<number> {
   if (max <= 0) return 0;
   if (accountPages.size <= max) return 0;
 
-  const candidates = Array.from(accountPages.keys())
-    .map((accountId) => ({
-      accountId,
-      mutex: accountMutexes.get(accountId),
-      lastActivity: lastAccountActivity.get(accountId) ?? 0,
-    }))
-    .filter((candidate) => candidate.mutex?.isIdle())
-    .filter((candidate) => !isAccountServingStream(candidate.accountId))
-    .sort((a, b) => a.lastActivity - b.lastActivity);
+  const candidates = priorityOrderForEviction(
+    Array.from(accountPages.keys()).filter((accountId) => {
+      const mutex = accountMutexes.get(accountId);
+      return mutex?.isIdle() && !isAccountServingStream(accountId);
+    }),
+  ).map((accountId) => ({
+    accountId,
+    mutex: accountMutexes.get(accountId),
+    lastActivity: lastAccountActivity.get(accountId) ?? 0,
+  }));
 
   let closed = 0;
   for (const candidate of candidates) {
@@ -2139,6 +2247,26 @@ export async function keepAlivePlaywrightAccount(
 }
 
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
+
+/**
+ * A renderer crash ("page.evaluate: Target crashed") or browser death leaves
+ * a zombie account entry: page.isClosed() can stay false while every page
+ * operation fails, so the account would keep failing until something else
+ * clears the maps. Forget the state (and best-effort close) on death so the
+ * next use re-initializes cleanly — the same proven path as an evicted context.
+ */
+export function installContextDeathHandlers(
+  accountId: string,
+  context: BrowserContext,
+  page: Page,
+): void {
+  const onDeath = (): void => {
+    cleanupPlaywrightAccountState(accountId);
+    void closePlaywrightContextBestEffort(accountId, context).catch(() => {});
+  };
+  context.on("close", onDeath);
+  page.on("crash", onDeath);
+}
 
 function cleanupPlaywrightAccountState(accountId: string): void {
   accountContexts.delete(accountId);
@@ -2273,21 +2401,6 @@ export function registerPlaywrightAccountForTests(
   lastAccountActivity.set(accountId, lastActivityAt);
 }
 
-export function getPlaywrightStatus(): Record<
-  string,
-  { initialized: boolean; hasHeaders: boolean }
-> {
-  const status: Record<string, { initialized: boolean; hasHeaders: boolean }> =
-    {};
-  for (const [accountId, cache] of headerCaches.entries()) {
-    status[accountId] = {
-      initialized: accountPages.has(accountId),
-      hasHeaders: !!cache.headers["bx-ua"],
-    };
-  }
-  return status;
-}
-
 // ─── Token TTL Diagnostics ───────────────────────────────────────────────────
 
 export interface CookieDiagnostic {
@@ -2409,22 +2522,17 @@ export async function getTokenDiagnostics(
   };
 }
 
-
-// [Dodo] Funcoes extras para esconder as janelas (CDP protocol)
+// [Dodo] Funções CDP para gerenciar o estado da janela
 export async function minimizeWindow(page: any): Promise<void> {
-  try {
-    const cdp = await page.context().newCDPSession(page);
-    const { windowId } = await cdp.send("Browser.getWindowForTarget");
-    await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "minimized" } });
-    await cdp.detach();
-  } catch (err) {}
+  const cdp = await page.context().newCDPSession(page);
+  const { windowId } = await cdp.send("Browser.getWindowForTarget");
+  await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "minimized" } });
+  await cdp.detach();
 }
 
 export async function restoreWindow(page: any): Promise<void> {
-  try {
-    const cdp = await page.context().newCDPSession(page);
-    const { windowId } = await cdp.send("Browser.getWindowForTarget");
-    await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } });
-    await cdp.detach();
-  } catch (err) {}
+  const cdp = await page.context().newCDPSession(page);
+  const { windowId } = await cdp.send("Browser.getWindowForTarget");
+  await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } });
+  await cdp.detach();
 }

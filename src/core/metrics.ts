@@ -1,9 +1,9 @@
 import { EventEmitter } from "events";
 import { config } from "./config.js";
-import { getHeapUsageSnapshot } from "./memory-usage.js";
+import { getHeapUsageSnapshot, getRssUsageSnapshot } from "./memory-usage.js";
 
-// [Dodo] Mapeamento em tempo real de tokens consumidos por conta
 export const accountTokenUsage: Record<string, { prompt: number, completion: number, total: number }> = {};
+
 interface MetricPoint {
   value: number;
   timestamp: number;
@@ -60,6 +60,11 @@ export class Metrics extends EventEmitter {
         "Heap used percent vs heap_size_limit",
       ],
       ["memory.rss", "gauge", "Resident set size (bytes)"],
+      [
+        "memory.rss.usage_percent",
+        "gauge",
+        "RSS as percent of total system memory (RAM pressure signal)",
+      ],
 
       // Cache metrics
       ["cache.set", "counter", "Cache set operations"],
@@ -136,18 +141,14 @@ export class Metrics extends EventEmitter {
     if (!metric || metric.type !== "counter") return;
 
     const key = labels ? JSON.stringify(labels) : "default";
-    const current = metric.values.get(key)?.value || 0;
-    metric.values.set(key, {
-      value: current + value,
-      timestamp: Date.now(),
-      labels,
-    });
-    this.emit("metric", {
-      name,
-      type: "counter",
-      value: current + value,
-      labels,
-    });
+    // Mutate in place to avoid reallocating a MetricPoint on every increment.
+    const point = metric.values.get(key);
+    if (point) {
+      point.value += value;
+      point.timestamp = Date.now();
+    } else {
+      metric.values.set(key, { value, timestamp: Date.now(), labels });
+    }
   }
 
   gauge(name: string, value: number, labels?: Record<string, string>): void {
@@ -155,8 +156,13 @@ export class Metrics extends EventEmitter {
     if (!metric || metric.type !== "gauge") return;
 
     const key = labels ? JSON.stringify(labels) : "default";
-    metric.values.set(key, { value, timestamp: Date.now(), labels });
-    this.emit("metric", { name, type: "gauge", value, labels });
+    const point = metric.values.get(key);
+    if (point) {
+      point.value = value;
+      point.timestamp = Date.now();
+    } else {
+      metric.values.set(key, { value, timestamp: Date.now(), labels });
+    }
   }
 
   histogram(
@@ -169,29 +175,35 @@ export class Metrics extends EventEmitter {
 
     const key = labels ? JSON.stringify(labels) : "default";
     const existing = metric.values.get(key);
-    const data = existing?.value || {
-      count: 0,
-      sum: 0,
-      buckets: new Map<number, number>(),
-    };
+    // Reuse the stored aggregate object instead of re-wrapping it each call.
+    let data: { count: number; sum: number; buckets: Map<number, number> };
+    if (existing && typeof existing.value === "object" && existing.value !== null) {
+      data = existing.value as { count: number; sum: number; buckets: Map<number, number> };
+    } else {
+      data = { count: 0, sum: 0, buckets: new Map<number, number>() };
+    }
 
-    if (typeof data === "object" && data !== null) {
-      data.count++;
-      data.sum += value;
-      for (const bucket of metric.histogramBuckets || []) {
-        data.buckets.set(
-          bucket,
-          (data.buckets.get(bucket) || 0) + (value <= bucket ? 1 : 0),
-        );
+    data.count++;
+    data.sum += value;
+    const buckets = metric.histogramBuckets;
+    if (buckets) {
+      for (let i = 0; i < buckets.length; i++) {
+        const bucket = buckets[i];
+        if (value <= bucket) {
+          data.buckets.set(bucket, (data.buckets.get(bucket) || 0) + 1);
+        } else if (!data.buckets.has(bucket)) {
+          // Keep every bucket present for stable output, but skip redundant writes.
+          data.buckets.set(bucket, 0);
+        }
       }
     }
 
-    metric.values.set(key, {
-      value: data as any,
-      timestamp: Date.now(),
-      labels,
-    });
-    this.emit("metric", { name, type: "histogram", value, labels });
+    if (existing) {
+      existing.value = data as any;
+      existing.timestamp = Date.now();
+    } else {
+      metric.values.set(key, { value: data as any, timestamp: Date.now(), labels });
+    }
   }
 
   startCollection(): void {
@@ -204,11 +216,13 @@ export class Metrics extends EventEmitter {
 
   private collectSystemMetrics(): void {
     const heap = getHeapUsageSnapshot();
+    const rss = getRssUsageSnapshot();
     this.gauge("memory.heap.used", heap.heapUsed);
     this.gauge("memory.heap.total", heap.heapTotal);
     this.gauge("memory.heap.limit", heap.heapSizeLimit);
     this.gauge("memory.heap.usage_percent", heap.usagePercent);
     this.gauge("memory.rss", heap.rss);
+    this.gauge("memory.rss.usage_percent", rss.usagePercent);
   }
 
   get(name: string, labels?: Record<string, string>): MetricPoint | null {
@@ -224,12 +238,37 @@ export class Metrics extends EventEmitter {
       output += `# HELP ${metric.name} ${metric.help}\n`;
       output += `# TYPE ${metric.name} ${metric.type}\n`;
 
-      for (const [key, point] of metric.values) {
-        const labelsStr = point.labels
-          ? `{${Object.entries(point.labels)
-              .map(([k, v]) => `${k}="${v}"`)
-              .join(",")}}`
-          : "";
+      for (const point of metric.values.values()) {
+        const labelPairs = point.labels
+          ? Object.entries(point.labels).map(([k, v]) => `${k}="${v}"`)
+          : [];
+        const labelsStr = labelPairs.length ? `{${labelPairs.join(",")}}` : "";
+
+        if (
+          metric.type === "histogram" &&
+          typeof point.value === "object" &&
+          point.value !== null
+        ) {
+          // Histogram points store a {count, sum, buckets} aggregate; emitting
+          // it raw produced "[object Object]" (invalid Prometheus exposition).
+          const data = point.value as {
+            count: number;
+            sum: number;
+            buckets: Map<number, number>;
+          };
+          const bucketPrefix = labelPairs.length
+            ? `${labelPairs.join(",")},`
+            : "";
+          const sortedBuckets = [...data.buckets.keys()].sort((a, b) => a - b);
+          for (const bucket of sortedBuckets) {
+            output += `${metric.name}_bucket{${bucketPrefix}le="${bucket}"} ${data.buckets.get(bucket)} ${point.timestamp}\n`;
+          }
+          output += `${metric.name}_bucket{${bucketPrefix}le="+Inf"} ${data.count} ${point.timestamp}\n`;
+          output += `${metric.name}_sum${labelsStr} ${data.sum} ${point.timestamp}\n`;
+          output += `${metric.name}_count${labelsStr} ${data.count} ${point.timestamp}\n`;
+          continue;
+        }
+
         output += `${metric.name}${labelsStr} ${point.value} ${point.timestamp}\n`;
       }
     }

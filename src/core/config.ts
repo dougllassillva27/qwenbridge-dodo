@@ -17,7 +17,11 @@ const envSchema = z
       .default(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
       ),
-    QWEN_BX_V: z.string().default("2.5.36"),
+    QWEN_BX_V: z.string().default("2.5.37"),
+    // The real chat.qwen.ai client sends ONLY bx-v on API requests (no
+    // bx-ua/bx-umidtoken headers — the WAF carries them as cookies). Set true
+    // to restore the legacy behavior of injecting the captured bx-ua tokens.
+    QWEN_SEND_BX_UA: z.string().default("false"),
     PLAYWRIGHT_HEADLESS: z.string().default("true"),
     PLAYWRIGHT_BROWSER: z
       .enum(["chromium", "chrome", "edge"])
@@ -27,6 +31,13 @@ const envSchema = z
     PLAYWRIGHT_IDLE_CONTEXT_TTL_MS: z.string().default("60000"),
     PLAYWRIGHT_JS_HEAP_MB: z.string().default("256"),
     PLAYWRIGHT_LOW_MEMORY_FLAGS: z.string().default("true"),
+    // Keep only 1 warm context by default (user preference over failover speed):
+    // after warmup exactly one browser stays open for immediate use; any extra
+    // context (simultaneous use / failover hop) is closed once idle. The cap
+    // only evicts IDLE contexts — busy mutexes and active streams are never
+    // touched, so concurrent accounts each keep their own context while serving.
+    // Tradeoff: an account whose context was evicted pays a context recreation
+    // on its next use (set higher, e.g. 3, to keep failover hops warm).
     PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("1"),
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("true"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
@@ -44,8 +55,16 @@ const envSchema = z
     HEADERS_TIMEOUT: z.string().default("60000"),
     TIME_TO_FIRST_BYTE: z.string().default("60000"),
     IDLE_STREAM_TIMEOUT: z.string().default("60000"),
+    // Deadline for the FIRST upstream chunk on thinking models (the reasoning
+    // idle of 600s is for gaps AFTER data flows; a stream that produced
+    // nothing in this window is dead and should fail fast, retryable).
+    QWEN_FIRST_CHUNK_TIMEOUT: z.string().default("180000"),
     TOTAL_REQUEST_TIMEOUT: z.string().default("600000"),
-    REASONING_MODEL_TIMEOUT: z.string().default("600000"),
+    // Mid-stream silence window for thinking models: 3 min with ZERO upstream
+    // bytes is a dead stream (WAF swallow / dropped connection) — fail fast and
+    // let the retry policy rotate accounts. Flowing reasoning chunks RESET this
+    // timer, so legitimate slow thinking is never cut; only total silence is.
+    REASONING_MODEL_TIMEOUT: z.string().default("180000"),
     CACHE_TTL: z.string().default("3600"),
     RESPONSE_TTL: z.string().default("1800"),
     CACHE_COMPRESSION_ENABLED: z.string().default("true"),
@@ -65,11 +84,31 @@ const envSchema = z
     RETRY_ON_UNKNOWN_UPSTREAM: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS_MAX: z.string().default("2"),
+    MAX_TOOL_CALLS_PER_TURN: z.string().default("8"),
+    QWEN_REPEATED_TOOL_CALL_WARN: z.string().default("2"),
     ACCOUNT_MAX_CONCURRENT_STREAMS: z.string().default("1"),
     ACCOUNT_BUSY_WAIT_MS: z.string().default("30000"),
+    // Cap for the "wait forever" account-lease queue (thread owner / last
+    // usable account): the queue previously had NO deadline, so a stuck lease
+    // holder made the next turn wait up to ~600s. A generous finite cap keeps
+    // the wait far above the normal 30s but still bounded.
+    ACCOUNT_QUEUE_WAIT_FOREVER_CAP_MS: z.string().default("120000"),
+    // Hard deadline for one stream-acquire attempt. A dead account (upstream
+    // swallows the completion fetch) otherwise chains metadata/header timeouts
+    // for minutes; this fails the attempt visibly so the retry loop switches.
+    ACQUIRE_DEADLINE_MS: z.string().default("120000"),
+    ACCOUNT_LEASE_MAX_DURATION_MS: z.string().default("600000"),
     ACCOUNT_INIT_FAILURE_COOLDOWN_MS: z.string().default("300000"),
+    STREAM_DISCONNECT_GRACE_MS: z
+      .string()
+      .regex(/^\d+$/, "STREAM_DISCONNECT_GRACE_MS must be a number")
+      .default("4000"),
     CHAT_IN_PROGRESS_RETRY_DELAY_MS: z.string().default("2000"),
-    CHAT_IN_PROGRESS_BUSY_MS: z.string().default("5000"),
+    // Temporarily-busy window after a chat_in_progress: long enough to absorb
+    // the upstream chat settle (measured ~1-2s), short enough that the next
+    // turn of the sticky owner is not pushed to a cold account with a full
+    // context replay (8s caused a needless 13.3s hop in the 20:04 session).
+    CHAT_IN_PROGRESS_BUSY_MS: z.string().default("4000"),
     MID_STREAM_FAILOVER_THRESHOLD: z.string().default("2"),
     MID_STREAM_FAILOVER_BUSY_MS: z.string().default("60000"),
 
@@ -90,6 +129,10 @@ const envSchema = z
     SESSION_KEEP_ALIVE_IDLE_MS: z.string().default("120000"),
     SESSION_KEEP_ALIVE_NAVIGATION_INTERVAL_MS: z.string().default("480000"),
     API_KEY: z.string().default(""),
+    // Static x-ratelimit-* response headers (OpenAI-shaped, doc §5.2). The proxy
+    // does not enforce a token/request quota; these exist for SDK/tool parsing.
+    RATE_LIMIT_REQUESTS: z.string().default("5000"),
+    RATE_LIMIT_TOKENS: z.string().default("200000"),
   })
 ;
 
@@ -100,6 +143,10 @@ export const config = {
     port: parseInt(env.PORT),
     host: env.HOST,
     internalHost: env.INTERNAL_HOST,
+    rateLimit: {
+      requests: parseInt(env.RATE_LIMIT_REQUESTS),
+      tokens: parseInt(env.RATE_LIMIT_TOKENS),
+    },
   },
   logging: {
     chatRequests: env.CHAT_REQUEST_LOG === "true",
@@ -147,6 +194,7 @@ export const config = {
     idleStreamTimeout: parseInt(env.IDLE_STREAM_TIMEOUT),
     totalRequestTimeout: parseInt(env.TOTAL_REQUEST_TIMEOUT),
     reasoningModelTimeout: parseInt(env.REASONING_MODEL_TIMEOUT),
+    firstChunkTimeout: parseInt(env.QWEN_FIRST_CHUNK_TIMEOUT),
   },
   cache: {
     defaultTTL: parseInt(env.CACHE_TTL),
@@ -191,13 +239,48 @@ export const config = {
     ),
     autoRetryMalformedTools: env.RETRY_AUTO_MALFORMED_TOOLS !== "false",
     autoRetryMalformedToolsMax: Math.max(1, parseInt(env.RETRY_AUTO_MALFORMED_TOOLS_MAX)),
+    maxToolCallsPerTurn: Math.max(0, parseInt(env.MAX_TOOL_CALLS_PER_TURN)),
+    repeatedToolCallWarnThreshold: Math.max(
+      1,
+      parseInt(env.QWEN_REPEATED_TOOL_CALL_WARN),
+    ),
   },
   concurrency: {
     maxStreamsPerAccount: Math.max(1, parseInt(env.ACCOUNT_MAX_CONCURRENT_STREAMS)),
-    busyWaitMs: Math.max(0, parseInt(env.ACCOUNT_BUSY_WAIT_MS)),
+    busyWaitMs: Math.max(
+      0,
+      Number.isFinite(parseInt(env.ACCOUNT_BUSY_WAIT_MS as string))
+        ? parseInt(env.ACCOUNT_BUSY_WAIT_MS as string)
+        : 30_000,
+    ),
+    /** Bound for the "wait forever" lease queue (default 2 min). */
+    queueWaitForeverCapMs: Math.max(
+      0,
+      Number.isFinite(parseInt(env.ACCOUNT_QUEUE_WAIT_FOREVER_CAP_MS as string))
+        ? parseInt(env.ACCOUNT_QUEUE_WAIT_FOREVER_CAP_MS as string)
+        : 120_000,
+    ),
+    /** Hard deadline for one stream-acquire attempt (default 2 min). */
+    acquireDeadlineMs: Math.max(
+      0,
+      Number.isFinite(parseInt(env.ACQUIRE_DEADLINE_MS as string))
+        ? parseInt(env.ACQUIRE_DEADLINE_MS as string)
+        : 120_000,
+    ),
+    /** Safety net: force-release leases held longer than this (default 10 min). */
+    leaseMaxDurationMs: Math.max(
+      0,
+      parseInt(env.ACCOUNT_LEASE_MAX_DURATION_MS),
+    ),
     initFailureCooldownMs: Math.max(
       30_000,
       parseInt(env.ACCOUNT_INIT_FAILURE_COOLDOWN_MS),
+    ),
+  },
+  stream: {
+    disconnectGraceMs: Math.max(
+      0,
+      parseInt(env.STREAM_DISCONNECT_GRACE_MS),
     ),
   },
 
@@ -226,6 +309,8 @@ export const config = {
       parseInt(env.QWEN_MAX_PERSONALIZATION_BYTES),
     ),
     deleteAllChatsOnShutdown: env.DELETE_ALL_CHATS_ON_SHUTDOWN === "true",
+    /** Send the captured bx-ua/bx-umidtoken headers (real client does NOT). */
+    sendBxUa: env.QWEN_SEND_BX_UA === "true",
   },
   contextMeter: {
     enabled: env.CONTEXT_METER_ENABLED === "true",

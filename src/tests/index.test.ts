@@ -63,10 +63,7 @@ test("Models endpoint returns live models and supported variants", async () => {
     assert.ok(Array.isArray(body.data));
     assert.ok(body.data.some((m: any) => m.id === "qwen3.6-plus"));
     assert.ok(body.data.some((m: any) => m.id === "qwen3.6-plus-fast"));
-    assert.equal(
-      body.data.some((m: any) => m.id === "qwen3.6-plus-thinking"),
-      false,
-    );
+    assert.ok(body.data.some((m: any) => m.id === "qwen3.6-plus-thinking"));
     assert.equal(
       body.data.some((m: any) => m.id === "qwen3.6-plus-no-thinking"),
       false,
@@ -667,7 +664,7 @@ test("API Key protection", async () => {
         "Should return 200 OK with correct API Key",
       );
 
-      // 4. Anthropic-style x-api-key also authenticates
+      // 4. x-api-key (bearer-style) also authenticates
       const req4 = new Request("http://localhost/v1/models", {
         headers: { "x-api-key": "test-api-key" },
       });

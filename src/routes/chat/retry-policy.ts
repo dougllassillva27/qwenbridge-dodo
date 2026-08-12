@@ -15,6 +15,7 @@ import {
 } from "../../services/qwen.ts";
 import {
   AuthError,
+  ClientAbortedError,
   NotFoundError,
   ValidationError,
 } from "../../core/errors.ts";
@@ -139,7 +140,13 @@ export function isClientAbortError(
   requestAborted = false,
 ): boolean {
   if (clientDisconnected || requestAborted) return true;
-  // Only treat as client abort when explicitly flagged as such by caller.
+  // Our own client-abort markers: the client disconnected OR a same-session
+  // retry superseded this request's lease during stream creation. A superseded
+  // request must die silently — the newer request owns the session, and
+  // retrying the old one resends full context on another account for nothing
+  // (and can queue indefinitely behind the new stream's lease).
+  if (err instanceof ClientAbortedError) return true;
+  if (err instanceof Error && err.message.includes("client aborted")) return true;
   // Bare AbortError mid-stream is usually idle/upstream timeout (retryable).
   return false;
 }
@@ -159,22 +166,50 @@ export function isInvalidInputError(err: unknown): boolean {
   );
 }
 
+/**
+ * Qwen content-safety moderation rejections (data_inspection_failed).
+ * These are deterministic: the same content will be rejected on any account,
+ * so retrying or switching accounts only wastes resources and time.
+ */
+export function isContentModerationError(err: unknown): boolean {
+  const code = errCode(err).toLowerCase();
+  const message = errMessage(err).toLowerCase();
+  return (
+    code === "data_inspection_failed" ||
+    message.includes("data_inspection_failed") ||
+    message.includes("conteúdo inadequado") ||
+    message.includes("inappropriate content") ||
+    message.includes("aviso de segurança do conteúdo") ||
+    message.includes("content safety")
+  );
+}
+
 /** Prefer a clean chat on the current account before paying the cost of replaying
  * the full context on another account. Callers keep their own per-request count. */
 export function shouldRetryInvalidInputOnSameAccount(
   reason: string,
   alreadyRetried: boolean,
 ): boolean {
-  return reason === "invalid_input" && !alreadyRetried;
+  return (
+    (reason === "invalid_input" || reason === "corrupted_chat_history") &&
+    !alreadyRetried
+  );
 }
 
-/** Keep one retry on the current account while an upstream generation settles;
- * subsequent chat_in_progress failures must be allowed to rotate accounts. */
+/** Keep TWO retries on the current account while an upstream generation
+ * settles. The tool loop fires the next turn the instant the previous one
+ * completes, and the upstream chat stays "in progress" for 2-4s after the
+ * terminal event — a single ~1.2s retry often loses that settle race, and
+ * escalating replays the FULL context on a cold account (~12s context reopen
+ * + captcha). Rotate only after the second failure. */
 export function shouldRetryChatInProgressOnSameAccount(
   reason: string,
-  alreadyRetried: boolean,
+  alreadyRetriedCount: number,
 ): boolean {
-  return reason === "chat_in_progress" && !alreadyRetried;
+  // Three same-chat retries: settle is usually 2-4s but was measured >6s after
+  // huge turns, and the escalation alternative (full-context replay on a cold
+  // account) is far more expensive than one more bounded wait.
+  return reason === "chat_in_progress" && alreadyRetriedCount < 3;
 }
 
 export function isAccountInitializationError(err: unknown): boolean {
@@ -287,6 +322,23 @@ export function isChatInProgressError(err: unknown): boolean {
 }
 
 /**
+ * Qwen rejects a model the account cannot serve with Not_Found: Model not found.
+ * This is deterministic per request — retrying on the same (or any) account
+ * with the same model can never succeed, so it must terminate instead of
+ * burning retry attempts / account cooldowns and ending in a misleading 502.
+ */
+export function isModelNotFoundError(err: unknown): boolean {
+  const code = errCode(err).toLowerCase();
+  const message = errMessage(err).toLowerCase();
+  return (
+    (code === "not_found" &&
+      message.includes("model") &&
+      message.includes("not found")) ||
+    message.includes("model not found")
+  );
+}
+
+/**
  * Browser fetch and ReadableStream failures often arrive as plain Error
  * instances, especially when the stream is consumed outside Playwright.
  * Keep this matcher narrow so local programming errors are not retried as
@@ -368,6 +420,7 @@ export function classifyRetryAction(
   }
 
   const message = errMessage(err).toLowerCase();
+  const code = errCode(err).toLowerCase();
   if (isAccountInitializationError(err)) {
     return {
       retryable: true,
@@ -382,6 +435,7 @@ export function classifyRetryAction(
   }
 
   if (
+    code === "account_busy" ||
     message.includes("waiting for a free slot") ||
     message.includes("busy: timed out")
   ) {
@@ -397,10 +451,12 @@ export function classifyRetryAction(
 
   // Specialized recoveries first (even if wrapped as RetryableQwenStreamError)
     // Corrupted chat history must win over broad "invalid input" matches.
+    // Try a fresh chat on the SAME account first — the corruption is in the
+    // upstream parent chain, not the account. Only rotate if the rebuild fails.
     if (isCorruptedChatHistoryError(err)) {
       return {
         retryable: true,
-        switchAccount: true,
+        switchAccount: false,
         forceNewChat: true,
         retryWithFullPrompt: true,
         retryAfterMs: 0,
@@ -437,6 +493,34 @@ export function classifyRetryAction(
         retryAfterMs: typed.retryAfterMs ?? baseDelayMs,
         reason: "invalid_input",
         dropFiles: typed.dropFiles,
+      };
+    }
+
+    // Content moderation rejections are deterministic — retrying on any
+    // account with the same content produces the same rejection. Fail fast
+    // instead of burning through accounts, personalization syncs and captchas.
+    if (isContentModerationError(err)) {
+      return {
+        retryable: false,
+        switchAccount: false,
+        forceNewChat: false,
+        retryWithFullPrompt: false,
+        retryAfterMs: 0,
+        reason: "content_moderation",
+      };
+    }
+
+    // Model not found is equally deterministic (the account cannot serve the
+    // requested model). Fail fast with a clear error instead of retrying the
+    // same doomed request and cooldown-marking accounts for ~5 hours.
+    if (isModelNotFoundError(err)) {
+      return {
+        retryable: false,
+        switchAccount: false,
+        forceNewChat: false,
+        retryWithFullPrompt: false,
+        retryAfterMs: 0,
+        reason: "model_not_found",
       };
     }
 
@@ -574,6 +658,15 @@ export function throwFromSseUpstreamError(
   errCode: string,
   errDetails: string,
 ): never {
+  const detailsLower = errDetails.toLowerCase();
+  // Qwen sometimes labels the chat-state error as RateLimited. Normalize it
+  // before retry/logging so it cannot be mistaken for account quota exhaustion.
+  const normalizedErrCode =
+    detailsLower.includes("chat is in progress") ||
+    detailsLower.includes("the chat is in progress")
+      ? "chat_in_progress"
+      : errCode;
+
   // Log upstream errors. Expected retryable codes (quota, rate limit, chat
   // state) use warn level to avoid noisy stderr stack traces in production.
   const expectedCodes = new Set([
@@ -582,17 +675,19 @@ export function throwFromSseUpstreamError(
     "rate_limit_exceeded",
     "chat_in_progress",
     "invalid_input",
+    "data_inspection_failed",
   ]);
-  if (expectedCodes.has(errCode.toLowerCase())) {
-    logger.warn(`[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`);
+  if (expectedCodes.has(normalizedErrCode.toLowerCase())) {
+    logger.warn(
+      `[Upstream] Error | ${normalizedErrCode} | ${errDetails.substring(0, 200)}`,
+    );
   } else {
     console.error(
-      `[Upstream] Error | ${errCode} | ${errDetails.substring(0, 200)}`,
+      `[Upstream] Error | ${normalizedErrCode} | ${errDetails.substring(0, 200)}`,
     );
   }
 
   // invalid_input keeps dedicated wording for logs/tests (not "chat is not exist")
-  const detailsLower = errDetails.toLowerCase();
   const isChatMissing =
     detailsLower.includes("is not exist") ||
     detailsLower.includes("does not exist") ||
@@ -625,6 +720,38 @@ export function throwFromSseUpstreamError(
     throw error;
   }
 
+  // Content moderation rejections are deterministic — the same content will
+  // be rejected on every account. Throw as RetryableQwenStreamError so it
+  // propagates through the streaming catch blocks, but classifyRetryAction
+  // will mark it non-retryable.
+  if (isContentModerationError({ upstreamCode: normalizedErrCode, message: errDetails })) {
+    logger.warn(
+      `[Upstream] Content moderation rejection (not retrying): ${normalizedErrCode}`,
+    );
+    const error = new RetryableQwenStreamError(
+      `Qwen content moderation: ${normalizedErrCode}: ${errDetails.substring(0, 200)}`,
+      0,
+    ) as RetryableStreamError;
+    error.upstreamCode = normalizedErrCode;
+    error.switchAccount = false;
+    throw error;
+  }
+
+  // A model the account cannot serve is a deterministic rejection too — never
+  // transparently retrofit this doomed model request on the same/other account.
+  if (isModelNotFoundError({ upstreamCode: normalizedErrCode, message: errDetails })) {
+    logger.warn(
+      `[Upstream] Model not available (not retrying): ${normalizedErrCode}`,
+    );
+    const error = new RetryableQwenStreamError(
+      `Qwen model not found: ${normalizedErrCode}: ${errDetails.substring(0, 200)}`,
+      0,
+    ) as RetryableStreamError;
+    error.upstreamCode = normalizedErrCode;
+    error.switchAccount = false;
+    throw error;
+  }
+
   if (
     errDetails.includes("FAIL_SYS_USER_VALIDATE") ||
     errDetails.includes("RGV587_ERROR") ||
@@ -639,7 +766,7 @@ export function throwFromSseUpstreamError(
     throw error;
   }
 
-  throw toRetryableStreamError(errCode, errDetails);
+  throw toRetryableStreamError(normalizedErrCode, errDetails);
 }
 
 export function parseSseErrorFromBuffer(

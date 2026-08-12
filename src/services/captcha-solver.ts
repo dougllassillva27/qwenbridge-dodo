@@ -1,6 +1,6 @@
 import type { Locator, Page } from "playwright";
 import { humanDrag, sleep } from "./human-behavior.ts";
-import { minimizeWindow, restoreWindow } from "./playwright.ts";
+
 
 export const BAXIA_DIALOG_SELECTOR = ".baxia-dialog";
 export const BAXIA_CONTENT_SELECTOR = "#baxia-dialog-content";
@@ -335,9 +335,6 @@ export async function solveBaxiaCaptcha(
   const detected = await detectBaxiaChallenge(page, waitForMs);
   if (!detected) return false;
 
-  // [Dodo] Captcha detectado! Trazer janela para frente para resolução manual ou via IA
-  await restoreWindow(page);
-
   const scope = detected.target.iframeSelector ? "iframe" : "top_level";
   let lastGeometry: { track?: number; slider?: number; distance?: number } = {};
   let lastReason = "unknown";
@@ -419,8 +416,6 @@ export async function solveBaxiaCaptcha(
           },
           true,
         );
-        // [Dodo] Captcha resolvido! Esconder janela novamente
-        await minimizeWindow(page);
         return true;
       }
 
@@ -468,8 +463,6 @@ export async function solveBaxiaCaptcha(
     },
     true,
   );
-  // [Dodo] Captcha falhou! Esconder janela novamente
-  await minimizeWindow(page);
   return false;
 }
 

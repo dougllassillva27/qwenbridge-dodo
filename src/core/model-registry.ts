@@ -1,5 +1,5 @@
 const defaultContextWindow = 1_048_576;
-const defaultMaxOutputTokens = 8192;
+const defaultMaxOutputTokens = 65536;
 const defaultMaxThinkingTokens = 16384;
 export const MAX_PAYLOAD_SIZE = 50 * 1024 * 1024;
 
@@ -71,9 +71,16 @@ function accountKey(accountId?: string): string {
 }
 
 export function getBaseModelId(modelId: string): string {
+  // [Dodo] Remove tags de contexto personalizadas (ex: [1M], [32k]) antes do parsing
+  let cleanId = modelId.trim().replace(/\[.*?\]$/, "").trim();
+
   // `-fast` is the only public variant. Keep legacy suffixes normalized for
   // account metadata lookups and old clients, without publishing them.
-  return modelId.replace(/-(?:fast|no-thinking|thinking)$/, "");
+  // Check `-no-thinking` before `-thinking` (the former ends with the latter).
+  if (cleanId.endsWith("-no-thinking")) return cleanId.slice(0, -12);
+  if (cleanId.endsWith("-thinking")) return cleanId.slice(0, -9);
+  if (cleanId.endsWith("-fast")) return cleanId.slice(0, -5);
+  return cleanId;
 }
 
 function getAccountRegistry(accountId?: string): Map<string, RegistryEntry> {

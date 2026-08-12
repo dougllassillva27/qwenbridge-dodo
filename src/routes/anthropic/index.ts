@@ -167,6 +167,7 @@ app.post("/v1/messages", async (c) => {
           currentBlockType: null as string | null,
           requestModel,
           inputTokens: 0,
+          inReasoning: false,
         };
 
         // Timeout handler

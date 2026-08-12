@@ -23,6 +23,11 @@ test("config exposes only Playwright/thread-native current auth and context sett
   assert.equal(typeof config.playwright.initBatchSize, "number");
   assert.equal(typeof config.playwright.contextCloseTimeoutMs, "number");
   assert.equal(typeof config.playwright.idleContextTtlMs, "number");
+  // Warm-context lifecycle: 1 warm context by default (browsers close quickly
+  // after capture; concurrent streams keep their own context — the cap only
+  // evicts idle ones) + 60s idle TTL for the overflow contexts.
+  assert.equal(config.playwright.maxActiveContexts, 1);
+  assert.equal(config.playwright.idleContextTtlMs, 60_000);
   assert.equal(typeof config.playwright.jsHeapMb, "number");
   assert.equal(typeof config.playwright.lowMemoryFlags, "boolean");
   assert.equal(typeof config.oss.multipartThresholdBytes, "number");
@@ -34,6 +39,17 @@ test("config exposes only Playwright/thread-native current auth and context sett
   assert.equal(typeof config.sessionKeeper.idleMs, "number");
   assert.equal(typeof config.sessionKeeper.navigationIntervalMs, "number");
   assert.ok(config.concurrency.initFailureCooldownMs >= 30_000);
+
+  // Mid-stream silence window: 3 min with ZERO upstream bytes = dead stream.
+  // Must not exceed the first-chunk deadline — flowing reasoning chunks reset
+  // this timer, so only total silence is cut.
+  assert.equal(config.timeouts.reasoningModelTimeout, 180_000);
+  assert.equal(config.timeouts.firstChunkTimeout, 180_000);
+  // chat_in_progress busy window: production default is 4s (short enough that
+  // the sticky owner's next turn is not pushed to a cold account; measured
+  // settle ~1-2s). .env.test overrides it to 100ms for suite speed.
+  assert.ok(config.retry.chatInProgressBusyMs <= 4_000);
+  assert.ok(config.retry.chatInProgressBusyMs >= 100);
 });
 
 test("config keeps Qwen anti-bot static config limited to bx-v fallback", () => {

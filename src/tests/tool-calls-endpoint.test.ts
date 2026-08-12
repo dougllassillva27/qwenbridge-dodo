@@ -1,8 +1,3 @@
-/**
- * Copyright (c) 2025 johngbl
- * QwenBridge - OpenAI-compatible proxy for Qwen
- */
-
 import test from "node:test";
 import assert from "node:assert";
 
@@ -96,6 +91,44 @@ function createSseResponse(events: string[]): Response {
   });
 
   return new Response(stream, { status: 200 });
+}
+
+function setupCountingFetchMock(
+  handler: (callIndex: number) => Response | Promise<Response>,
+) {
+  const originalFetch = globalThis.fetch;
+  let callIndex = 0;
+  globalThis.fetch = async (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+  ) => {
+    const urlStr =
+      typeof input === "string"
+        ? input
+        : "url" in input
+          ? input.url
+          : String(input);
+    if (urlStr.includes("chat.qwen.ai")) {
+      if (urlStr.includes("/api/models")) {
+        return new Response(
+          JSON.stringify({ data: [{ id: "qwen3.6-plus", owned_by: "qwen" }] }),
+          { status: 200 },
+        );
+      }
+      if (!urlStr.includes("/api/v2/chat/completions")) {
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }
+      callIndex += 1;
+      return handler(callIndex);
+    }
+    return originalFetch(input, init);
+  };
+  return {
+    restore: () => {
+      globalThis.fetch = originalFetch;
+    },
+    getCompletionCalls: () => callIndex,
+  };
 }
 
 async function collectStreamResult(res: Response) {
@@ -341,7 +374,7 @@ test("non-stream: valid tool_call becomes structured tool_calls", async () => {
   }
 });
 
-test("non-stream: undeclared tool name in literal example is preserved as text", async () => {
+test("non-stream: undeclared tool name in literal example is preserved as text without surfacing a warning", async () => {
   const literal =
     '<tool_call>{"name":"nome_da_ferramenta","arguments":{"parametro":"valor"}}</tool_call>';
   const restore = setupFetchMock(() =>
@@ -369,9 +402,19 @@ test("non-stream: undeclared tool name in literal example is preserved as text",
 
     const body = await res.json();
     const message = body.choices[0].message;
-    assert.strictEqual(message.content, literal);
     assert.strictEqual(message.tool_calls, undefined);
     assert.strictEqual(body.choices[0].finish_reason, "stop");
+    // The undeclared call is preserved as literal text. The bridge must NOT
+    // inject its own warning into the user-visible reply — any correction is
+    // sent to Qwen through the auto-retry upstream prompt instead.
+    assert.ok(
+      message.content.includes(literal),
+      "literal tool call should be preserved in content",
+    );
+    assert.ok(
+      !message.content.includes("[WARNING"),
+      "no bridge-authored warning expected: " + message.content,
+    );
   } finally {
     restore();
   }
@@ -542,6 +585,68 @@ test("stream: write_file arguments are emitted incrementally before tool close",
     assert.strictEqual(result.finishReason, "tool_calls");
   } finally {
     restore();
+  }
+});
+
+test("stream: malformed tool call without successful tools is recovered via auto-retry (2 streams)", async () => {
+  // Mirrors the log's read_file corruption (`arguments> {` instead of
+  // `"arguments": {`): use a variant the in-stream repair cannot fix, so the
+  // block is unparseable, no tool call is emitted, and the auto-retry asks the
+  // model again and the second stream is re-parsed.
+  const malformed =
+    '<tool_call>{"name":"read_file"(oops){"path":"a.txt"}}</tool_call>';
+  const valid =
+    '<tool_call>{"name":"read_file","arguments":{"path":"a.txt"}}</tool_call>';
+
+  let completionCalls = 0;
+  const mock = setupCountingFetchMock((callIndex) => {
+    if (callIndex === 1) {
+      return createSseResponse([
+        `data: ${JSON.stringify({
+          choices: [{ delta: { phase: "answer", content: malformed } }],
+        })}`,
+      ]);
+    }
+    return createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content: valid } }],
+      })}`,
+    ]);
+  });
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: TOOLS,
+        messages: [{ role: "user", content: "read a file" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const result = await collectStreamResult(res);
+    completionCalls = mock.getCompletionCalls();
+    assert.strictEqual(result.finishReason, "tool_calls");
+    assert.strictEqual(
+      result.toolCalls.length,
+      1,
+      "expected a recovered tool call",
+    );
+    assert.strictEqual(result.toolCalls[0].name, "read_file");
+    assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
+      path: "a.txt",
+    });
+    assert.ok(
+      completionCalls >= 2,
+      `expected at least 2 completion calls to prove auto-retry, got ${completionCalls}`,
+    );
+  } finally {
+    mock.restore();
   }
 });
 

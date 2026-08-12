@@ -4,14 +4,17 @@ import {
   QwenBridgeError,
   InternalError,
   ValidationError,
-  AuthError,
   UpstreamRateLimit,
   UpstreamError,
+  ClientAbortedError,
 } from "../core/errors.js";
 import {
+  QwenNetworkError,
+  QwenUpstreamUnavailableError,
   RetryableQwenStreamError,
   QwenUpstreamError,
   QwenSessionExpiredError,
+  getQwenErrorCode,
 } from "../services/qwen.js";
 
 /**
@@ -19,11 +22,45 @@ import {
  * Preserves specific error metadata when possible.
  */
 export function classifyError(err: unknown): QwenBridgeError {
-  if (err instanceof RetryableQwenStreamError) {
-    if (err.retryAfterMs > 0 && err.retryAfterMs < 60000) {
-      return new UpstreamRateLimit(err.message);
-    }
+  // These errors are retryable upstream failures, not rate-limit responses.
+  // RetryableQwenStreamError inherits UpstreamRateLimit for legacy behavior,
+  // so classify the concrete network/upstream types before that base class.
+  if (
+    err instanceof QwenNetworkError ||
+    err instanceof QwenUpstreamUnavailableError
+  ) {
     return new UpstreamError(err.message);
+  }
+
+  if (err instanceof RetryableQwenStreamError) {
+    const upstreamCode = getQwenErrorCode(err)?.toLowerCase() || "";
+    const message = err.message.toLowerCase();
+
+    // Content moderation rejections are client-side content policy violations,
+    // not upstream failures. Return 400 so the client can adjust its input.
+    if (
+      upstreamCode === "data_inspection_failed" ||
+      message.includes("content moderation") ||
+      message.includes("data_inspection_failed")
+    ) {
+      const moderationError = new ValidationError(
+        `Content rejected by Qwen safety filter: ${err.message.replace(/^Qwen content moderation: [^:]+: /, "")}`,
+      );
+      (moderationError as any).code = "content_policy_violation";
+      return moderationError;
+    }
+
+    const isActualRateLimit =
+      upstreamCode === "quota_limit" ||
+      upstreamCode === "ratelimited" ||
+      upstreamCode === "rate_limit" ||
+      upstreamCode === "rate_limit_exceeded" ||
+      message.includes("quota") ||
+      message.includes("upper limit for today");
+
+    return isActualRateLimit
+      ? new UpstreamRateLimit(err.message)
+      : new UpstreamError(err.message);
   }
 
   if (err instanceof QwenUpstreamError) {
@@ -36,6 +73,23 @@ export function classifyError(err: unknown): QwenBridgeError {
 
   if (err instanceof QwenBridgeError) {
     return err;
+  }
+
+  // Client disconnected before the stream could be created. This is not a
+  // server fault: the request has no listener anymore. Classify it as a silent
+  // abort (499) so callers neither emit a 500 nor count it as an error.
+  if (err instanceof Error && err.message.includes("client aborted")) {
+    return new ClientAbortedError(err.message);
+  }
+
+  // Capacity saturation on the bridge's own account pool: this is a "try again
+  // later" condition, not a server fault. A hard 500 is misleading for the
+  // client (and for the retry classifier it hides a recoverable slot wait).
+  if (
+    err instanceof Error &&
+    (err as Error & { code?: string }).code === "account_busy"
+  ) {
+    return new UpstreamRateLimit(err.message);
   }
 
   if (err instanceof ZodError) {

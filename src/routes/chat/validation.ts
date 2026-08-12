@@ -4,9 +4,10 @@
  * Description: Request parsing and validation for chat completions
  */
 
-import { Context } from "hono";
-import { OpenAIRequest, Message } from "../../utils/types.ts";
-import { QwenFileEntry, processImagesForQwen } from "../upload.ts";
+import type { Context } from "hono";
+import type { OpenAIRequest, Message } from "../../utils/types.ts";
+import type { QwenFileEntry } from "../upload.ts";
+import { processImagesForQwen } from "../upload.ts";
 import { logger, isToolcallDebugEnabled } from "../../core/logger.js";
 import { config } from "../../core/config.ts";
 import { getBasicHeaders } from "../../services/auth-playwright.ts";
@@ -14,6 +15,7 @@ import { buildToolInstructions } from "../../tools/instructions.ts";
 import {
   mapClientModelToQwen,
   stripThinkingSuffix,
+  type ReasoningMode,
 } from "../../core/model-alias.ts";
 
 // Tag literals split to avoid proxy parser misinterpretation
@@ -34,6 +36,7 @@ export interface ParsedRequest {
   shouldParseToolCalls: boolean;
   modelId: string;
   enableThinking: boolean;
+  reasoningMode: ReasoningMode;
   messageCount: number;
   currentMessageCount: number;
 }
@@ -64,12 +67,12 @@ export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
   const toolInstructions = injectToolInstructions(body);
   const shouldParseToolCalls = toolInstructions.length > 0;
 
-  const systemPrompt = systemPromptParts.join("");
+  const systemPrompt = systemPromptParts.join("") + buildResponseFormatInstruction(body);
   const prompt = promptParts.join("");
   const currentPrompt = currentPromptParts.join("");
 
-  // Thinking suffixes + GPT/Claude aliases → Qwen ids (shared with Responses/Anthropic)
-  const { baseModel, enableThinking } = stripThinkingSuffix(body.model);
+  // Thinking suffixes → base model + reasoning mode
+  const { baseModel, enableThinking, reasoningMode } = stripThinkingSuffix(body.model);
   const modelId = mapClientModelToQwen(baseModel);
 
   return {
@@ -86,6 +89,7 @@ export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
     shouldParseToolCalls,
     modelId,
     enableThinking,
+    reasoningMode,
     messageCount: promptParts.length,
     currentMessageCount: currentPromptParts.length,
   };
@@ -336,7 +340,9 @@ function logIncomingChatRequest(c: Context, body: OpenAIRequest): void {
     });
   }
 
-  if (!config.logging.chatRequests) return;
+  // The debug payload below scans every message (regex previews + JSON
+  // stringify), so skip building it unless it will actually be logged.
+  if (!config.logging.chatRequests || !logger.isLevelEnabled("debug")) return;
 
   const last = messages[messages.length - 1];
   const firstUser = messages.find((msg) => msg.role === "user");
@@ -419,6 +425,46 @@ function getCurrentPromptStartIndex(messages: Message[]): number {
   }
 
   return last;
+}
+
+// Structured outputs (doc §2.1 / checklist item 6): OpenAI's response_format
+// is not natively supported by the Qwen web API, so the schema/JSON-mode
+// constraint is enforced at the prompt level — the same approach as tools.
+// json_object demands a bare JSON object; json_schema embeds the schema with a
+// strict-mode note. Text mode (default) returns nothing and changes nothing.
+function buildResponseFormatInstruction(body: OpenAIRequest): string {
+  const bodyAny = body as any;
+  const rf = bodyAny?.response_format;
+  if (!rf || typeof rf !== "object") return "";
+
+  if (rf.type === "json_object") {
+    return (
+      "\n\n[OUTPUT FORMAT]\n" +
+      "Respond with a single valid JSON object only. " +
+      "Do not wrap it in markdown code fences and do not add any text " +
+      "before or after the JSON object."
+    );
+  }
+
+  if (rf.type === "json_schema" && rf.json_schema?.schema) {
+    const { name, description, schema, strict } = rf.json_schema;
+    const strictNote =
+      strict === true
+        ? "The output MUST strictly conform to the schema: every required property present and no extra properties.\n"
+        : "The output MUST conform to the following JSON schema.\n";
+    return (
+      "\n\n[OUTPUT FORMAT]\n" +
+      (name ? `Output schema name: ${name}\n` : "") +
+      (description ? `Schema description: ${description}\n` : "") +
+      strictNote +
+      "Respond with a single JSON object that matches this schema. " +
+      "Do not wrap it in markdown code fences and do not add any text " +
+      "before or after the JSON object.\n\n" +
+      `Schema:\n${JSON.stringify(schema, null, 2)}`
+    );
+  }
+
+  return "";
 }
 
 function injectToolInstructions(body: OpenAIRequest): string {

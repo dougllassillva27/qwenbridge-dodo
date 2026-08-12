@@ -9,10 +9,14 @@
  * - streaming.ts: response processing (SSE/JSON)
  */
 
-import { Context } from "hono";
+import type { Context } from "hono";
 import { parseRequestBody } from "./validation.ts";
 import { buildFinalContext } from "./context.ts";
 import { acquireUpstreamStream, acquireChatLock } from "./account.ts";
+import {
+  abortLeaseBySessionLabel,
+  hasUnemittedSessionStream,
+} from "../../core/account-concurrency.ts";
 import {
   processNonStreamingResponse,
   processStreamingResponse,
@@ -24,6 +28,7 @@ import { logger } from "../../core/logger.ts";
 import { getContextMeterHeaders, type ContextMeterMode } from "../../services/context-meter.ts";
 import {
   getLogicalThreadState,
+  invalidateLogicalThreadParent,
   RetryableQwenStreamError,
 } from "../../services/qwen.ts";
 import {
@@ -63,6 +68,7 @@ export async function chatCompletions(c: Context) {
       currentPrompt,
       modelId,
       enableThinking,
+      reasoningMode,
       allFiles,
       currentFiles,
       shouldParseToolCalls,
@@ -73,6 +79,14 @@ export async function chatCompletions(c: Context) {
     const declaredTools = Array.isArray((body as any).tools)
       ? (body as any).tools
       : [];
+
+    // Correlate arrival and dispatch: logged again on the 📤 line once the
+    // upstream stream (and its queue wait) is resolved.
+    const reqId = crypto.randomUUID().substring(0, 8);
+    const reqStartedAt = Date.now();
+    console.log(
+      `📥 [Chat] Incoming | req=${reqId} | ${body.model} | ${messages.length} msg(s) | stream=${isStream}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${allFiles.length ? ` | ${allFiles.length} file(s)` : ""}`,
+    );
 
     // Intercept image/video generation models: they bypass the text chat flow
     // and are handled by the native media pipeline (qwen-image-*, wan2.*).
@@ -156,20 +170,52 @@ export async function chatCompletions(c: Context) {
       ? "delta"
       : "full";
 
+    // Same-session latest-wins BEFORE the per-chat lock and BEFORE the stream
+    // acquisition: the client can fire the next turn while the previous stream
+    // is still open (streaming tool calls). Killing the stale generation first
+    // frees the account slot + chat lock immediately instead of queueing.
+    // onlyIfEmitted: a stream that has NOT emitted a chunk yet is protected —
+    // a parallel request (e.g. the client's title generation racing the main
+    // request) must not waste the main generation. In that case this request
+    // runs on its OWN chat (parallelEscape) instead of waiting on the main
+    // chat's lock for minutes.
+    let parallelEscape = false;
+    if (ctx.allowThreadReuse && ctx.sessionId) {
+      const superseded = abortLeaseBySessionLabel(ctx.sessionId, {
+        onlyIfEmitted: true,
+      });
+      const existingThread = getLogicalThreadState(ctx.sessionId);
+      const chatId = existingThread?.chatSessionId;
+      // Escape ONLY when an unemitted stream is actually active (a lease
+      // exists but was protected). No active lease (normal next turn) takes
+      // the regular path.
+      parallelEscape =
+        !!chatId && !superseded && hasUnemittedSessionStream(ctx.sessionId);
+      if (parallelEscape && logger.isLevelEnabled("info")) {
+        console.log(
+          `🔀 [Chat] Parallel escape | req=${reqId} | session=${ctx.sessionId} | chat=${chatId?.substring(0, 12)} | own chat`,
+        );
+      }
+      if (chatId && !parallelEscape) {
+        releaseChatLock = await acquireChatLock(chatId);
+      }
+    }
+
     let streamResult = await acquireUpstreamStream({
       finalPrompt,
       fullPrompt: fullPromptForRequest,
       isThinkingModel: ctx.isThinkingModel,
       model: modelId,
+      reasoningMode,
       contextModelId: modelId,
       shouldResetUpstreamThread: ctx.shouldResetUpstreamThread,
       allFiles: files,
       isNewSession: ctx.isNewSession,
       sessionId: ctx.sessionId,
       useThreadNative: ctx.useThreadNative,
-      updateLogicalThread: ctx.updateLogicalThread,
+      updateLogicalThread: parallelEscape ? false : ctx.updateLogicalThread,
       allowThreadReuse: ctx.allowThreadReuse,
-      forceNewChat: false,
+      forceNewChat: parallelEscape,
       preferredAccountId: undefined,
       messageCount: msgCount,
       fullMessageCount: parsed.messageCount,
@@ -178,6 +224,7 @@ export async function chatCompletions(c: Context) {
       contextMode: initialContextMode,
       requestSignal: c.req.raw.signal,
       messages,
+      parallelEscape,
     });
 
 
@@ -206,24 +253,19 @@ export async function chatCompletions(c: Context) {
       c.header(name, value);
     }
 
-    // Acquire per-chat lock now that we have a stream, to serialize concurrent
-    // writes to the same upstream Qwen chat session.
-    if (ctx.allowThreadReuse && ctx.sessionId) {
-      const existingThread = getLogicalThreadState(ctx.sessionId);
-      const chatId = existingThread?.chatSessionId;
-      if (chatId) {
-        releaseChatLock = await acquireChatLock(chatId);
-      }
-    }
-
+    // A full-context replay (account switch / missing thread parent) hides its
+    // real cost behind the thread-native delta numbers: surface it explicitly
+    // so the 📤 line shows what was actually sent upstream.
+    const replayed = streamResult.replayedFullContext === true;
     console.log(
-      `📤 [Chat] Request | ${streamResult.activeAccountLabel} | ${body.model} | ${msgCount} msg(s) | ${finalPrompt.length} chars | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""}`,
+      `📤 [Chat] Request | req=${reqId} | ${streamResult.activeAccountLabel} | ${body.model} | ${replayed ? parsed.messageCount : msgCount} msg(s) | ${replayed ? fullPromptForRequest.length : finalPrompt.length} chars${replayed ? " | full-replay" : ""} | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | +${Date.now() - reqStartedAt}ms`,
     );
 
     const onAssistantComplete: ((event: AssistantCompleteEvent) => Promise<void> | void) | undefined = undefined;
 
     const params = {
       c,
+      reqId,
       completionId: streamResult.completionId,
       stream: streamResult.stream,
       uiSessionId: streamResult.uiSessionId,
@@ -240,11 +282,18 @@ export async function chatCompletions(c: Context) {
         fullPrompt: fullPromptForRequest,
         isThinkingModel: ctx.isThinkingModel,
         contextModelId: modelId,
+        reasoningMode,
+        activeAccountId: streamResult.activeAccountId,
         allFiles: files,
         isNewSession: ctx.isNewSession,
         sessionId: ctx.sessionId,
         useThreadNative: ctx.useThreadNative,
-        updateLogicalThread: ctx.updateLogicalThread,
+        // A parallel request (own chat) must not rebind the session thread on
+        // mid-stream recovery — the main conversation owns it.
+        updateLogicalThread: parallelEscape
+          ? false
+          : ctx.updateLogicalThread,
+        parallelEscape,
         allowThreadReuse: ctx.allowThreadReuse,
         messageCount: msgCount,
         fullMessageCount: parsed.messageCount,
@@ -282,6 +331,10 @@ export async function chatCompletions(c: Context) {
               requestAborted: c.req.raw.signal.aborted,
             });
 
+            if (policy.reason === "corrupted_chat_history") {
+              invalidateLogicalThreadParent(ctx.sessionId);
+            }
+
             // Prefer explicit RetryableQwenStreamError OR generic retryable policy
             const canRetry =
               streamProcessingRetries > 0 &&
@@ -311,7 +364,7 @@ export async function chatCompletions(c: Context) {
             const retryChatInProgressOnSameAccount =
               shouldRetryChatInProgressOnSameAccount(
                 policy.reason,
-                chatInProgressSameAccountRetries > 0,
+                chatInProgressSameAccountRetries,
               );
             if (retryChatInProgressOnSameAccount) {
               chatInProgressSameAccountRetries++;
@@ -375,6 +428,31 @@ export async function chatCompletions(c: Context) {
               );
             }
 
+            // Same-session latest-wins before re-acquiring: protects an
+            // unemitted generation (parallel title request) which then runs on
+            // its own chat via retryParallelEscape.
+            let retryParallelEscape = false;
+            if (ctx.allowThreadReuse && ctx.sessionId) {
+              const superseded = abortLeaseBySessionLabel(ctx.sessionId, {
+                onlyIfEmitted: true,
+              });
+              const existingThread = getLogicalThreadState(ctx.sessionId);
+              const chatId = existingThread?.chatSessionId;
+              retryParallelEscape =
+                parallelEscape ||
+                (!!chatId &&
+                  !superseded &&
+                  hasUnemittedSessionStream(ctx.sessionId));
+              if (retryParallelEscape && logger.isLevelEnabled("info")) {
+                console.log(
+                  `🔀 [Chat] Parallel escape (retry) | req=${reqId} | session=${ctx.sessionId} | chat=${chatId?.substring(0, 12)} | own chat`,
+                );
+              }
+              if (chatId && !retryParallelEscape) {
+                releaseChatLock = await acquireChatLock(chatId);
+              }
+            }
+
             // Re-acquire stream with different account or a fresh upstream chat
             const newStreamResult = await acquireUpstreamStream({
               finalPrompt: retryFinalPrompt,
@@ -387,10 +465,12 @@ export async function chatCompletions(c: Context) {
               isNewSession: ctx.isNewSession,
               sessionId: ctx.sessionId,
               useThreadNative: ctx.useThreadNative,
-              updateLogicalThread: ctx.updateLogicalThread,
+              updateLogicalThread: retryParallelEscape
+                ? false
+                : ctx.updateLogicalThread,
               allowThreadReuse: ctx.allowThreadReuse,
               forceNewChat:
-                forceRetryNewChat || switchAccount,
+                forceRetryNewChat || switchAccount || retryParallelEscape,
               preferredAccountId: switchAccount
                 ? null
                 : currentStreamResult.activeAccountId,
@@ -405,6 +485,7 @@ export async function chatCompletions(c: Context) {
               contextMode: needsFullPromptOnRetry ? "replay" : initialContextMode,
               requestSignal: c.req.raw.signal,
               messages,
+              parallelEscape: retryParallelEscape,
             });
 
             if ("error" in newStreamResult) {
@@ -422,21 +503,13 @@ export async function chatCompletions(c: Context) {
             }
 
             console.log(
-              `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars | chat=${newStreamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry`,
+              `🔄 [Chat] Request routed | ${newStreamResult.activeAccountLabel} | ${body.model} | ${retryMessageCount} msg(s) | ${retryFinalPrompt.length} chars | chat=${newStreamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | retry | +${Date.now() - reqStartedAt}ms`,
             );
-
-            // Re-acquire chat lock for new stream
-            if (ctx.allowThreadReuse && ctx.sessionId) {
-              const existingThread = getLogicalThreadState(ctx.sessionId);
-              const chatId = existingThread?.chatSessionId;
-              if (chatId) {
-                releaseChatLock = await acquireChatLock(chatId);
-              }
-            }
 
             currentStreamResult = newStreamResult;
             currentParams = {
               c,
+              reqId,
               completionId: newStreamResult.completionId,
               stream: newStreamResult.stream,
               uiSessionId: newStreamResult.uiSessionId,
@@ -453,11 +526,16 @@ export async function chatCompletions(c: Context) {
                 fullPrompt: fullPromptForRequest,
                 isThinkingModel: ctx.isThinkingModel,
                 contextModelId: modelId,
+                reasoningMode,
+                activeAccountId: newStreamResult.activeAccountId,
                 allFiles: retryFiles,
                 isNewSession: ctx.isNewSession,
                 sessionId: ctx.sessionId,
                 useThreadNative: ctx.useThreadNative,
-                updateLogicalThread: ctx.updateLogicalThread,
+                updateLogicalThread: retryParallelEscape
+                  ? false
+                  : ctx.updateLogicalThread,
+                parallelEscape: retryParallelEscape,
                 allowThreadReuse: ctx.allowThreadReuse,
                 messageCount: retryMessageCount,
                 fullMessageCount: parsed.messageCount,

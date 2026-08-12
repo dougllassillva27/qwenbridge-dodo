@@ -7,10 +7,13 @@ function sanitizeAndBalance(input: string): {
   openBraces: number;
   openBrackets: number;
   recoveredUnclosedString: boolean;
+  /** Opening tokens `{`/`[` in the order they were opened (LIFO close order). */
+  openStack: string[];
 } {
   let out = "";
   let openBraces = 0;
   let openBrackets = 0;
+  let openStack: string[] = [];
   let inString = false;
   let escaped = false;
 
@@ -23,8 +26,11 @@ function sanitizeAndBalance(input: string): {
           const next4 = input.substring(i + 1, i + 5);
           out += /^[0-9a-fA-F]{4}$/.test(next4) ? "\\" + char : "\\\\" + char;
         } else if (["n", "r", "t"].includes(char)) {
-          const isWinPath =
-            /[a-zA-Z]:\\/i.test(input) || /[a-zA-Z]:\//i.test(input);
+          // Local check: only double-escape if the 2 chars before this
+          // backslash form a Windows drive letter + colon (e.g. C:\, D:/).
+          // Scanning the whole input causes false positives with URLs
+          // like https:// or paths embedded elsewhere in the string.
+          const isWinPath = i >= 2 && /[a-zA-Z]:/.test(input.substring(i - 2, i));
           const nextChar = input[i + 1] || "";
           out +=
             isWinPath && /^[a-zA-Z0-9]/.test(nextChar)
@@ -57,10 +63,22 @@ function sanitizeAndBalance(input: string): {
       else out += char;
     } else {
       out += char;
-      if (char === "{") openBraces++;
-      if (char === "}") openBraces--;
-      if (char === "[") openBrackets++;
-      if (char === "]") openBrackets--;
+      if (char === "{") {
+        openBraces++;
+        openStack.push("{");
+      }
+      if (char === "}") {
+        openBraces--;
+        openStack.pop();
+      }
+      if (char === "[") {
+        openBrackets++;
+        openStack.push("[");
+      }
+      if (char === "]") {
+        openBrackets--;
+        openStack.pop();
+      }
     }
   }
 
@@ -73,17 +91,35 @@ function sanitizeAndBalance(input: string): {
     recoveredUnclosedString = true;
   }
 
-  return { result: out, openBraces, openBrackets, recoveredUnclosedString };
+  return { result: out, openBraces, openBrackets, recoveredUnclosedString, openStack };
 }
 
+/**
+ * Close unterminated containers in LIFO order (reverse of how they were
+ * opened). Appending all `]` then all `}` (the old counting-only approach)
+ * produces invalid JSON whenever an array is opened and then an object is
+ * opened inside it before truncation, e.g.
+ * `{"a":[{"old_text":"start` needs `}],}}` and not `]}}}`.
+ */
 function closeBraces(
   input: string,
   openBraces: number,
   openBrackets: number,
+  openStack: string[],
 ): string {
   let out = input;
-  if (openBrackets > 0) out += "]".repeat(openBrackets);
-  if (openBraces > 0) out += "}".repeat(openBraces);
+  for (let i = openStack.length - 1; i >= 0; i--) {
+    out += openStack[i] === "{" ? "}" : "]";
+  }
+  if (openBraces > 0 || openBrackets > 0) {
+    // Open tokens shorter than the counted opens (no stack entries for them)
+    // cannot happen since the stack mirrors the counts; keep the historical
+    // count-based close as a safety net for callers without a stack.
+    if (openStack.length === 0) {
+      if (openBrackets > 0) out += "]".repeat(openBrackets);
+      if (openBraces > 0) out += "}".repeat(openBraces);
+    }
+  }
   return out;
 }
 
@@ -126,9 +162,6 @@ export function robustParseJSON(str: string): any {
     .replace(/```$/, "")
     .trim();
 
-  // Fix double-escaped quotes (e.g., \\" -> ")
-  sanitized = sanitized.replace(/\\\\"/g, '\\"');
-
   const firstBrace = sanitized.indexOf("{");
   if (firstBrace === -1) {
     if (isDebug) {
@@ -153,7 +186,9 @@ export function robustParseJSON(str: string): any {
         error: e instanceof Error ? e.message : String(e),
       });
     }
-    /* continue */
+    // Fix double-escaped quotes (e.g., \\" -> ") only after direct parse
+    // fails, to avoid corrupting valid JSON with legitimate \\ sequences.
+    jsonPart = jsonPart.replace(/\\\\"/g, '\\"');
   }
 
   let currentJson = jsonPart.replace(
@@ -216,6 +251,7 @@ export function robustParseJSON(str: string): any {
     openBraces,
     openBrackets,
     recoveredUnclosedString,
+    openStack: fixedJsonOpenStack,
   } = sanitizeAndBalance(cleaned);
 
   if (isDebug && recoveredUnclosedString) {
@@ -274,7 +310,12 @@ export function robustParseJSON(str: string): any {
       });
     }
   } else if (openBraces > 0 || openBrackets > 0) {
-    tempJson = closeBraces(fixedJson, openBraces, openBrackets);
+    tempJson = closeBraces(
+      fixedJson,
+      openBraces,
+      openBrackets,
+      fixedJsonOpenStack,
+    );
     if (isDebug) {
       logger.debug("[json] robustParseJSON: closed braces", {
         openBraces,
@@ -306,6 +347,7 @@ export function robustParseJSON(str: string): any {
       openBraces: ob,
       openBrackets: bk,
       recoveredUnclosedString: aggRecovered,
+      openStack: aggOpenStack,
     } = sanitizeAndBalance(aggressive);
 
     if (isDebug && aggRecovered) {
@@ -318,7 +360,7 @@ export function robustParseJSON(str: string): any {
     }
 
     try {
-      const result = JSON.parse(closeBraces(aggFixed, ob, bk));
+      const result = JSON.parse(closeBraces(aggFixed, ob, bk, aggOpenStack));
       if (isDebug) {
         logger.debug("[json] robustParseJSON: aggressive-parse succeeded", {
           resultType: typeof result,

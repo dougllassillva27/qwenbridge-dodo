@@ -191,11 +191,21 @@ export function translateOpenAIToAnthropic(
   const choice = openaiResponse.choices[0];
   const content: AnthropicResponseContentBlock[] = [];
 
-  // Text content
-  if (choice.message.content) {
+  // Text and Reasoning content
+  const msgContent = choice.message.content || "";
+  const msgReasoning = (choice.message as any).reasoning_content || "";
+
+  if (msgContent || msgReasoning) {
+    let text = "";
+    if (msgReasoning) {
+      text += `<thinking>\n${msgReasoning}\n</thinking>\n\n`;
+    }
+    if (msgContent) {
+      text += msgContent;
+    }
     content.push({
       type: "text",
-      text: choice.message.content,
+      text,
     });
   }
 
@@ -251,6 +261,7 @@ export function translateStreamChunk(
     currentBlockType: string | null;
     requestModel: string;
     inputTokens: number;
+    inReasoning?: boolean;
   },
 ): string[] {
   const events: string[] = [];
@@ -263,6 +274,39 @@ export function translateStreamChunk(
   const delta = choice?.delta ?? {};
 
   if (!choice?.delta && !choice?.finish_reason) return events;
+
+  // Reasoning content (Thinking models)
+  if (delta.reasoning_content) {
+    if (state.currentBlockType !== "text") {
+      // content_block_start for text
+      events.push(
+        JSON.stringify({
+          type: "content_block_start",
+          index: state.contentBlockIndex,
+          content_block: { type: "text", text: "<thinking>\n" },
+        }),
+      );
+      state.currentBlockType = "text";
+      state.inReasoning = true;
+    } else if (!state.inReasoning) {
+      events.push(
+        JSON.stringify({
+          type: "content_block_delta",
+          index: state.contentBlockIndex,
+          delta: { type: "text_delta", text: "\n<thinking>\n" },
+        }),
+      );
+      state.inReasoning = true;
+    }
+
+    events.push(
+      JSON.stringify({
+        type: "content_block_delta",
+        index: state.contentBlockIndex,
+        delta: { type: "text_delta", text: delta.reasoning_content },
+      }),
+    );
+  }
 
   // Text content
   if (delta.content) {
@@ -278,7 +322,17 @@ export function translateStreamChunk(
       state.currentBlockType = "text";
     }
 
-    // content_block_delta
+    if (state.inReasoning) {
+      events.push(
+        JSON.stringify({
+          type: "content_block_delta",
+          index: state.contentBlockIndex,
+          delta: { type: "text_delta", text: "\n</thinking>\n\n" },
+        }),
+      );
+      state.inReasoning = false;
+    }
+
     events.push(
       JSON.stringify({
         type: "content_block_delta",

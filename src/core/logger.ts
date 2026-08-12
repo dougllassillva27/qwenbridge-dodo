@@ -11,7 +11,86 @@ export function maskEmail(email: string | undefined | null): string {
   return email.substring(0, atIndex);
 }
 
+// ─── Log sanitization ───────────────────────────────────────────────────────────
+// Log entries carry raw upstream payloads (headers, cookies, JWT-backed
+// sessions, malformed tool-call dumps). Redact known credential keys and any
+// loose JWT/API-key shaped string before the entry hits the console, even when
+// the value appears nested inside a bigger object or a quoted JSON dump.
+
+const SENSITIVE_KEY_PATTERN =
+  /^(authorization|auth|cookie|cookies|set-cookie|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|x5sec|x5secdata|bx-ua|bx-v|bx-umidtoken)$/i;
+
+/** WAF cookie names come in many variants: x5sec, x5sec_v3, x5sec-cn, bx-temp... */
+const WAF_KEY_PREFIX_PATTERN = /^(x5sec|bx[-_])/i;
+
+/** JWT (3 base64url segments) or OpenAI-style `sk-` API key. */
+const LOOSE_SECRET_PATTERN =
+  /(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{20,})/g;
+
+/** Credentials embedded in free-form strings: header lines, cookie jars, URLs. */
+const EMBEDDED_SECRET_PATTERN =
+  /((?:x5sec(?:data|_[a-z0-9]+|-[a-z0-9]+)?|bx[-_][a-z0-9_-]+)\s*=\s*[^;\s"']+)|(\bBearer\s+[A-Za-z0-9._~+\/=-]+)/gi;
+
+function isPassthroughObject(value: object): boolean {
+  return (
+    value instanceof Date ||
+    value instanceof RegExp ||
+    value instanceof Error ||
+    value instanceof Map ||
+    value instanceof Set ||
+    value instanceof ArrayBuffer ||
+    ArrayBuffer.isView(value)
+  );
+}
+
+function redactLogValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value
+      .replace(LOOSE_SECRET_PATTERN, "[REDACTED]")
+      .replace(EMBEDDED_SECRET_PATTERN, "[REDACTED]");
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactLogValue(item));
+  }
+  if (value !== null && typeof value === "object" && !isPassthroughObject(value)) {
+    // Recurse into own enumerable props of BOTH plain objects and class
+    // instances (sessions, response wrappers) — JSON.stringify serializes
+    // those the same way, so redacting them loses nothing.
+    const out: Record<string, unknown> = {};
+    for (const [key, val] of Object.entries(value)) {
+      out[key] =
+        SENSITIVE_KEY_PATTERN.test(key) || WAF_KEY_PREFIX_PATTERN.test(key)
+          ? "[REDACTED]"
+          : redactLogValue(val);
+    }
+    return out;
+  }
+  return value;
+}
+
+function redactLogMessage(message: string): string {
+  return message
+    .replace(LOOSE_SECRET_PATTERN, "[REDACTED]")
+    .replace(EMBEDDED_SECRET_PATTERN, "[REDACTED]");
+}
+
 export type LogLevel = "debug" | "info" | "warn" | "error";
+
+const LEVEL_RANK: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
+
+/**
+ * Data/hora BR local (sem ms) usado APENAS no campo `until=` das linhas de
+ * cooldown/quota — informação de negócio, não um carimbo de log.
+ */
+export function formatCooldownUntil(date: Date): string {
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${pad(date.getDate())}/${pad(date.getMonth() + 1)}/${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
 
 /**
  * TOOLCALL_DEBUG levels:
@@ -36,18 +115,21 @@ export class Logger {
   private minLevel: LogLevel;
   private context?: string;
 
-  constructor(level: LogLevel = "info", context?: string) {
+  constructor(level: LogLevel = "warn", context?: string) {
     this.minLevel = level;
     this.context = context;
   }
 
   private shouldLog(level: LogLevel): boolean {
-    const levels: LogLevel[] = ["debug", "info", "warn", "error"];
-    return levels.indexOf(level) >= levels.indexOf(this.minLevel);
+    return LEVEL_RANK[level] >= LEVEL_RANK[this.minLevel];
+  }
+
+  /** Cheap level check so callers can skip building expensive log payloads. */
+  isLevelEnabled(level: LogLevel): boolean {
+    return this.shouldLog(level);
   }
 
   private formatEntry(entry: LogEntry): string {
-    const timestamp = entry.timestamp.toISOString();
     const pad = (str: string): string => str.padStart(5, " ");
     const colorCode =
       entry.level === "error"
@@ -62,10 +144,15 @@ export class Logger {
     const coloredLevel = colorCode + pad(entry.level.toUpperCase()) + reset;
     const contextPart = entry.context ? ` [${entry.context}]` : "";
 
-    let output = `${timestamp} ${coloredLevel}${contextPart} ${entry.message}`;
+    // Redact credentials from BOTH the message (payload previews often embed
+    // cookies/JWTs) and the structured data.
+    const safeMessage = redactLogMessage(entry.message);
+    const safeData = entry.data ? redactLogValue(entry.data) : undefined;
 
-    if (entry.data) {
-      output += "\n" + JSON.stringify(entry.data, null, 2);
+    let output = `${coloredLevel}${contextPart} ${safeMessage}`;
+
+    if (safeData !== undefined) {
+      output += "\n" + JSON.stringify(safeData, null, 2);
     }
 
     return output;
@@ -140,9 +227,16 @@ const initialLevel: LogLevel =
     ? "debug"
     : envLevel && ["debug", "info", "warn", "error"].includes(envLevel)
       ? envLevel
-      : "info";
+      // Default for general users: quiet terminal with only warnings/errors
+      // (+ the always-on request/account console lines). Debugging opt-in via
+      // LOG_LEVEL=debug / TOOLCALL_DEBUG=1.
+      : "warn";
 
 export const logger = new Logger(initialLevel);
+
+export function isDebugEnabled(): boolean {
+  return logger.isLevelEnabled("debug");
+}
 
 // Helper to check if toolcall debug is enabled
 export function isToolcallDebugEnabled(): boolean {
