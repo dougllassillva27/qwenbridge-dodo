@@ -8,7 +8,7 @@
 
 import { chromium, type BrowserContext, type Page } from "playwright";
 import path from "path";
-import fs from "fs";
+import fs from "node:fs";
 import crypto from "crypto";
 import type { QwenAccount } from "../core/accounts.ts";
 // Imported here rather than injected from session-keeper.ts: account-concurrency
@@ -991,6 +991,18 @@ export async function initPlaywrightForAccount(
       launchArgs.push(`--window-position=${cx - 400},${cy - 550}`);
     }
     launchArgs.push("--start-minimized");
+
+    // [Dodo] Previne que o Chrome ignore a coordenada do launcher lendo um save-state antigo.
+    const prefsPath = path.join(profilePath, "Default", "Preferences");
+    if (fs.existsSync(prefsPath)) {
+      try {
+        const prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8"));
+        if (prefs?.browser?.window_placement) {
+          delete prefs.browser.window_placement;
+          fs.writeFileSync(prefsPath, JSON.stringify(prefs));
+        }
+      } catch {}
+    }
 
     const acctContext = await engineToUse.launchPersistentContext(profilePath, {
       headless: false,
