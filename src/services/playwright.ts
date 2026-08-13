@@ -1034,6 +1034,12 @@ export async function initPlaywrightForAccount(
         }
       }
 
+      const cx = parseInt(process.env.LAUNCHER_WINDOW_X as string);
+      const cy = parseInt(process.env.LAUNCHER_WINDOW_Y as string);
+      if (!isNaN(cx) && !isNaN(cy)) {
+        await alignWindowPosition(acctPage, cx - 400, cy - 550).catch(() => {});
+      }
+
       acctPage.setDefaultTimeout(config.timeouts.page);
       acctPage.setDefaultNavigationTimeout(config.timeouts.navigation);
       accountContexts.set(account.id, acctContext);
@@ -1097,11 +1103,6 @@ export async function initPlaywrightForAccount(
 
       // Capture headers by navigating and intercepting
       await captureQwenHeaders(account.id);
-      const cx = parseInt(process.env.LAUNCHER_WINDOW_X as string);
-      const cy = parseInt(process.env.LAUNCHER_WINDOW_Y as string);
-      if (!isNaN(cx) && !isNaN(cy)) {
-        await alignWindowPosition(acctPage, cx - 400, cy - 550).catch(() => {});
-      }
       
       await minimizeWindow(acctPage);
 
