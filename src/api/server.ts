@@ -286,18 +286,20 @@ const accountsHandler = async (c: any) => {
       status: account.cooldown_until && account.cooldown_until > Date.now() ? "cooldown" : "active",
       cooldown_until: account.cooldown_until,
       cooldown_reason: account.cooldown_reason,
-      ram_mb: memoryMB,
-      stream_errors: metrics.get("requests.errors")?.value || 0,
       tokens
     };
   });
   
   const activeCount = accountsData.filter(a => a.status === "active").length;
+  const globalRamMb = Math.round(getHeapUsageSnapshot().heapUsed / 1024 / 1024);
+  
   return c.json({
     total: accountsData.length,
     active: activeCount,
     cooldown: accountsData.length - activeCount,
     requests: metrics.get("requests.total")?.value || 0,
+    ram_mb: globalRamMb,
+    stream_errors: metrics.get("requests.errors")?.value || 0,
     accounts: accountsData
   });
 };
