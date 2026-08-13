@@ -287,7 +287,7 @@ export function translateStreamChunk(
       JSON.stringify({
         type: "content_block_delta",
         index: state.contentBlockIndex,
-        delta: { type: "text_delta", text: "" },
+        delta: { type: "text_delta", text: "\u200B" },
       }),
     );
   }
