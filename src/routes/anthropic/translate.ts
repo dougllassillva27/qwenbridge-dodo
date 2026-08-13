@@ -268,28 +268,11 @@ export function translateStreamChunk(
   if (!choice?.delta && !choice?.finish_reason) return events;
 
   // Reasoning content (Thinking models)
-  // Instead of showing the reasoning in the UI, we send empty text string
-  // events to keep the client's SSE connection alive and prevent Timeouts.
+  // [Dodo] Ocultado totalmente! Nós já injetamos eventos 'ping' no servidor para evitar
+  // timeout do Cline, então podemos simplesmente ignorar o raciocínio sem enviar lixo invisível.
   if (delta.reasoning_content) {
-    if (state.currentBlockType !== "text") {
-      // content_block_start for text
-      events.push(
-        JSON.stringify({
-          type: "content_block_start",
-          index: state.contentBlockIndex,
-          content_block: { type: "text", text: "" },
-        }),
-      );
-      state.currentBlockType = "text";
-    }
-
-    events.push(
-      JSON.stringify({
-        type: "content_block_delta",
-        index: state.contentBlockIndex,
-        delta: { type: "text_delta", text: "\u200B" },
-      }),
-    );
+    // Apenas retém o estado, não envia evento nenhum para o cliente.
+    return events;
   }
 
   // Text content
