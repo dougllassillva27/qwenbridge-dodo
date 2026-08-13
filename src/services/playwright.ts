@@ -1097,6 +1097,12 @@ export async function initPlaywrightForAccount(
 
       // Capture headers by navigating and intercepting
       await captureQwenHeaders(account.id);
+      const cx = parseInt(process.env.LAUNCHER_WINDOW_X as string);
+      const cy = parseInt(process.env.LAUNCHER_WINDOW_Y as string);
+      if (!isNaN(cx) && !isNaN(cy)) {
+        await alignWindowPosition(acctPage, cx - 400, cy - 550).catch(() => {});
+      }
+      
       await minimizeWindow(acctPage);
 
       // Header capture may leave the UI on a generated chat page. Return the
@@ -2523,6 +2529,14 @@ export async function getTokenDiagnostics(
 }
 
 // [Dodo] Funções CDP para gerenciar o estado da janela
+export async function alignWindowPosition(page: any, left: number, top: number): Promise<void> {
+  const cdp = await page.context().newCDPSession(page);
+  const { windowId } = await cdp.send("Browser.getWindowForTarget");
+  // O Chromium frequentemente ignora a flag --window-position na inicialização 
+  // se o Perfil Persistente salvou o local antigo. Aqui nós forçamos o reposicionamento físico.
+  await cdp.send("Browser.setWindowBounds", { windowId, bounds: { left, top, windowState: "normal" } });
+  await cdp.detach();
+}
 export async function minimizeWindow(page: any): Promise<void> {
   const cdp = await page.context().newCDPSession(page);
   const { windowId } = await cdp.send("Browser.getWindowForTarget");
