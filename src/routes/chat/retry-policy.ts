@@ -89,10 +89,6 @@ export function isTerminalLocalError(err: unknown): boolean {
   const code = errCode(err).toLowerCase();
   const message = errMessage(err).toLowerCase();
 
-  // Deterministic upstream errors that can never succeed on any account
-  if (isModelNotFoundError(err)) return true;
-  if (isContentModerationError(err)) return true;
-
   // Local proxy auth / validation / not found
   if (status === 400 || status === 401 || status === 404) {
     // Exception: Qwen upstream can also return 404 for missing chat — that is retryable.

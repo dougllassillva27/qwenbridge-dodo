@@ -60,6 +60,8 @@ import {
 	isAntiBotError as isAntiBotPolicyError,
 	isAccountInitializationError,
 	isChatInProgressError,
+	isContentModerationError,
+	isModelNotFoundError,
 	isQuotaLikeError,
 	isTerminalLocalError,
 	shouldRetryInvalidInputOnSameAccount,
@@ -553,7 +555,12 @@ export async function acquireUpstreamStream(
 		// In particular, an oversized prompt is independent of the selected
 		// account; rotating accounts only repeats the same 400 response and can
 		// also rebuild the full history several times.
-		if (isTerminalLocalError(lastError)) {
+		// The same applies to deterministic upstream errors (model not found, moderation).
+		if (
+			isTerminalLocalError(lastError) ||
+			isModelNotFoundError(lastError) ||
+			isContentModerationError(lastError)
+		) {
 			break;
 		}
 
