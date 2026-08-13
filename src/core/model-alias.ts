@@ -62,5 +62,16 @@ export function stripThinkingSuffix(model: string): {
  */
 export function mapClientModelToQwen(model: string): string {
   if (!model) return model;
-  return stripThinkingSuffix(model.trim()).baseModel;
+  
+  let base = stripThinkingSuffix(model.trim()).baseModel;
+  
+  // [Dodo] Interceptador de segurança para requisições secundárias do Cline.
+  // Como o upstream removeu os aliases, tarefas invisíveis (como dar nome à aba)
+  // que o Cline envia usando 'claude-*' ou 'gpt-*' estavam tomando erro 404.
+  const lower = base.toLowerCase();
+  if (lower.startsWith("claude-") || lower.startsWith("gpt-")) {
+    base = "qwen3.8-max";
+  }
+  
+  return base;
 }
