@@ -2279,6 +2279,11 @@ export async function processStreamingResponse(
         buildUsage(usageAccumulator),
         currentTokenEstimationContext?.contextMeter,
       );
+
+      // [Dodo] Injeta os tokens na telemetria (para exibir no Proxy Launcher)
+      if (activeAccountId && usage) {
+        recordAccountTokens(activeAccountId, usage.prompt_tokens || 0, usage.completion_tokens || 0);
+      }
       const finalFinishReason =
         toolParser && toolParser.getEmittedToolCallCount() > 0
           ? "tool_calls"

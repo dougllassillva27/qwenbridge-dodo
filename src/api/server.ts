@@ -287,7 +287,7 @@ const accountsHandler = async (c: any) => {
       cooldown_until: account.cooldown_until,
       cooldown_reason: account.cooldown_reason,
       ram_mb: memoryMB,
-      stream_errors: 0,
+      stream_errors: metrics.get("requests.errors")?.value || 0,
       tokens
     };
   });
@@ -297,6 +297,7 @@ const accountsHandler = async (c: any) => {
     total: accountsData.length,
     active: activeCount,
     cooldown: accountsData.length - activeCount,
+    requests: metrics.get("requests.total")?.value || 0,
     accounts: accountsData
   });
 };
