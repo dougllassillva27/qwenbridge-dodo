@@ -185,6 +185,14 @@ app.post("/v1/messages", async (c) => {
           }, timeoutMs);
         };
 
+        // [Dodo] Keep-alive ping para evitar que clientes (como o Cline)
+        // abortem a conexão por timeout enquanto a Qwen processa raciocínios longos.
+        const pingInterval = setInterval(() => {
+          if (!isDone) {
+            write(`event: ping\ndata: {"type": "ping"}\n\n`).catch(() => {});
+          }
+        }, 10000);
+
         try {
           // Make the actual request to Qwen
           const controller = new AbortController();
@@ -256,6 +264,7 @@ app.post("/v1/messages", async (c) => {
 
           isDone = true;
           if (timeoutId) clearTimeout(timeoutId);
+          clearInterval(pingInterval);
 
           // Send message_stop event
           await write(
@@ -264,6 +273,7 @@ app.post("/v1/messages", async (c) => {
         } catch (error) {
           isDone = true;
           if (timeoutId) clearTimeout(timeoutId);
+          clearInterval(pingInterval);
           console.error("❌ [Anthropic] Stream error:", error);
           try {
             await write(
