@@ -268,13 +268,27 @@ export function translateStreamChunk(
   if (!choice?.delta && !choice?.finish_reason) return events;
 
   // Reasoning content (Thinking models)
-  // Instead of showing the reasoning in the UI, we send invisible 'ping'
+  // Instead of showing the reasoning in the UI, we send empty text string
   // events to keep the client's SSE connection alive and prevent Timeouts.
   if (delta.reasoning_content) {
+    if (state.currentBlockType !== "text") {
+      // content_block_start for text
+      events.push(
+        JSON.stringify({
+          type: "content_block_start",
+          index: state.contentBlockIndex,
+          content_block: { type: "text", text: "" },
+        }),
+      );
+      state.currentBlockType = "text";
+    }
+
     events.push(
       JSON.stringify({
-        type: "ping",
-      })
+        type: "content_block_delta",
+        index: state.contentBlockIndex,
+        delta: { type: "text_delta", text: "" },
+      }),
     );
   }
 
