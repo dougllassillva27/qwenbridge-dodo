@@ -1,322 +1,188 @@
-import { z } from "zod";
+import { z } from 'zod'
 
-const envSchema = z
-  .object({
-    PORT: z
-      .string()
-      .regex(/^\d+$/, "PORT must be a number")
-      .refine((value) => {
-        const port = Number(value);
-        return port >= 1 && port <= 65535;
-      }, "PORT must be between 1 and 65535")
-      .default("3000"),
-    HOST: z.string().default("0.0.0.0"),
-    INTERNAL_HOST: z.string().default("127.0.0.1"),
-    USER_AGENT: z
-      .string()
-      .default(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
-      ),
-    QWEN_BX_V: z.string().default("2.5.37"),
-    // The real chat.qwen.ai client sends ONLY bx-v on API requests (no
-    // bx-ua/bx-umidtoken headers — the WAF carries them as cookies). Set true
-    // to restore the legacy behavior of injecting the captured bx-ua tokens.
-    QWEN_SEND_BX_UA: z.string().default("false"),
-    PLAYWRIGHT_HEADLESS: z.string().default("true"),
-    PLAYWRIGHT_BROWSER: z
-      .enum(["chromium", "chrome", "edge"])
-      .default("chromium"),
-    PLAYWRIGHT_INIT_BATCH_SIZE: z.string().default("1"),
-    PLAYWRIGHT_CONTEXT_CLOSE_TIMEOUT_MS: z.string().default("10000"),
-    PLAYWRIGHT_IDLE_CONTEXT_TTL_MS: z.string().default("60000"),
-    PLAYWRIGHT_JS_HEAP_MB: z.string().default("256"),
-    PLAYWRIGHT_LOW_MEMORY_FLAGS: z.string().default("true"),
-    // Keep only 1 warm context by default (user preference over failover speed):
-    // after warmup exactly one browser stays open for immediate use; any extra
-    // context (simultaneous use / failover hop) is closed once idle. The cap
-    // only evicts IDLE contexts — busy mutexes and active streams are never
-    // touched, so concurrent accounts each keep their own context while serving.
-    // Tradeoff: an account whose context was evicted pays a context recreation
-    // on its next use (set higher, e.g. 3, to keep failover hops warm).
-    PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("1"),
-    PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("true"),
-    CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
-    CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
-    CAPTCHA_SOLVER_TIMEOUT_MS: z.string().default("15000"),
-    CAPTCHA_SOLVER_RETRY_DELAY_MS: z.string().default("1000"),
-    CAPTCHA_SOLVER_SETTLE_MS: z.string().default("2000"),
-    CAPTCHA_ACCOUNT_COOLDOWN_MS: z.string().default("120000"),
-    OSS_MULTIPART_THRESHOLD_MB: z.string().default("5"),
-    CHAT_REQUEST_LOG: z.string().default("false"),
-    HTTP_TIMEOUT: z.string().default("15000"),
-    CHAT_TIMEOUT: z.string().default("180000"),
-    NAVIGATION_TIMEOUT: z.string().default("60000"),
-    PAGE_TIMEOUT: z.string().default("60000"),
-    HEADERS_TIMEOUT: z.string().default("60000"),
-    TIME_TO_FIRST_BYTE: z.string().default("60000"),
-    IDLE_STREAM_TIMEOUT: z.string().default("60000"),
-    // Deadline for the FIRST upstream chunk on thinking models (the reasoning
-    // idle of 600s is for gaps AFTER data flows; a stream that produced
-    // nothing in this window is dead and should fail fast, retryable).
-    QWEN_FIRST_CHUNK_TIMEOUT: z.string().default("180000"),
-    TOTAL_REQUEST_TIMEOUT: z.string().default("600000"),
-    // Mid-stream silence window for thinking models: 3 min with ZERO upstream
-    // bytes is a dead stream (WAF swallow / dropped connection) — fail fast and
-    // let the retry policy rotate accounts. Flowing reasoning chunks RESET this
-    // timer, so legitimate slow thinking is never cut; only total silence is.
-    REASONING_MODEL_TIMEOUT: z.string().default("180000"),
-    CACHE_TTL: z.string().default("3600"),
-    RESPONSE_TTL: z.string().default("1800"),
-    CACHE_COMPRESSION_ENABLED: z.string().default("true"),
-    CACHE_COMPRESSION_THRESHOLD: z.string().default("1024"),
-    CACHE_COMPRESSION_LEVEL: z.string().default("6"),
-    METRICS_INTERVAL: z.string().default("10000"),
-    WATCHDOG_INTERVAL: z.string().default("5000"),
-    WATCHDOG_FAILURES: z.string().default("3"),
-    RAM_WARNING: z.string().default("80"),
-    RAM_CRITICAL: z.string().default("95"),
-    WS_WARNING: z.string().default("50"),
-    WS_CRITICAL: z.string().default("100"),
-    RETRY_BASE_DELAY_MS: z.string().default(process.env.TEST_MOCK_QWEN_AUTH === "true" ? "50" : "1000"),
-    RETRY_MAX_DELAY_MS: z.string().default(process.env.TEST_MOCK_QWEN_AUTH === "true" ? "200" : "10000"),
-    RETRY_MAX_ATTEMPTS: z.string().default("3"),
-    RETRY_MAX_ACCOUNT_SWITCHES: z.string().default("2"),
-    RETRY_ON_UNKNOWN_UPSTREAM: z.string().default("true"),
-    RETRY_AUTO_MALFORMED_TOOLS: z.string().default("true"),
-    RETRY_AUTO_MALFORMED_TOOLS_MAX: z.string().default("2"),
-    MAX_TOOL_CALLS_PER_TURN: z.string().default("8"),
-    QWEN_REPEATED_TOOL_CALL_WARN: z.string().default("2"),
-    ACCOUNT_MAX_CONCURRENT_STREAMS: z.string().default("1"),
-    ACCOUNT_BUSY_WAIT_MS: z.string().default("30000"),
-    // Cap for the "wait forever" account-lease queue (thread owner / last
-    // usable account): the queue previously had NO deadline, so a stuck lease
-    // holder made the next turn wait up to ~600s. A generous finite cap keeps
-    // the wait far above the normal 30s but still bounded.
-    ACCOUNT_QUEUE_WAIT_FOREVER_CAP_MS: z.string().default("120000"),
-    // Hard deadline for one stream-acquire attempt. A dead account (upstream
-    // swallows the completion fetch) otherwise chains metadata/header timeouts
-    // for minutes; this fails the attempt visibly so the retry loop switches.
-    ACQUIRE_DEADLINE_MS: z.string().default("120000"),
-    ACCOUNT_LEASE_MAX_DURATION_MS: z.string().default("600000"),
-    ACCOUNT_INIT_FAILURE_COOLDOWN_MS: z.string().default("300000"),
-    STREAM_DISCONNECT_GRACE_MS: z
-      .string()
-      .regex(/^\d+$/, "STREAM_DISCONNECT_GRACE_MS must be a number")
-      .default("4000"),
-    CHAT_IN_PROGRESS_RETRY_DELAY_MS: z.string().default("2000"),
-    // Temporarily-busy window after a chat_in_progress: long enough to absorb
-    // the upstream chat settle (measured ~1-2s), short enough that the next
-    // turn of the sticky owner is not pushed to a cold account with a full
-    // context replay (8s caused a needless 13.3s hop in the 20:04 session).
-    CHAT_IN_PROGRESS_BUSY_MS: z.string().default("4000"),
-    MID_STREAM_FAILOVER_THRESHOLD: z.string().default("2"),
-    MID_STREAM_FAILOVER_BUSY_MS: z.string().default("60000"),
-
-
-    QWEN_BASE_URL: z.string().default("https://chat.qwen.ai"),
-    QWEN_CHAT_POOL_SIZE: z.string().default("1"),
-    QWEN_CHAT_POOL_MODELS: z.string().default("qwen3.7-plus"),
-    QWEN_PERSONALIZATION_FROM_REQUEST: z.string().default("true"),
-    QWEN_PERSONALIZATION_VERIFY_GET: z.string().default("true"),
-    QWEN_MAX_PROMPT_BYTES: z.string().default("0"),
-    QWEN_MAX_PERSONALIZATION_BYTES: z.string().default("200000"),
-    CONTEXT_METER_ENABLED: z.string().default("true"),
-    CONTEXT_METER_WINDOW_TOKENS: z.string().default("0"),
-    CONTEXT_METER_REPORT_USAGE: z.string().default("true"),
-    DELETE_ALL_CHATS_ON_SHUTDOWN: z.string().default("false"),
-    SESSION_KEEP_ALIVE_ENABLED: z.string().default("false"),
-    SESSION_KEEP_ALIVE_INTERVAL_MS: z.string().default("30000"),
-    SESSION_KEEP_ALIVE_IDLE_MS: z.string().default("120000"),
-    SESSION_KEEP_ALIVE_NAVIGATION_INTERVAL_MS: z.string().default("480000"),
-    API_KEY: z.string().default(""),
-    // Static x-ratelimit-* response headers (OpenAI-shaped, doc §5.2). The proxy
-    // does not enforce a token/request quota; these exist for SDK/tool parsing.
-    RATE_LIMIT_REQUESTS: z.string().default("5000"),
-    RATE_LIMIT_TOKENS: z.string().default("200000"),
+const envInt = (def: number, min = 0) =>
+  z.string().default(String(def)).transform(v => {
+    const n = Number(v)
+    if (!Number.isInteger(n)) throw new Error(`Expected integer, got "${v}"`)
+    if (n < min) throw new Error(`Expected >= ${min}, got ${n}`)
+    return n
   })
-;
 
-const env = envSchema.parse(process.env);
+const envBool = (defaultTrue: boolean) =>
+  z.string().default(defaultTrue ? 'true' : 'false').transform(v =>
+    defaultTrue ? v !== 'false' : v === 'true'
+  )
+
+const envSchema = z.object({
+  PORT: envInt(3000, 1),
+  HOST: z.string().default('0.0.0.0'),
+  HEADLESS: envBool(true),
+  BROWSER: z.enum(['chromium', 'firefox', 'webkit', 'chrome', 'edge']).default('chromium'),
+  USER_DATA_DIR: z.string().default('./qwen_profiles'),
+  USER_AGENT: z.string().default('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36'),
+  LOG_CONSOLE: envBool(false),
+  NAVIGATION_TIMEOUT: envInt(90000, 1),
+  PAGE_TIMEOUT: envInt(60000, 1),
+  HTTP_TIMEOUT: envInt(45000, 1),
+  HEADERS_TIMEOUT: envInt(90000, 1),
+  CHAT_TIMEOUT: envInt(120000, 1),
+  STREAM_IDLE_TIMEOUT: envInt(180000, 1),
+  CACHE_TTL: envInt(3600, 1),
+  RESPONSE_TTL: envInt(1800, 1),
+  METRICS_INTERVAL: envInt(10000, 1),
+  WATCHDOG_INTERVAL: envInt(5000, 1),
+  WATCHDOG_FAILURES: envInt(3, 1),
+  RAM_WARNING: envInt(70, 1),
+  RAM_CRITICAL: envInt(90, 1),
+  WS_WARNING: envInt(40, 1),
+  WS_CRITICAL: envInt(80, 1),
+  QWEN_BASE_URL: z.string().default('https://chat.qwen.ai'),
+  QWEN_HTTP_ENDPOINT: z.string().default('https://api.qwen.ai/v1/chat'),
+  QWEN_API_KEY: z.string().default(''),
+  API_KEY: z.string().default(''),
+  HEADERS_TTL_MS: envInt(1800000, 1),
+  BACKGROUND_HEADER_REFRESH: envBool(true),
+  WARM_POOL_SIZE: envInt(0),
+  WARM_POOL_LOW_WATER: envInt(0),
+  WARM_POOL_TTL_MS: envInt(600000, 1),
+  WARM_POOL_STARTUP: envBool(true),
+  SESSION_KEEPER_ENABLED: envBool(true),
+  ACCOUNT_INIT_CONCURRENCY: envInt(1, 1),
+  ACCOUNT_INIT_STAGGER_MIN_MS: envInt(250),
+  ACCOUNT_INIT_STAGGER_MAX_MS: envInt(800),
+  PRECAPTURE_HEADERS_STARTUP: envBool(true),
+  PRECAPTURE_HEADERS_CONCURRENCY: envInt(1, 1),
+  PRECAPTURE_HEADERS_STAGGER_MIN_MS: envInt(2500),
+  PRECAPTURE_HEADERS_STAGGER_MAX_MS: envInt(5000),
+  SINGLE_ACCOUNT_MODE: envBool(false),
+  SINGLE_ACCOUNT_ID: z.string().default(''),
+  SINGLE_ACCOUNT_EMAIL: z.string().default(''),
+  ACCOUNT_LANES: envInt(1, 1),
+  ACCOUNT_MAX_CONCURRENT_STREAMS: envInt(2, 1),
+  ACCOUNT_STREAM_SLOT_WAIT_MS: envInt(30000, 1000),
+  QWEN_DIRECT_FETCH: envBool(true),
+  LARGE_PROMPT_THRESHOLD: envInt(524288, 1),
+  HYBRID_SESSIONS_ENABLED: envBool(true),
+  HYBRID_SESSION_VERIFY: envBool(true),
+  HYBRID_SESSION_VERIFY_EVERY_MS: envInt(60000, 0),
+  HYBRID_SESSION_TTL_MS: envInt(86400000, 1),
+  STREAM_DEGENERATE_GUARD: z.enum(['prone', 'always', 'off']).default('prone'),
+  AUTH_REQUIRED: envBool(false),
+  USER_RATE_LIMIT_RPM: envInt(120, 0),
+  USER_MAX_CONCURRENCY: envInt(8, 1),
+  USER_API_KEYS: z.string().default(''),
+  ADMIN_PASSWORD: z.string().default(''),
+})
+
+const env = envSchema.parse(process.env)
 
 export const config = {
   server: {
-    port: parseInt(env.PORT),
+    port: env.PORT,
     host: env.HOST,
-    internalHost: env.INTERNAL_HOST,
-    rateLimit: {
-      requests: parseInt(env.RATE_LIMIT_REQUESTS),
-      tokens: parseInt(env.RATE_LIMIT_TOKENS),
-    },
   },
-  logging: {
-    chatRequests: env.CHAT_REQUEST_LOG === "true",
-  },
-  auth: {
+  browser: {
+    headless: env.HEADLESS,
+    type: env.BROWSER,
+    userDataDir: env.USER_DATA_DIR,
     userAgent: env.USER_AGENT,
-    bxV: env.QWEN_BX_V,
-  },
-  playwright: {
-    headless: env.PLAYWRIGHT_HEADLESS !== "false",
-    browser: env.PLAYWRIGHT_BROWSER,
-    initBatchSize: Math.max(1, parseInt(env.PLAYWRIGHT_INIT_BATCH_SIZE)),
-    contextCloseTimeoutMs: Math.max(
-      1_000,
-      parseInt(env.PLAYWRIGHT_CONTEXT_CLOSE_TIMEOUT_MS),
-    ),
-    idleContextTtlMs: Math.max(0, parseInt(env.PLAYWRIGHT_IDLE_CONTEXT_TTL_MS)),
-    jsHeapMb: Math.max(64, parseInt(env.PLAYWRIGHT_JS_HEAP_MB)),
-    lowMemoryFlags: env.PLAYWRIGHT_LOW_MEMORY_FLAGS !== "false",
-    maxActiveContexts: Math.max(0, parseInt(env.PLAYWRIGHT_MAX_ACTIVE_CONTEXTS)),
-    prepareAllOnStartup: env.PLAYWRIGHT_PREPARE_ALL_ON_STARTUP !== "false",
-  },
-  captcha: {
-    enabled: env.CAPTCHA_SOLVER_ENABLED === "true",
-    maxAttempts: Math.max(1, Math.min(5, parseInt(env.CAPTCHA_SOLVER_MAX_ATTEMPTS))),
-    timeoutMs: Math.max(0, parseInt(env.CAPTCHA_SOLVER_TIMEOUT_MS)),
-    retryDelayMs: Math.max(0, parseInt(env.CAPTCHA_SOLVER_RETRY_DELAY_MS)),
-    settleMs: Math.max(0, parseInt(env.CAPTCHA_SOLVER_SETTLE_MS)),
-    /** Rest an account whose challenge could not be cleared before reusing it. */
-    accountCooldownMs: Math.max(0, parseInt(env.CAPTCHA_ACCOUNT_COOLDOWN_MS)),
-  },
-  oss: {
-    multipartThresholdBytes: Math.max(
-      1 * 1024 * 1024,
-      parseInt(env.OSS_MULTIPART_THRESHOLD_MB) * 1024 * 1024,
-    ),
+    args: [
+      '--disable-gpu',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ],
+    launchTimeout: 30000,
+    healthCheckInterval: 30000,
+    headers: {
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+    },
+    logConsole: env.LOG_CONSOLE,
   },
   timeouts: {
-    http: parseInt(env.HTTP_TIMEOUT),
-    chat: parseInt(env.CHAT_TIMEOUT),
-    navigation: parseInt(env.NAVIGATION_TIMEOUT),
-    page: parseInt(env.PAGE_TIMEOUT),
-    headers: parseInt(env.HEADERS_TIMEOUT),
-    timeToFirstByte: parseInt(env.TIME_TO_FIRST_BYTE),
-    idleStreamTimeout: parseInt(env.IDLE_STREAM_TIMEOUT),
-    totalRequestTimeout: parseInt(env.TOTAL_REQUEST_TIMEOUT),
-    reasoningModelTimeout: parseInt(env.REASONING_MODEL_TIMEOUT),
-    firstChunkTimeout: parseInt(env.QWEN_FIRST_CHUNK_TIMEOUT),
+    navigation: env.NAVIGATION_TIMEOUT,
+    page: env.PAGE_TIMEOUT,
+    http: env.HTTP_TIMEOUT,
+    headers: env.HEADERS_TIMEOUT,
+    chat: env.CHAT_TIMEOUT,
+    streamIdle: env.STREAM_IDLE_TIMEOUT,
   },
   cache: {
-    defaultTTL: parseInt(env.CACHE_TTL),
-    responseTTL: parseInt(env.RESPONSE_TTL),
-    compression: {
-      enabled: env.CACHE_COMPRESSION_ENABLED !== "false",
-      threshold: parseInt(env.CACHE_COMPRESSION_THRESHOLD),
-      level: parseInt(env.CACHE_COMPRESSION_LEVEL),
-    },
+    defaultTTL: env.CACHE_TTL,
+    responseTTL: env.RESPONSE_TTL,
   },
-
   metrics: {
-    interval: parseInt(env.METRICS_INTERVAL),
+    interval: env.METRICS_INTERVAL,
   },
   watchdog: {
-    checkInterval: parseInt(env.WATCHDOG_INTERVAL),
-    consecutiveFailuresThreshold: parseInt(env.WATCHDOG_FAILURES),
+    checkInterval: env.WATCHDOG_INTERVAL,
+    consecutiveFailuresThreshold: env.WATCHDOG_FAILURES,
     ram: {
-      warningThreshold: parseInt(env.RAM_WARNING),
-      criticalThreshold: parseInt(env.RAM_CRITICAL),
+      warningThreshold: env.RAM_WARNING,
+      criticalThreshold: env.RAM_CRITICAL,
     },
     streams: {
-      warningThreshold: parseInt(env.WS_WARNING),
-      criticalThreshold: parseInt(env.WS_CRITICAL),
+      warningThreshold: env.WS_WARNING,
+      criticalThreshold: env.WS_CRITICAL,
     },
-  },
-  retry: {
-    baseDelayMs: parseInt(env.RETRY_BASE_DELAY_MS),
-    maxDelayMs: parseInt(env.RETRY_MAX_DELAY_MS),
-    maxAttempts: Math.max(1, parseInt(env.RETRY_MAX_ATTEMPTS)),
-    maxAccountSwitches: Math.max(0, parseInt(env.RETRY_MAX_ACCOUNT_SWITCHES)),
-    onUnknownUpstream: env.RETRY_ON_UNKNOWN_UPSTREAM !== "false",
-    chatInProgressDelayMs: Math.max(0, parseInt(env.CHAT_IN_PROGRESS_RETRY_DELAY_MS)),
-    chatInProgressBusyMs: Math.max(0, parseInt(env.CHAT_IN_PROGRESS_BUSY_MS)),
-    midStreamFailoverThreshold: Math.max(
-      0,
-      parseInt(env.MID_STREAM_FAILOVER_THRESHOLD),
-    ),
-    midStreamFailoverBusyMs: Math.max(
-      0,
-      parseInt(env.MID_STREAM_FAILOVER_BUSY_MS),
-    ),
-    autoRetryMalformedTools: env.RETRY_AUTO_MALFORMED_TOOLS !== "false",
-    autoRetryMalformedToolsMax: Math.max(1, parseInt(env.RETRY_AUTO_MALFORMED_TOOLS_MAX)),
-    maxToolCallsPerTurn: Math.max(0, parseInt(env.MAX_TOOL_CALLS_PER_TURN)),
-    repeatedToolCallWarnThreshold: Math.max(
-      1,
-      parseInt(env.QWEN_REPEATED_TOOL_CALL_WARN),
-    ),
-  },
-  concurrency: {
-    maxStreamsPerAccount: Math.max(1, parseInt(env.ACCOUNT_MAX_CONCURRENT_STREAMS)),
-    busyWaitMs: Math.max(
-      0,
-      Number.isFinite(parseInt(env.ACCOUNT_BUSY_WAIT_MS as string))
-        ? parseInt(env.ACCOUNT_BUSY_WAIT_MS as string)
-        : 30_000,
-    ),
-    /** Bound for the "wait forever" lease queue (default 2 min). */
-    queueWaitForeverCapMs: Math.max(
-      0,
-      Number.isFinite(parseInt(env.ACCOUNT_QUEUE_WAIT_FOREVER_CAP_MS as string))
-        ? parseInt(env.ACCOUNT_QUEUE_WAIT_FOREVER_CAP_MS as string)
-        : 120_000,
-    ),
-    /** Hard deadline for one stream-acquire attempt (default 2 min). */
-    acquireDeadlineMs: Math.max(
-      0,
-      Number.isFinite(parseInt(env.ACQUIRE_DEADLINE_MS as string))
-        ? parseInt(env.ACQUIRE_DEADLINE_MS as string)
-        : 120_000,
-    ),
-    /** Safety net: force-release leases held longer than this (default 10 min). */
-    leaseMaxDurationMs: Math.max(
-      0,
-      parseInt(env.ACCOUNT_LEASE_MAX_DURATION_MS),
-    ),
-    initFailureCooldownMs: Math.max(
-      30_000,
-      parseInt(env.ACCOUNT_INIT_FAILURE_COOLDOWN_MS),
-    ),
-  },
-  stream: {
-    disconnectGraceMs: Math.max(
-      0,
-      parseInt(env.STREAM_DISCONNECT_GRACE_MS),
-    ),
-  },
-
-
-  sessionKeeper: {
-    enabled: env.SESSION_KEEP_ALIVE_ENABLED !== "false",
-    intervalMs: parseInt(env.SESSION_KEEP_ALIVE_INTERVAL_MS),
-    idleMs: parseInt(env.SESSION_KEEP_ALIVE_IDLE_MS),
-    navigationIntervalMs: parseInt(
-      env.SESSION_KEEP_ALIVE_NAVIGATION_INTERVAL_MS,
-    ),
   },
   apiKey: env.API_KEY,
   qwen: {
     baseUrl: env.QWEN_BASE_URL,
-    chatPoolSize: Math.max(0, parseInt(env.QWEN_CHAT_POOL_SIZE)),
-    chatPoolModels: env.QWEN_CHAT_POOL_MODELS.split(",")
-      .map((model) => model.trim())
-      .filter(Boolean),
-    personalizationFromRequest:
-      env.QWEN_PERSONALIZATION_FROM_REQUEST === "true",
-    personalizationVerifyGet: env.QWEN_PERSONALIZATION_VERIFY_GET !== "false",
-    maxPromptBytes: Math.max(0, parseInt(env.QWEN_MAX_PROMPT_BYTES)),
-    maxPersonalizationBytes: Math.max(
-      0,
-      parseInt(env.QWEN_MAX_PERSONALIZATION_BYTES),
-    ),
-    deleteAllChatsOnShutdown: env.DELETE_ALL_CHATS_ON_SHUTDOWN === "true",
-    /** Send the captured bx-ua/bx-umidtoken headers (real client does NOT). */
-    sendBxUa: env.QWEN_SEND_BX_UA === "true",
+    httpEndpoint: env.QWEN_HTTP_ENDPOINT,
+    apiKey: env.QWEN_API_KEY,
   },
-  contextMeter: {
-    enabled: env.CONTEXT_METER_ENABLED === "true",
-    windowTokens: Math.max(0, parseInt(env.CONTEXT_METER_WINDOW_TOKENS)),
-    reportUsage: env.CONTEXT_METER_REPORT_USAGE === "true",
+  headers: {
+    ttlMs: env.HEADERS_TTL_MS,
+    backgroundRefresh: env.BACKGROUND_HEADER_REFRESH,
   },
-};
+  warmPool: {
+    size: env.WARM_POOL_SIZE,
+    lowWater: env.WARM_POOL_LOW_WATER,
+    ttlMs: env.WARM_POOL_TTL_MS,
+    startup: env.WARM_POOL_STARTUP,
+  },
+  sessionKeeper: {
+    enabled: env.SESSION_KEEPER_ENABLED,
+  },
+  accounts: {
+    initConcurrency: env.ACCOUNT_INIT_CONCURRENCY,
+    initStaggerMinMs: env.ACCOUNT_INIT_STAGGER_MIN_MS,
+    initStaggerMaxMs: env.ACCOUNT_INIT_STAGGER_MAX_MS,
+    singleAccountMode: env.SINGLE_ACCOUNT_MODE,
+    singleAccountId: env.SINGLE_ACCOUNT_ID,
+    singleAccountEmail: env.SINGLE_ACCOUNT_EMAIL,
+    lanes: env.ACCOUNT_LANES,
+    maxStreamsPerAccount: env.ACCOUNT_MAX_CONCURRENT_STREAMS,
+    streamSlotWaitMs: env.ACCOUNT_STREAM_SLOT_WAIT_MS,
+  },
+  directFetch: {
+    enabled: env.QWEN_DIRECT_FETCH,
+  },
+  precapture: {
+    headersStartup: env.PRECAPTURE_HEADERS_STARTUP,
+    concurrency: env.PRECAPTURE_HEADERS_CONCURRENCY,
+    staggerMinMs: env.PRECAPTURE_HEADERS_STAGGER_MIN_MS,
+    staggerMaxMs: env.PRECAPTURE_HEADERS_STAGGER_MAX_MS,
+  },
+  largePromptThreshold: env.LARGE_PROMPT_THRESHOLD,
+  hybridSessions: {
+    enabled: env.HYBRID_SESSIONS_ENABLED,
+    verify: env.HYBRID_SESSION_VERIFY,
+    verifyEveryMs: env.HYBRID_SESSION_VERIFY_EVERY_MS,
+    ttlMs: env.HYBRID_SESSION_TTL_MS,
+  },
+  streamDegenerateGuard: env.STREAM_DEGENERATE_GUARD,
+  authRequired: env.AUTH_REQUIRED,
+  users: {
+    defaultRateLimitRpm: env.USER_RATE_LIMIT_RPM,
+    defaultMaxConcurrency: env.USER_MAX_CONCURRENCY,
+    apiKeys: env.USER_API_KEYS,
+  },
+  adminPassword: env.ADMIN_PASSWORD,
+}
 
-export type Config = typeof config;
+export type Config = typeof config

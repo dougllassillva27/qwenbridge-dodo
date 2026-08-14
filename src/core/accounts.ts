@@ -1,208 +1,92 @@
-import "dotenv/config";
-import crypto from "crypto";
-import { getDatabase } from "./database.ts";
-import { decrypt, encrypt } from "./crypto-utils.ts";
+import crypto from 'crypto'
+import { getDatabase } from './database.js'
+import { config } from './config.js'
+import { encrypt, decrypt } from './crypto-utils.js'
 
 export interface QwenAccount {
-  id: string;
-  email: string;
-  password: string;
-  cooldown_until?: number;
-  cooldown_reason?: string | null;
+  id: string
+  email: string
+  password: string
+  cooldown_until?: number
+  cooldown_reason?: string | null
 }
 
-function generateId(email: string): string {
-  return crypto
-    .createHash("md5")
-    .update(email)
-    .digest("hex")
-    .replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, "$1-$2-$3-$4-$5");
-}
-
-function parseEnvAccounts(): QwenAccount[] {
-  const envAccounts = process.env.QWEN_ACCOUNTS;
-  if (!envAccounts) return [];
-
-  const separator = envAccounts.includes(";") ? ";" : ",";
-
-  return envAccounts
-    .split(separator)
-    .map((entry, index) => {
-      const trimmed = entry.trim();
-      const colonIdx = trimmed.indexOf(":");
-      if (colonIdx === -1) {
-        console.warn(
-          `[Accounts] Invalid QWEN_ACCOUNTS entry at index ${index}: "${trimmed}"`,
-        );
-        return null;
-      }
-      const email = trimmed.substring(0, colonIdx);
-      const password = trimmed.substring(colonIdx + 1);
-      if (!email || !password) {
-        console.warn(
-          `[Accounts] Invalid QWEN_ACCOUNTS entry at index ${index}: "${trimmed}"`,
-        );
-        return null;
-      }
-      return {
-        id: generateId(email),
-        email: email.trim(),
-        password: password.trim(),
-      };
-    })
-    .filter((a): a is QwenAccount => a !== null);
-}
-
-let lastSyncedEnv = "";
-let lastSyncTime = 0;
-const SYNC_INTERVAL = 30_000;
-
-function syncEnvAccounts(): void {
-  const envAccounts = process.env.QWEN_ACCOUNTS || "";
-  const now = Date.now();
-  if (envAccounts === lastSyncedEnv && now - lastSyncTime < SYNC_INTERVAL)
-    return;
-
-  lastSyncedEnv = envAccounts;
-  lastSyncTime = now;
-
-  const accounts = parseEnvAccounts();
-  if (accounts.length === 0) return;
-
-  const db = getDatabase();
-  const upsert = db.prepare(`
-    INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)
-    ON CONFLICT(email) DO UPDATE SET password = excluded.password, updated_at = datetime('now')
-  `);
-
-  const sync = db.transaction(() => {
-    for (const acc of accounts) {
-      upsert.run(acc.id, acc.email, encrypt(acc.password));
-    }
-    
-    // [Dodo] Faxina de banco de dados: remove contas fantasmas apagadas do .env
-    if (accounts.length > 0) {
-      const placeholders = accounts.map(() => "?").join(",");
-      const emails = accounts.map((a) => a.email);
-      db.prepare(`DELETE FROM accounts WHERE email NOT IN (${placeholders})`).run(...emails);
-    }
-  });
-
-  sync();
-}
-
-let accountsCache: QwenAccount[] | null = null;
-let accountsCacheTime = 0;
-const ACCOUNTS_CACHE_TTL = 5_000;
+let accountsCache: QwenAccount[] | null = null
+let accountsCacheTimestamp = 0
+const ACCOUNTS_CACHE_TTL = config.cache.defaultTTL * 1000
 
 function getCachedAccounts(): QwenAccount[] {
-  syncEnvAccounts();
-
-  const now = Date.now();
-  if (accountsCache && now - accountsCacheTime < ACCOUNTS_CACHE_TTL) {
-    return accountsCache;
+  const now = Date.now()
+  if (!accountsCache || (now - accountsCacheTimestamp) > ACCOUNTS_CACHE_TTL) {
+    const db = getDatabase()
+    const rows = db.prepare('SELECT id, email, password, cooldown_until, cooldown_reason FROM accounts ORDER BY created_at ASC').all() as QwenAccount[]
+    accountsCache = rows.map(row => ({
+      ...row,
+      password: decrypt(row.password),
+    }))
+    accountsCacheTimestamp = now
   }
-
-  const db = getDatabase();
-  const rows = db
-    .prepare(
-      "SELECT id, email, password, cooldown_until, cooldown_reason FROM accounts ORDER BY created_at ASC",
-    )
-    .all() as QwenAccount[];
-
-  accountsCache = rows.map((row) => ({
-    ...row,
-    password: decrypt(row.password),
-  }));
-  accountsCacheTime = now;
-  return accountsCache;
-}
-
-export function loadAccounts(): QwenAccount[] {
-  return getCachedAccounts().map((account) => ({
-    ...account,
-    password: "***",
-  }));
-}
-
-export function loadConfiguredAccounts(): QwenAccount[] {
-  const envAccounts = parseEnvAccounts();
-  if (envAccounts.length === 0) return [];
-  
-  const allAccounts = getCachedAccounts();
-  const envEmails = new Set(envAccounts.map((a) => a.email));
-  
-  return allAccounts
-    .filter((account) => envEmails.has(account.email))
-    .map((account) => ({
-      ...account,
-      password: "***",
-    }));
+  return accountsCache
 }
 
 export function invalidateAccountsCache(): void {
-  accountsCache = null;
-  accountsCacheTime = 0;
+  accountsCache = null
+  accountsCacheTimestamp = 0
 }
 
-export function addAccount(
-  email: string,
-  password: string,
-  id?: string,
-): QwenAccount {
-  if (!email || typeof email !== "string" || email.trim().length === 0) {
-    throw new Error("Email is required");
+export function loadAccounts(): QwenAccount[] {
+  return getCachedAccounts().map(a => ({ ...a, password: '***' }))
+}
+
+export function addAccount(email: string, password: string, id?: string): QwenAccount {
+  if (!email || typeof email !== 'string' || email.trim().length === 0) {
+    throw new Error('Email is required')
   }
 
-  const db = getDatabase();
-
-  const existing = db
-    .prepare("SELECT id FROM accounts WHERE email = ?")
-    .get(email.trim());
+  const db = getDatabase()
+  const existing = db.prepare('SELECT id FROM accounts WHERE email = ?').get(email.trim())
   if (existing) {
-    throw new Error("Account with this email already exists");
+    throw new Error(`Account with email ${email} already exists`)
   }
 
+  const encryptedPassword = encrypt(password)
+  
   const newAccount: QwenAccount = {
     id: id || crypto.randomUUID(),
     email: email.trim(),
     password,
-  };
+  }
 
-  db.prepare("INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)").run(
+  db.prepare('INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)').run(
     newAccount.id,
     newAccount.email,
-    encrypt(newAccount.password),
-  );
+    encryptedPassword,
+  )
 
-  invalidateAccountsCache();
-  return newAccount;
+  invalidateAccountsCache()
+  return newAccount
 }
 
 export function removeAccount(id: string): boolean {
-  const db = getDatabase();
-  const result = db.prepare("DELETE FROM accounts WHERE id = ?").run(id);
-  invalidateAccountsCache();
-  return result.changes > 0;
+  const db = getDatabase()
+  const result = db.prepare('DELETE FROM accounts WHERE id = ?').run(id)
+  if (result.changes > 0) {
+    invalidateAccountsCache()
+  }
+  return result.changes > 0
 }
 
 export function listAccounts(): QwenAccount[] {
-  return loadAccounts();
+  return loadAccounts()
 }
 
 export function getAccountCredentials(id: string): QwenAccount | undefined {
-  const cached = getCachedAccounts();
-  return cached.find((a) => a.id === id);
+  const cached = getCachedAccounts()
+  return cached.find(a => a.id === id)
 }
 
-export function updateAccountCooldown(
-  id: string,
-  cooldownUntil: number,
-  reason: string | null,
-): void {
-  const db = getDatabase();
-  db.prepare(
-    "UPDATE accounts SET cooldown_until = ?, cooldown_reason = ? WHERE id = ?",
-  ).run(cooldownUntil, reason, id);
-  invalidateAccountsCache();
+export function updateAccountCooldown(id: string, cooldownUntil: number, reason: string | null): void {
+  const db = getDatabase()
+  db.prepare('UPDATE accounts SET cooldown_until = ?, cooldown_reason = ? WHERE id = ?').run(cooldownUntil, reason, id)
+  invalidateAccountsCache()
 }

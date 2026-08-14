@@ -48,36 +48,100 @@ function anthropicError(
 /**
  * Verify Anthropic API key
  */
-function constantTimeStringEqual(provided: string, expected: string): boolean {
-  const providedBuf = Buffer.from(provided);
-  const expectedBuf = Buffer.from(expected);
-  const providedHash = crypto.createHash("sha256").update(providedBuf).digest();
-  const expectedHash = crypto.createHash("sha256").update(expectedBuf).digest();
-
-  return (
-    crypto.timingSafeEqual(providedHash, expectedHash) &&
-    providedBuf.length === expectedBuf.length
-  );
-}
-
 function verifyAnthropicApiKey(c: Context): boolean {
   const apiKey = process.env.API_KEY || config.apiKey;
   if (!apiKey) return true; // No key configured = open access
 
-  const candidates: string[] = [];
-  const auth = c.req.header("Authorization");
-  if (auth?.startsWith("Bearer ")) {
-    const token = auth.slice(7).trim();
-    if (token) candidates.push(token);
-  }
-  const xApiKey = c.req.header("x-api-key")?.trim();
-  if (xApiKey) candidates.push(xApiKey);
+  const providedKey = c.req.header("x-api-key");
+  if (!providedKey) return false;
 
-  if (candidates.length === 0) return false;
-  return candidates.some((key) => constantTimeStringEqual(key, apiKey));
+  return providedKey === apiKey;
 }
 
-// /v1/models is owned by api/models.ts (OpenAI + Anthropic dual format).
+/**
+ * GET /v1/models - List available models (Anthropic format)
+ */
+app.get("/v1/models", async (c) => {
+  try {
+    const { fetchQwenModels } = await import("../../services/qwen.js");
+
+    // Check if we should return Anthropic format
+    const anthropicVersion = c.req.header("anthropic-version");
+    const isAnthropicFormat = !!anthropicVersion;
+
+    const models = await fetchQwenModels();
+
+    if (isAnthropicFormat) {
+      // Return Anthropic format
+      return c.json({
+        data: models.map((m: any) => ({
+          id: m.id,
+          display_name: m.id,
+          created_at: new Date().toISOString(),
+          max_input_tokens: 1000000,
+          max_tokens: 8192,
+          type: "model" as const,
+          capabilities: {
+            batch: { supported: false },
+            citations: { supported: false },
+            code_execution: { supported: false },
+            image_input: { supported: true },
+            pdf_input: { supported: false },
+            structured_outputs: { supported: true },
+            thinking: {
+              supported: true,
+              types: { enabled: { supported: true } },
+            },
+          },
+        })),
+        has_more: false,
+      });
+    } else {
+      // Return OpenAI format (existing behavior)
+      return c.json({
+        object: "list",
+        data: models,
+      });
+    }
+  } catch (error) {
+    console.error("[Anthropic] Error fetching models:", error);
+    return anthropicError(c, "api_error", "Failed to fetch models", 500);
+  }
+});
+
+/**
+ * GET /v1/models/:model_id - Get specific model
+ */
+app.get("/v1/models/:model_id", async (c) => {
+  const modelId = c.req.param("model_id");
+
+  try {
+    const { fetchQwenModels } = await import("../../services/qwen.js");
+    const models = await fetchQwenModels();
+    const model = models.find((m: any) => m.id === modelId);
+
+    if (!model) {
+      return anthropicError(
+        c,
+        "not_found_error",
+        `Model '${modelId}' not found`,
+        404,
+      );
+    }
+
+    return c.json({
+      id: model.id,
+      display_name: model.id,
+      created_at: new Date().toISOString(),
+      max_input_tokens: 1000000,
+      max_tokens: 8192,
+      type: "model" as const,
+    });
+  } catch (error) {
+    console.error("[Anthropic] Error fetching model:", error);
+    return anthropicError(c, "api_error", "Failed to fetch model", 500);
+  }
+});
 
 /**
  * POST /v1/messages - Create a message (Anthropic format)
@@ -126,10 +190,6 @@ app.post("/v1/messages", async (c) => {
     const openaiRequest = translateAnthropicToOpenAI(body);
     openaiRequest.stream = false; // We handle streaming ourselves
 
-    // Import and use the existing chat completion logic
-    const { chatCompletions: processChatCompletion } =
-      await import("../../routes/chat.js");
-
     if (isStream) {
       // Streaming mode
       c.header("Content-Type", "text/event-stream");
@@ -167,11 +227,10 @@ app.post("/v1/messages", async (c) => {
           currentBlockType: null as string | null,
           requestModel,
           inputTokens: 0,
-          inReasoning: false,
         };
 
-        // Timeout handler
-        const timeoutMs = 300000; // 5 minutes
+        // Timeout handler - 45 seconds hang timeout
+        const timeoutMs = 45000;
         let timeoutId: NodeJS.Timeout | null = null;
         let isDone = false;
 
@@ -179,23 +238,24 @@ app.post("/v1/messages", async (c) => {
           if (timeoutId) clearTimeout(timeoutId);
           timeoutId = setTimeout(() => {
             if (!isDone) {
-              console.error("⏱️  [Anthropic] Stream timeout");
+              console.error("[Anthropic] Stream timeout (45s reached without activity)");
               stream.close().catch(() => {});
             }
           }, timeoutMs);
         };
 
-        // [Dodo] Keep-alive ping para evitar que clientes (como o Cline)
-        // abortem a conexão por timeout enquanto a Qwen processa raciocínios longos.
-        const pingInterval = setInterval(() => {
-          if (!isDone) {
-            write(`event: ping\ndata: {"type": "ping"}\n\n`).catch(() => {});
-          }
-        }, 10000);
+        const controller = new AbortController();
+
+        // Listen for client connection abort to cleanly stop upstream stream and avoid Node unhandled errors
+        c.req.raw.signal?.addEventListener("abort", () => {
+          isDone = true;
+          if (timeoutId) clearTimeout(timeoutId);
+          controller.abort();
+          console.log("[Anthropic] Client aborted connection during streaming");
+        });
 
         try {
-          // Make the actual request to Qwen
-          const controller = new AbortController();
+          // Make the actual request to the local Qwen OpenAI completions endpoint
           const response = await fetch(
             `http://127.0.0.1:${config.server.port}/v1/chat/completions`,
             {
@@ -231,6 +291,10 @@ app.post("/v1/messages", async (c) => {
 
           try {
             while (true) {
+              if (controller.signal.aborted || isDone) {
+                break;
+              }
+
               const { done, value } = await reader.read();
               if (done) break;
 
@@ -240,8 +304,10 @@ app.post("/v1/messages", async (c) => {
               responseBuffer = lines.pop() || "";
 
               for (const line of lines) {
-                if (!line.startsWith("data: ")) continue;
-                const data = line.slice(6);
+                const text = line.trim();
+                if (!text || text.startsWith(":")) continue;
+                if (!text.startsWith("data: ")) continue;
+                const data = text.slice(6);
                 if (data === "[DONE]") continue;
 
                 try {
@@ -264,20 +330,26 @@ app.post("/v1/messages", async (c) => {
 
           isDone = true;
           if (timeoutId) clearTimeout(timeoutId);
-          clearInterval(pingInterval);
 
-          // Send message_stop event
-          await write(
-            `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
-          );
-        } catch (error) {
+          // Send message_stop event if not aborted
+          if (!controller.signal.aborted) {
+            await write(
+              `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+            );
+          }
+        } catch (error: any) {
           isDone = true;
           if (timeoutId) clearTimeout(timeoutId);
-          clearInterval(pingInterval);
-          console.error("❌ [Anthropic] Stream error:", error);
+          
+          if (error.name === "AbortError" || controller.signal.aborted) {
+            // Already handled in abort event listener
+            return;
+          }
+
+          console.error("[Anthropic] Stream error:", error);
           try {
             await write(
-              `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: "Stream error" } })}\n\n`,
+              `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: `Stream error: ${error.message}` } })}\n\n`,
             );
           } catch {
             // Client disconnected
@@ -321,9 +393,9 @@ app.post("/v1/messages", async (c) => {
 
       return c.json(anthropicResponse);
     }
-  } catch (error) {
-    console.error("❌ [Anthropic] Error:", error);
-    return anthropicError(c, "api_error", "Internal server error", 500);
+  } catch (error: any) {
+    console.error("[Anthropic] Error:", error);
+    return anthropicError(c, "api_error", error.message || "Internal server error", 500);
   }
 });
 

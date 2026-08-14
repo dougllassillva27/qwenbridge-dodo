@@ -1,24 +1,14 @@
-import type { Context } from "hono";
-import { Readable } from "stream";
-import {
-  getBasicHeaders,
-  isAuthMockEnabled,
-} from "../services/auth-playwright.ts";
-import { v4 as uuidv4 } from "uuid";
-import { ValidationError, ServiceUnavailable } from "../core/errors.js";
-import { sendOpenAIError } from "../api/error-helpers.js";
-import { buildQwenRequestHeaders } from "../services/qwen-headers.ts";
-import { qwenUrl } from "../services/qwen-url.ts";
-import { config } from "../core/config.ts";
+/*
+ * File: upload.ts
+ * Project: qwenproxy
+ * File upload handler - forwards files to Qwen's OSS storage
+ */
 
-// Cache the heavy ali-oss module so we import it once, not on every upload.
-let cachedOSSModule: any = null;
-async function getOSSModule() {
-  if (!cachedOSSModule) {
-    cachedOSSModule = (await import("ali-oss")).default;
-  }
-  return cachedOSSModule;
-}
+import type { Context } from "hono";
+import type OSSType from "ali-oss";
+import { getQwenHeaders } from "../services/playwright.js";
+import { config } from "../core/config.js";
+import crypto from "crypto";
 
 interface STSResponse {
   success: boolean;
@@ -36,297 +26,9 @@ interface STSResponse {
   };
 }
 
-interface FileTypeInfo {
-  mime: string;
-  showType: "image" | "video" | "audio" | "file";
-  fileClass: "vision" | "video" | "audio" | "file";
-  qwenFileType: "image" | "video" | "audio" | "file";
-}
-
-const DEFAULT_FILE_TYPE_INFO: FileTypeInfo = {
-  mime: "application/octet-stream",
-  showType: "file",
-  fileClass: "file",
-  qwenFileType: "file",
-};
-
-const FILE_TYPE_MAP: Record<string, FileTypeInfo> = {
-  png: {
-    mime: "image/png",
-    showType: "image",
-    fileClass: "vision",
-    qwenFileType: "image",
-  },
-  jpg: {
-    mime: "image/jpeg",
-    showType: "image",
-    fileClass: "vision",
-    qwenFileType: "image",
-  },
-  jpeg: {
-    mime: "image/jpeg",
-    showType: "image",
-    fileClass: "vision",
-    qwenFileType: "image",
-  },
-  gif: {
-    mime: "image/gif",
-    showType: "image",
-    fileClass: "vision",
-    qwenFileType: "image",
-  },
-  webp: {
-    mime: "image/webp",
-    showType: "image",
-    fileClass: "vision",
-    qwenFileType: "image",
-  },
-  mp4: {
-    mime: "video/mp4",
-    showType: "video",
-    fileClass: "video",
-    qwenFileType: "video",
-  },
-  mov: {
-    mime: "video/quicktime",
-    showType: "video",
-    fileClass: "video",
-    qwenFileType: "video",
-  },
-  avi: {
-    mime: "video/x-msvideo",
-    showType: "video",
-    fileClass: "video",
-    qwenFileType: "video",
-  },
-  webm: {
-    mime: "video/webm",
-    showType: "video",
-    fileClass: "video",
-    qwenFileType: "video",
-  },
-  mkv: {
-    mime: "video/x-matroska",
-    showType: "video",
-    fileClass: "video",
-    qwenFileType: "video",
-  },
-  mp3: {
-    mime: "audio/mpeg",
-    showType: "audio",
-    fileClass: "audio",
-    qwenFileType: "audio",
-  },
-  wav: {
-    mime: "audio/wav",
-    showType: "audio",
-    fileClass: "audio",
-    qwenFileType: "audio",
-  },
-  ogg: {
-    mime: "audio/ogg",
-    showType: "audio",
-    fileClass: "audio",
-    qwenFileType: "audio",
-  },
-  flac: {
-    mime: "audio/flac",
-    showType: "audio",
-    fileClass: "audio",
-    qwenFileType: "audio",
-  },
-  m4a: {
-    mime: "audio/mp4",
-    showType: "audio",
-    fileClass: "audio",
-    qwenFileType: "audio",
-  },
-  aac: {
-    mime: "audio/aac",
-    showType: "audio",
-    fileClass: "audio",
-    qwenFileType: "audio",
-  },
-  pdf: {
-    mime: "application/pdf",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  doc: {
-    mime: "application/msword",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  docx: {
-    mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  xls: {
-    mime: "application/vnd.ms-excel",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  xlsx: {
-    mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  ppt: {
-    mime: "application/vnd.ms-powerpoint",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  pptx: {
-    mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  txt: {
-    mime: "text/plain",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  md: {
-    mime: "text/markdown",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  csv: {
-    mime: "text/csv",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  json: {
-    mime: "application/json",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  xml: {
-    mime: "application/xml",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  html: {
-    mime: "text/html",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-  zip: {
-    mime: "application/zip",
-    showType: "file",
-    fileClass: "file",
-    qwenFileType: "file",
-  },
-};
-
-const SUPPORTED_MIME_TYPES = new Set(
-  Object.values(FILE_TYPE_MAP).map((typeInfo) => typeInfo.mime),
-);
-
-function getFileExtension(filename: string): string {
-  return filename.split(".").pop()?.toLowerCase() || "";
-}
-
-function detectFileType(filename: string): FileTypeInfo {
-  return FILE_TYPE_MAP[getFileExtension(filename)] || DEFAULT_FILE_TYPE_INFO;
-}
-
-function getExtensionFromMime(mime: string): string | undefined {
-  for (const [ext, typeInfo] of Object.entries(FILE_TYPE_MAP)) {
-    if (typeInfo.mime === mime) {
-      return ext;
-    }
-  }
-  return undefined;
-}
-
-function getMaxUploadSize(fileType: string): number {
-  if (fileType.startsWith("video/")) return 100 * 1024 * 1024;
-  if (fileType.startsWith("audio/")) return 50 * 1024 * 1024;
-  return 20 * 1024 * 1024;
-}
-
-function getFilenameFromUrl(url: string, mime?: string): string {
-  let filename = "";
-
-  try {
-    filename = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
-  } catch {
-    filename = url.split("/").pop()?.split("?")[0] || "";
-  }
-
-  if (!filename) {
-    filename = "file";
-  }
-
-  if (!filename.includes(".")) {
-    const ext = mime ? getExtensionFromMime(mime) : undefined;
-    if (ext) {
-      filename = `${filename}.${ext}`;
-    }
-  }
-
-  return filename || "file.bin";
-}
-
-async function downloadRemoteMedia(url: string): Promise<{
-  buffer: Buffer;
-  filename: string;
-  mime: string;
-}> {
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": config.auth.userAgent,
-      Accept: "image/*,*/*;q=0.8",
-    },
-  });
-  if (!response.ok) {
-    throw new Error(`Remote media download failed: ${response.status}`);
-  }
-
-  const headerMime =
-    response.headers.get("content-type")?.split(";")[0].trim() || "";
-  const filename = getFilenameFromUrl(url, headerMime || undefined);
-  const detectedMime =
-    headerMime && SUPPORTED_MIME_TYPES.has(headerMime)
-      ? headerMime
-      : detectFileType(filename).mime;
-
-  if (!SUPPORTED_MIME_TYPES.has(detectedMime)) {
-    throw new Error(
-      `Unsupported remote media type: ${headerMime || detectedMime || "unknown"}`,
-    );
-  }
-
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const maxSize = getMaxUploadSize(detectedMime);
-  if (buffer.length > maxSize) {
-    throw new Error(`Remote media too large: ${buffer.length}`);
-  }
-
-  return {
-    buffer,
-    filename,
-    mime: detectedMime,
-  };
-}
-
 /**
  * Get STS token from Qwen for file upload
+ * Retries once with refreshed headers if 401/RateLimited
  */
 async function getSTSToken(
   filename: string,
@@ -334,102 +36,109 @@ async function getSTSToken(
   filetype: string,
   headers: Record<string, string>,
 ): Promise<STSResponse["data"]> {
-  const response = await fetch(
-    qwenUrl("/api/v2/files/getstsToken"),
-    {
-      method: "POST",
-      headers: buildQwenRequestHeaders({
-        cookie: headers.cookie,
-        userAgent: headers["user-agent"],
-        bxUa: headers["bx-ua"],
-        bxUmidtoken: headers["bx-umidtoken"],
-        bxV: headers["bx-v"],
-      }),
-      body: JSON.stringify({ filename, filesize: String(filesize), filetype }),
-    },
-  );
-
-  if (!response.ok) {
-    const errorText = await response.text().catch(() => "");
-    throw new Error(
-      `STS token request failed: ${response.status} ${errorText.substring(0, 200)}`,
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const response = await fetch(
+      "https://chat.qwen.ai/api/v2/files/getstsToken",
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/plain, */*",
+          "Content-Type": "application/json",
+          Cookie: headers.cookie,
+          Origin: "https://chat.qwen.ai",
+          Referer: "https://chat.qwen.ai/",
+          "User-Agent": headers["user-agent"],
+          "X-Request-Id": crypto.randomUUID(),
+          "bx-ua": headers["bx-ua"],
+          "bx-umidtoken": headers["bx-umidtoken"],
+          "bx-v": headers["bx-v"],
+        },
+        body: JSON.stringify({ filename, filesize: String(filesize), filetype }),
+      },
     );
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "");
+      // On 401, try refreshing headers once
+      if (response.status === 401 && attempt === 0) {
+        console.warn("[Upload] STS 401, refreshing headers and retrying...");
+        const refreshed = await refreshUploadHeaders();
+        if (refreshed) {
+          Object.assign(headers, refreshed);
+          continue;
+        }
+      }
+      throw new Error(
+        `STS token request failed: ${response.status} ${errorText.substring(0, 200)}`,
+      );
+    }
+
+    const data = await response.json();
+    if (!data.success || !data.data) {
+      // Check if it's a 401/RateLimited error inside the response body
+      const code = data.data?.code || data.code;
+      const details = data.data?.details || data.message || "";
+      if ((code === "RateLimited" && details.includes("401")) || details.includes("Unauthorized")) {
+        if (attempt === 0) {
+          console.warn("[Upload] STS returned 401 in body, refreshing headers and retrying...");
+          const refreshed = await refreshUploadHeaders();
+          if (refreshed) {
+            Object.assign(headers, refreshed);
+            continue;
+          }
+        }
+      }
+      throw new Error(
+        `STS token invalid: ${JSON.stringify(data).substring(0, 200)}`,
+      );
+    }
+
+    return data.data;
   }
 
-  const data = await response.json();
-  if (!data.success || !data.data) {
-    throw new Error(
-      `STS token invalid: ${JSON.stringify(data).substring(0, 200)}`,
-    );
-  }
-
-  return data.data;
-}
-
-/** Minimal OSS client surface used by upload helpers (easy to mock in tests). */
-export interface OssUploadClient {
-  putStream: (
-    name: string,
-    stream: Readable,
-    options?: {
-      contentLength?: number;
-      headers?: Record<string, string>;
-    },
-  ) => Promise<unknown>;
-  multipartUpload: (
-    name: string,
-    file: Buffer | string,
-    options?: {
-      partSize?: number;
-      headers?: Record<string, string>;
-    },
-  ) => Promise<unknown>;
+  throw new Error("STS token request failed after retries");
 }
 
 /**
- * Stream-friendly OSS body upload:
- * - small/medium: putStream (avoids ali-oss put() extra buffering path)
- * - large: multipartUpload (better reliability for big media)
+ * Refresh upload headers by forcing a new Qwen headers intercept
  */
-export async function uploadBufferToOssClient(
-  client: OssUploadClient,
-  filePath: string,
-  buffer: Buffer,
-  contentType: string,
-  multipartThresholdBytes: number = config.oss.multipartThresholdBytes,
-): Promise<"putStream" | "multipart"> {
-  const headers = { "Content-Type": contentType };
-
-  if (buffer.length >= multipartThresholdBytes) {
-    const partSize = Math.min(
-      5 * 1024 * 1024,
-      Math.max(256 * 1024, Math.floor(buffer.length / 4)),
-    );
-    await client.multipartUpload(filePath, buffer, {
-      partSize,
-      headers,
-    });
-    return "multipart";
+async function refreshUploadHeaders(): Promise<Record<string, string> | null> {
+  try {
+    const { headers: qHeaders } = await getQwenHeaders(true);
+    if (qHeaders['cookie'] && qHeaders['bx-ua']) {
+      return {
+        cookie: qHeaders['cookie'] || '',
+        "user-agent": qHeaders['user-agent'] || '',
+        "bx-ua": qHeaders['bx-ua'] || '',
+        "bx-umidtoken": qHeaders['bx-umidtoken'] || '',
+        "bx-v": qHeaders['bx-v'] || '',
+      };
+    }
+  } catch (err: any) {
+    console.error("[Upload] Failed to refresh headers:", err.message);
   }
-
-  await client.putStream(filePath, Readable.from(buffer), {
-    contentLength: buffer.length,
-    headers,
-  });
-  return "putStream";
+  return null;
 }
 
 /**
  * Upload file to Alibaba Cloud OSS using STS credentials
  */
+// Cache the heavy ali-oss module so we import it once, not on every upload.
+// @types/ali-oss uses `export = OSS`, so the constructor type is `typeof OSSType`.
+// esModuleInterop exposes the class on the `.default` property at runtime.
+let cachedOSSModule: typeof OSSType | null = null;
+async function getOSSModule() {
+  if (!cachedOSSModule) {
+    cachedOSSModule = (await import("ali-oss")).default;
+  }
+  return cachedOSSModule;
+}
+
 async function uploadToOSS(
-  fileBuffer: ArrayBuffer | Buffer,
+  fileBuffer: ArrayBuffer,
   stsData: STSResponse["data"],
   filename: string,
 ): Promise<string> {
-  if (isAuthMockEnabled()) {
-    return stsData.file_url.split("?")[0];
-  }
   const {
     access_key_id,
     access_key_secret,
@@ -440,6 +149,10 @@ async function uploadToOSS(
     region,
     endpoint,
   } = stsData;
+
+  if (process.env.TEST_MOCK_PLAYWRIGHT) {
+    return stsData.file_url.split("?")[0];
+  }
 
   const OSS = await getOSSModule();
   const client = new OSS({
@@ -456,14 +169,51 @@ async function uploadToOSS(
       stsToken: security_token,
     }),
     refreshSTSTokenInterval: 300000,
-  }) as unknown as OssUploadClient;
+  });
 
-  const buffer = Buffer.isBuffer(fileBuffer)
-    ? fileBuffer
-    : Buffer.from(fileBuffer);
-  const contentType = detectFileType(filename).mime;
+  const buffer = Buffer.from(fileBuffer);
+  const ext = filename.split(".").pop()?.toLowerCase() || "";
+  const mimeMap: Record<string, string> = {
+    // Images
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    // Video
+    mp4: "video/mp4",
+    mov: "video/quicktime",
+    avi: "video/x-msvideo",
+    webm: "video/webm",
+    mkv: "video/x-matroska",
+    // Audio
+    mp3: "audio/mpeg",
+    wav: "audio/wav",
+    ogg: "audio/ogg",
+    flac: "audio/flac",
+    m4a: "audio/mp4",
+    aac: "audio/aac",
+    // Documents
+    pdf: "application/pdf",
+    doc: "application/msword",
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xls: "application/vnd.ms-excel",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ppt: "application/vnd.ms-powerpoint",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    txt: "text/plain",
+    md: "text/markdown",
+    csv: "text/csv",
+    json: "application/json",
+    xml: "application/xml",
+    html: "text/html",
+    zip: "application/zip",
+  };
+  const contentType = mimeMap[ext] || "application/octet-stream";
 
-  await uploadBufferToOssClient(client, file_path, buffer, contentType);
+  await client.put(file_path, buffer, {
+    headers: { "Content-Type": contentType },
+  });
 
   return file_url.split("?")[0];
 }
@@ -478,63 +228,94 @@ export async function uploadFile(c: Context) {
     const file = formData.get("file") as File | null;
 
     if (!file) {
-      return sendOpenAIError(c, new ValidationError("No file provided"));
+      return c.json({ error: "No file provided" }, 400);
     }
 
-    // Detect MIME from filename if the client sends a generic type
+    // Detect MIME from filename if browser sends generic type
     let fileType = file.type;
     if (fileType === "application/octet-stream" || !fileType) {
-      fileType = detectFileType(file.name).mime;
-    }
-
-    // Validate file type is supported by Qwen
-    if (!SUPPORTED_MIME_TYPES.has(fileType)) {
-      return sendOpenAIError(
-        c,
-        new ValidationError(
-          `Unsupported file type: ${file.type || "unknown"}. Supported: images, videos, audio, documents (PDF, DOC, XLS, PPT, TXT, MD, CSV, JSON, XML, HTML, ZIP)`,
-        ),
-      );
+      const ext = file.name.split(".").pop()?.toLowerCase() || "";
+      const extMimeMap: Record<string, string> = {
+        jpg: "image/jpeg",
+        jpeg: "image/jpeg",
+        png: "image/png",
+        gif: "image/gif",
+        webp: "image/webp",
+        mp4: "video/mp4",
+        mov: "video/quicktime",
+        avi: "video/x-msvideo",
+        webm: "video/webm",
+        mkv: "video/x-matroska",
+        mp3: "audio/mpeg",
+        wav: "audio/wav",
+        ogg: "audio/ogg",
+        flac: "audio/flac",
+        m4a: "audio/mp4",
+        aac: "audio/aac",
+        pdf: "application/pdf",
+        doc: "application/msword",
+        docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        xls: "application/vnd.ms-excel",
+        xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ppt: "application/vnd.ms-powerpoint",
+        pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        txt: "text/plain",
+        md: "text/markdown",
+        csv: "text/csv",
+        json: "application/json",
+        xml: "application/xml",
+        html: "text/html",
+        zip: "application/zip",
+      };
+      fileType = extMimeMap[ext] || "application/octet-stream";
     }
 
     // Determine media category for size limits
     const isVideo = fileType.startsWith("video/");
     const isAudio = fileType.startsWith("audio/");
-    const maxSize = getMaxUploadSize(fileType);
+    const isImage = fileType.startsWith("image/");
+    let maxSize = 20 * 1024 * 1024; // 20MB default for docs/images
+    if (isVideo)
+      maxSize = 100 * 1024 * 1024; // 100MB for video
+    else if (isAudio) maxSize = 50 * 1024 * 1024; // 50MB for audio
     if (file.size > maxSize) {
       const sizeLabel = isVideo
         ? "100MB (video)"
         : isAudio
           ? "50MB (audio)"
           : "20MB (image/doc)";
-      return sendOpenAIError(
-        c,
-        new ValidationError(`File too large. Max size: ${sizeLabel}`),
-      );
+      return c.json({ error: `File too large. Max size: ${sizeLabel}` }, 400);
     }
 
-    let headers: Record<string, string>;
+    // Get full Qwen headers with bx-ua/bx-umidtoken
+    let headers: Record<string, string> | null = null;
     try {
-      const { cookie, userAgent, bxV, bxUa, bxUmidtoken } =
-        await getBasicHeaders();
-      headers = {
-        cookie,
-        "user-agent": userAgent,
-        "bx-v": bxV,
-      };
-      if (bxUa) headers["bx-ua"] = bxUa;
-      if (bxUmidtoken) headers["bx-umidtoken"] = bxUmidtoken;
-    } catch (error) {
-      return sendOpenAIError(
-        c,
-        new ServiceUnavailable(
-          `Authentication unavailable: ${error instanceof Error ? error.message : String(error)}`,
-        ),
+      const { headers: qHeaders } = await getQwenHeaders(false);
+      if (qHeaders['cookie'] && qHeaders['bx-ua']) {
+        headers = {
+          cookie: qHeaders['cookie'] || '',
+          "user-agent": qHeaders['user-agent'] || '',
+          "bx-ua": qHeaders['bx-ua'] || '',
+          "bx-umidtoken": qHeaders['bx-umidtoken'] || '',
+          "bx-v": qHeaders['bx-v'] || '',
+        };
+      }
+    } catch (err: any) {
+      console.error("[Upload] Failed to get Qwen headers:", err.message);
+    }
+
+    if (!headers) {
+      return c.json(
+        { error: "Authentication not ready. Send a chat message first." },
+        503,
       );
     }
 
     // Determine Qwen filetype for STS token
-    const qwenFileType = detectFileType(file.name).qwenFileType;
+    let qwenFileType = "file";
+    if (isVideo) qwenFileType = "video";
+    else if (isAudio) qwenFileType = "audio";
+    else if (isImage) qwenFileType = "image";
 
     const stsData = await getSTSToken(
       file.name,
@@ -551,12 +332,9 @@ export async function uploadFile(c: Context) {
       filename: file.name,
       type: qwenFileType,
     });
-  } catch (error) {
-    console.error(
-      "[Upload] Error:",
-      error instanceof Error ? error.message : String(error),
-    );
-    return sendOpenAIError(c, error);
+  } catch (error: any) {
+    console.error("[Upload] Error:", error.message);
+    return c.json({ error: error.message }, 500);
   }
 }
 
@@ -597,6 +375,228 @@ export interface QwenFileEntry {
 }
 
 /**
+ * Detect file type from URL or filename
+ */
+function detectFileType(filename: string): {
+  mime: string;
+  showType: string;
+  fileClass: string;
+  qwenFileType: string;
+} {
+  const ext = filename.split(".").pop()?.toLowerCase() || "";
+
+  const typeMap: Record<
+    string,
+    { mime: string; showType: string; fileClass: string; qwenFileType: string }
+  > = {
+    // Images
+    png: {
+      mime: "image/png",
+      showType: "image",
+      fileClass: "vision",
+      qwenFileType: "image",
+    },
+    jpg: {
+      mime: "image/jpeg",
+      showType: "image",
+      fileClass: "vision",
+      qwenFileType: "image",
+    },
+    jpeg: {
+      mime: "image/jpeg",
+      showType: "image",
+      fileClass: "vision",
+      qwenFileType: "image",
+    },
+    gif: {
+      mime: "image/gif",
+      showType: "image",
+      fileClass: "vision",
+      qwenFileType: "image",
+    },
+    webp: {
+      mime: "image/webp",
+      showType: "image",
+      fileClass: "vision",
+      qwenFileType: "image",
+    },
+    // Video
+    mp4: {
+      mime: "video/mp4",
+      showType: "video",
+      fileClass: "video",
+      qwenFileType: "video",
+    },
+    mov: {
+      mime: "video/quicktime",
+      showType: "video",
+      fileClass: "video",
+      qwenFileType: "video",
+    },
+    avi: {
+      mime: "video/x-msvideo",
+      showType: "video",
+      fileClass: "video",
+      qwenFileType: "video",
+    },
+    webm: {
+      mime: "video/webm",
+      showType: "video",
+      fileClass: "video",
+      qwenFileType: "video",
+    },
+    mkv: {
+      mime: "video/x-matroska",
+      showType: "video",
+      fileClass: "video",
+      qwenFileType: "video",
+    },
+    // Audio
+    mp3: {
+      mime: "audio/mpeg",
+      showType: "audio",
+      fileClass: "audio",
+      qwenFileType: "audio",
+    },
+    wav: {
+      mime: "audio/wav",
+      showType: "audio",
+      fileClass: "audio",
+      qwenFileType: "audio",
+    },
+    ogg: {
+      mime: "audio/ogg",
+      showType: "audio",
+      fileClass: "audio",
+      qwenFileType: "audio",
+    },
+    flac: {
+      mime: "audio/flac",
+      showType: "audio",
+      fileClass: "audio",
+      qwenFileType: "audio",
+    },
+    m4a: {
+      mime: "audio/mp4",
+      showType: "audio",
+      fileClass: "audio",
+      qwenFileType: "audio",
+    },
+    aac: {
+      mime: "audio/aac",
+      showType: "audio",
+      fileClass: "audio",
+      qwenFileType: "audio",
+    },
+    // Documents
+    pdf: {
+      mime: "application/pdf",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    doc: {
+      mime: "application/msword",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    docx: {
+      mime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    xls: {
+      mime: "application/vnd.ms-excel",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    xlsx: {
+      mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    ppt: {
+      mime: "application/vnd.ms-powerpoint",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    pptx: {
+      mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    txt: {
+      mime: "text/plain",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    md: {
+      mime: "text/markdown",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    csv: {
+      mime: "text/csv",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    json: {
+      mime: "application/json",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    xml: {
+      mime: "application/xml",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    html: {
+      mime: "text/html",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+    zip: {
+      mime: "application/zip",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    },
+  };
+
+  return (
+    typeMap[ext] || {
+      mime: "application/octet-stream",
+      showType: "file",
+      fileClass: "file",
+      qwenFileType: "file",
+    }
+  );
+}
+
+const TEXT_DOC_EXTENSIONS = new Set([
+  'txt', 'log', 'md', 'markdown', 'csv', 'json', 'xml', 'yml', 'yaml', 'html', 'htm', 'ini', 'conf', 'env', 'py', 'js', 'ts', 'tsx', 'jsx', 'c', 'cpp', 'h', 'java', 'go', 'rs', 'sh', 'sql',
+]);
+
+function isTextDocument(filename: string, mime: string): boolean {
+  if (mime.startsWith('text/')) return true;
+  if (mime === 'application/json' || mime === 'application/xml' || mime === 'application/javascript') return true;
+  const ext = filename.split('.').pop()?.toLowerCase() || '';
+  return TEXT_DOC_EXTENSIONS.has(ext);
+}
+
+/**
  * Process OpenAI-style image/video content into Qwen file format
  */
 export async function processImagesForQwen(
@@ -609,9 +609,10 @@ export async function processImagesForQwen(
     file_url?: { url: string };
   }>,
   headers: Record<string, string>,
-): Promise<{ text: string; files: QwenFileEntry[] }> {
+): Promise<{ text: string; files: QwenFileEntry[]; docText: string }> {
   const textParts: string[] = [];
   const files: QwenFileEntry[] = [];
+  const docTexts: string[] = [];
 
   for (const part of content) {
     if (part.type === "text" && part.text) {
@@ -634,12 +635,31 @@ export async function processImagesForQwen(
       let filename = "";
       let fileSize = 0;
       let fileId = "";
+      let fileBuffer: Buffer | null = null;
 
       if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
         try {
-          const remoteMedia = await downloadRemoteMedia(mediaUrl);
-          filename = remoteMedia.filename;
-          fileSize = remoteMedia.buffer.length;
+          const downloadRes = await fetch(mediaUrl);
+          if (!downloadRes.ok) {
+            console.error(`[Upload] Failed to download media: ${downloadRes.status} ${mediaUrl}`);
+            continue;
+          }
+          const buffer = Buffer.from(await downloadRes.arrayBuffer());
+          fileBuffer = buffer;
+          fileSize = buffer.length;
+          filename = mediaUrl.split("/").pop()?.split("?")[0] || "file.bin";
+          if (!filename.includes(".")) {
+            const mime = downloadRes.headers.get("content-type") || "";
+            const mimeExt: Record<string, string> = {
+              "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif",
+              "image/webp": "webp", "video/mp4": "mp4", "video/webm": "webm",
+              "audio/mpeg": "mp3", "audio/wav": "wav", "audio/ogg": "ogg",
+              "audio/flac": "flac", "audio/mp4": "m4a", "audio/aac": "aac",
+              "application/pdf": "pdf",
+            };
+            const ext = mimeExt[mime] || "bin";
+            filename = `${filename}.${ext}`;
+          }
           const typeInfo = detectFileType(filename);
           const stsData = await getSTSToken(
             filename,
@@ -647,15 +667,11 @@ export async function processImagesForQwen(
             typeInfo.qwenFileType,
             headers,
           );
-          fileUrl = await uploadToOSS(remoteMedia.buffer, stsData, filename);
+          fileUrl = await uploadToOSS(buffer.buffer, stsData, filename);
           fileId = stsData.file_id;
         } catch (err: any) {
-          console.warn(
-            `[Upload] Failed to re-upload remote media, falling back to source URL: ${err.message}`,
-          );
-          fileUrl = mediaUrl;
-          filename = getFilenameFromUrl(mediaUrl);
-          fileId = uuidv4();
+          console.error("[Upload] Failed to download/re-upload HTTP media:", err.message);
+          continue;
         }
       } else if (mediaUrl.startsWith("data:")) {
         try {
@@ -663,11 +679,29 @@ export async function processImagesForQwen(
           const dataMime = mediaUrl.match(/^data:([^;]+)/)?.[1] || "";
           const isVideoData = dataMime.startsWith("video/");
           const isAudioData = dataMime.startsWith("audio/");
+          const extFromMime: Record<string, string> = {
+            "video/mp4": "mp4",
+            "video/webm": "webm",
+            "video/quicktime": "mov",
+            "audio/mpeg": "mp3",
+            "audio/wav": "wav",
+            "audio/ogg": "ogg",
+            "audio/flac": "flac",
+            "audio/mp4": "m4a",
+            "audio/aac": "aac",
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/gif": "gif",
+            "image/webp": "webp",
+            "application/pdf": "pdf",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+          };
           const detectedExt =
-            getExtensionFromMime(dataMime) ||
+            extFromMime[dataMime] ||
             (isVideoData ? "mp4" : isAudioData ? "mp3" : "png");
           const base64Data = mediaUrl.split(",")[1];
           const buffer = Buffer.from(base64Data, "base64");
+          fileBuffer = buffer;
           filename = `${isVideoData ? "video" : isAudioData ? "audio" : "file"}_${Date.now()}.${detectedExt}`;
           fileSize = buffer.length;
           const typeInfo = detectFileType(filename);
@@ -677,16 +711,24 @@ export async function processImagesForQwen(
             typeInfo.qwenFileType,
             headers,
           );
-          fileUrl = await uploadToOSS(buffer, stsData, filename);
+          fileUrl = await uploadToOSS(buffer.buffer, stsData, filename);
           fileId = stsData.file_id;
         } catch (err: any) {
-          console.error("❌ [Upload] Failed to upload media:", err.message);
+          console.error("[Upload] Failed to upload media:", err.message);
           continue;
         }
       }
 
       if (fileUrl) {
         const typeInfo = detectFileType(filename);
+        if (isTextDocument(filename, typeInfo.mime) && fileBuffer) {
+          // Text documents are inlined into the prompt so the model reliably sees
+          // their content. Attaching them as `files` and letting Qwen read them
+          // is unreliable and produces terse/degenerate replies.
+          const docText = fileBuffer.toString("utf-8");
+          docTexts.push(`[File: ${filename}]\n${docText}`);
+          continue;
+        }
         files.push({
           type: typeInfo.showType,
           file: {
@@ -717,15 +759,63 @@ export async function processImagesForQwen(
           greenNet: "success",
           size: fileSize,
           error: "",
-          itemId: uuidv4(),
+          itemId: crypto.randomUUID(),
           file_type: typeInfo.mime,
           showType: typeInfo.showType,
           file_class: typeInfo.fileClass,
-          uploadTaskId: uuidv4(),
+          uploadTaskId: crypto.randomUUID(),
         });
       }
     }
   }
 
-  return { text: textParts.join("\n"), files };
+  return { text: textParts.join("\n"), files, docText: docTexts.join("\n\n---\n\n") };
+}
+const LARGE_PROMPT_THRESHOLD = config.largePromptThreshold;
+
+export async function uploadLargePromptAsFile(
+  promptText: string,
+  headers: Record<string, string>,
+): Promise<QwenFileEntry | null> {
+  const byteLength = Buffer.byteLength(promptText, "utf-8");
+  if (byteLength <= LARGE_PROMPT_THRESHOLD) return null;
+
+  const filename = `prompt_${Date.now()}.txt`;
+  const buffer = Buffer.from(promptText, "utf-8");
+
+  const stsData = await getSTSToken(filename, buffer.length, "file", headers);
+  const fileUrl = await uploadToOSS(buffer.buffer, stsData, filename);
+
+  return {
+    type: "file",
+    file: {
+      created_at: Date.now(),
+      data: {},
+      filename,
+      hash: null,
+      id: stsData.file_id,
+      user_id: "proxy-user",
+      meta: { name: filename, size: buffer.length, content_type: "text/plain" },
+      update_at: Date.now(),
+      lastModified: Date.now(),
+      name: filename,
+      webkitRelativePath: "",
+      size: buffer.length,
+      type: "text/plain",
+    },
+    id: stsData.file_id,
+    url: fileUrl,
+    name: filename,
+    collection_name: "",
+    progress: 100,
+    status: "uploaded",
+    greenNet: "success",
+    size: buffer.length,
+    error: "",
+    itemId: crypto.randomUUID(),
+    file_type: "text/plain",
+    showType: "file",
+    file_class: "file",
+    uploadTaskId: crypto.randomUUID(),
+  };
 }

@@ -9,18 +9,19 @@ import type {
   OpenAIMessage,
   OpenAITool,
   OpenAIResponse,
-} from "./types.ts";
-
-import { mapClientModelToQwen } from "../../core/model-alias.ts";
+} from "./types.js";
 
 /**
  * Map model names for Qwen compatibility
- * - Qwen models pass through as-is
- * - Claude/GPT aliases map to equivalent Qwen models
- * - Unknown models pass through (Qwen will handle the error)
+ * - Opus models map to qwen3.7-plus (with thinking)
+ * - Sonnet, Haiku and others map to qwen3.7-plus-no-thinking
  */
 export function mapAnthropicModel(model: string): string {
-  return mapClientModelToQwen(model);
+  const modelLower = model.toLowerCase();
+  if (modelLower.includes("opus")) {
+    return "qwen3.7-plus";
+  }
+  return "qwen3.7-plus-no-thinking";
 }
 
 /**
@@ -94,7 +95,7 @@ export function translateAnthropicToOpenAI(
           messages.push({ role: "user", content: text });
         }
 
-        // Image parts → convert to multimodal content (not fully supported, skip for now)
+        // Image parts → convert to multimodal content
         if (imageParts.length > 0 && textParts.length === 0) {
           messages.push({ role: "user", content: "[Image content]" });
         }
@@ -106,11 +107,17 @@ export function translateAnthropicToOpenAI(
       if (Array.isArray(msg.content)) {
         const textParts = msg.content.filter((b) => b.type === "text");
         const toolUses = msg.content.filter((b) => b.type === "tool_use");
+        const thinkingParts = msg.content.filter((b) => b.type === "thinking");
 
         const assistantMsg: OpenAIMessage = {
           role: "assistant",
           content: textParts.map((b) => b.text || "").join("\n") || null,
         };
+
+        // Inject reasoning_content if thinking exists
+        if (thinkingParts.length > 0) {
+          assistantMsg.reasoning_content = thinkingParts.map((b) => b.thinking || "").join("\n");
+        }
 
         // Tool calls
         if (toolUses.length > 0) {
@@ -191,13 +198,20 @@ export function translateOpenAIToAnthropic(
   const choice = openaiResponse.choices[0];
   const content: AnthropicResponseContentBlock[] = [];
 
-  // Text content
-  const msgContent = choice.message.content || "";
+  // reasoning_content → thinking block
+  const reasoning = (choice.message as any).reasoning_content;
+  if (reasoning) {
+    content.push({
+      type: "thinking",
+      thinking: reasoning,
+    });
+  }
 
-  if (msgContent) {
+  // Text content
+  if (choice.message.content) {
     content.push({
       type: "text",
-      text: msgContent,
+      text: choice.message.content,
     });
   }
 
@@ -253,30 +267,61 @@ export function translateStreamChunk(
     currentBlockType: string | null;
     requestModel: string;
     inputTokens: number;
-    inReasoning?: boolean;
   },
 ): string[] {
   const events: string[] = [];
-  const usage = chunk.usage;
-  if (usage?.prompt_tokens !== undefined) {
-    state.inputTokens = usage.prompt_tokens;
-  }
+  const delta = chunk.choices?.[0]?.delta;
 
-  const choice = chunk.choices?.[0];
-  const delta = choice?.delta ?? {};
+  if (!delta) return events;
 
-  if (!choice?.delta && !choice?.finish_reason) return events;
-
-  // Reasoning content (Thinking models)
-  // [Dodo] Ocultado totalmente! Nós já injetamos eventos 'ping' no servidor para evitar
-  // timeout do Cline, então podemos simplesmente ignorar o raciocínio sem enviar lixo invisível.
+  // Reasoning content (Thinking phase)
   if (delta.reasoning_content) {
-    // Apenas retém o estado, não envia evento nenhum para o cliente.
-    return events;
+    if (state.currentBlockType !== "thinking") {
+      // Close previous block if it exists
+      if (state.currentBlockType) {
+        events.push(
+          JSON.stringify({
+            type: "content_block_stop",
+            index: state.contentBlockIndex,
+          }),
+        );
+        state.contentBlockIndex++;
+      }
+      // content_block_start for thinking
+      events.push(
+        JSON.stringify({
+          type: "content_block_start",
+          index: state.contentBlockIndex,
+          content_block: { type: "thinking", thinking: "" },
+        }),
+      );
+      state.currentBlockType = "thinking";
+    }
+
+    // content_block_delta for thinking
+    events.push(
+      JSON.stringify({
+        type: "content_block_delta",
+        index: state.contentBlockIndex,
+        delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+      }),
+    );
   }
 
   // Text content
   if (delta.content) {
+    // If we were thinking, close the thinking block first
+    if (state.currentBlockType === "thinking") {
+      events.push(
+        JSON.stringify({
+          type: "content_block_stop",
+          index: state.contentBlockIndex,
+        }),
+      );
+      state.contentBlockIndex++;
+      state.currentBlockType = null;
+    }
+
     if (state.currentBlockType !== "text") {
       // content_block_start for text
       events.push(
@@ -289,6 +334,7 @@ export function translateStreamChunk(
       state.currentBlockType = "text";
     }
 
+    // content_block_delta
     events.push(
       JSON.stringify({
         type: "content_block_delta",
@@ -346,7 +392,7 @@ export function translateStreamChunk(
   }
 
   // Finish reason
-  if (choice?.finish_reason) {
+  if (chunk.choices?.[0]?.finish_reason) {
     // Close current block
     if (state.currentBlockType) {
       events.push(
@@ -370,12 +416,9 @@ export function translateStreamChunk(
       JSON.stringify({
         type: "message_delta",
         delta: {
-          stop_reason: stopReasonMap[choice.finish_reason] || "end_turn",
-          stop_sequence: null,
-        },
-        usage: {
-          input_tokens: state.inputTokens,
-          output_tokens: usage?.completion_tokens || 0,
+          stop_reason:
+            stopReasonMap[chunk.choices[0].finish_reason] || "end_turn",
+          usage: { output_tokens: chunk.usage?.completion_tokens || 0 },
         },
       }),
     );

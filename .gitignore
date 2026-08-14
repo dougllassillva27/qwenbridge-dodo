@@ -9,18 +9,19 @@ dist/
 .env.local
 .env.production
 
-# Persistent runtime data (DB, profiles, benchmarks, diagnostics)
+# Database
 data/
-data-test/
 *.db
 *.db-wal
 *.db-shm
 accounts.json
 accounts.json.bak
 
+# Browser profiles (session data)
+qwen_profiles/
+
 # Logs
 *.log
-log*.txt
 
 # Coverage & cache
 coverage/
@@ -32,11 +33,10 @@ Thumbs.db
 
 # IDE / Editor
 .kilo
-.roo
 
-# Documentos Dodo
-resumo-de-trabalho.md
 
-_contexto-ia/
 
-qwen_profiles/
+
+# Admin web (React/shadcn build)
+web/node_modules
+web/dist

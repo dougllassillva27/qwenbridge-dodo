@@ -1,216 +1,229 @@
-import { createHash } from "crypto";
-import { Hono } from "hono";
-import { fetchQwenModels } from "../services/qwen.js";
-import { loadAccounts } from "../core/accounts.ts";
-import { getAccountCooldownInfo } from "../core/account-manager.ts";
-import { getAccountsByPriority } from "../core/account-priority.ts";
-import { NotFoundError } from "../core/errors.js";
-import { sendOpenAIError } from "./error-helpers.js";
-import { syncModelMetadata } from "../core/model-registry.ts";
-import { listMediaGenerationModels } from "../services/media-generation.ts";
-import { isPlaywrightInitialized } from "../services/playwright.ts";
+import { Hono } from 'hono'
+import { config } from '../core/config.js'
+import { getBasicHeaders } from '../services/playwright.js'
+import { loadAccounts } from '../core/accounts.js'
+import { getAccountCooldownInfo } from '../core/account-manager.js'
+import { cache } from '../cache/memory-cache.js'
+import { syncModelContextWindows } from '../core/model-registry.js'
 
-const app = new Hono();
+const app = new Hono()
 
-/**
- * Stable creation timestamp for synthetic media models.
- * Uses a fixed value so the ETag remains stable across requests.
- * 2025-01-01T00:00:00Z
- */
-const MEDIA_MODELS_CREATED_AT = 1735689600;
-
-function getPreferredModelsAccountId(): string | undefined {
-  try {
-    const accounts = loadAccounts();
-    if (accounts.length === 0) return undefined;
-
-    // Prefer an account whose browser is already open so the models fetch
-    // reuses the running session instead of launching a new browser for a
-    // standby account. Among usable accounts, follow the same priority
-    // order as request routing.
-    const usable = getAccountsByPriority(accounts).filter(
-      (account) => !getAccountCooldownInfo(account.id),
-    );
-    const initialized = usable.find((account) =>
-      isPlaywrightInitialized(account.id),
-    );
-    return (initialized || usable[0] || accounts[0]).id;
-  } catch {
-    return undefined;
+function buildCatalog(rawModels: any[]): any[] {
+  const capabilitiesOf = (model: any): string[] | undefined => {
+    const caps = model?.info?.meta?.capabilities
+    return Array.isArray(caps) ? caps.filter((c: any) => typeof c === 'string') : undefined
   }
-}
-
-export type PublicModel = {
-  id: string;
-  object?: string;
-  created?: number;
-  owned_by?: string;
-  context_window?: number;
-  is_active?: boolean;
-  capabilities?: Record<string, unknown>;
-  [key: string]: unknown;
-};
-
-function baseModelId(modelId: string): string {
-  // Only `-fast` is public. Strip legacy suffixes as well so a stale or
-  // mixed upstream catalog cannot create duplicate public model entries.
-  return modelId.replace(/-(?:fast|no-thinking|thinking)$/, "");
+  const entry = (model: any, id: string, name?: string) => ({
+    id,
+    name,
+    object: 'model',
+    owned_by: model.owned_by,
+    created: model.info?.created_at || Date.now(),
+    context_window: model.info?.meta?.max_context_length,
+    capabilities: capabilitiesOf(model),
+  })
+  return [
+    ...rawModels.map((model: any) => entry(model, model.id, model.name)),
+    ...rawModels.map((model: any) => entry(model, `${model.id}-thinking`, model.name ? `${model.name} (Thinking)` : undefined)),
+    ...rawModels.map((model: any) => entry(model, `${model.id}-no-thinking`, model.name ? `${model.name} (No Thinking)` : undefined)),
+  ]
 }
 
 /**
- * Expand the public reasoning variants from the selected account's live
- * catalog. The upstream list is normalized first, so this function is the
- * sole owner of synthetic variants and cannot create nested/duplicate
- * suffixes.
- *
- * Qwen's web client always has a Thinking base and a Fast mode. Publish the
- * Fast alias for every catalog model, even when older metadata does not
- * include `think_skip`.
+ * Fetches the full Qwen model catalog (base + thinking + no-thinking variants)
+ * with a dedicated admin-side cache, so the admin dashboard can show every
+ * available model without coupling to the public /v1/models cache keys.
  */
-export function expandModelVariants(
-  models: PublicModel[],
-  accountId?: string,
-): PublicModel[] {
-  syncModelMetadata(
-    models as unknown as Array<Record<string, unknown> & { id: string }>,
-    accountId,
-  );
-  const baseModels = new Map<string, PublicModel>();
+export async function fetchFullModelCatalog(): Promise<any[]> {
+  const cacheKey = 'models:full-catalog'
+  const cached = await cache.get<any>(cacheKey)
+  if (cached?.data) return cached.data
 
-  for (const model of models) {
-    if (!model?.id) continue;
-    const baseId = baseModelId(model.id);
-    if (!baseModels.has(baseId)) {
-      baseModels.set(baseId, {
-        ...model,
-        id: baseId,
-        object: "model",
-      });
-    }
-  }
-
-  const variants = new Map<string, PublicModel>();
-  for (const model of baseModels.values()) {
-    const addVariant = (suffix: string, nameSuffix: string) => {
-      const id = `${model.id}${suffix}`;
-      if (variants.has(id)) return;
-      variants.set(id, {
-        ...model,
-        id,
-        name:
-          typeof model.name === "string"
-            ? `${model.name}${nameSuffix}`
-            : `${model.id}${nameSuffix}`,
-        object: "model",
-      });
-    };
-
-    if (!variants.has(model.id)) variants.set(model.id, model);
-    addVariant("-fast", " (Fast)");
-    addVariant("-thinking", " (Thinking)");
-    // [Dodo] Exposicao automatica de nomes com tag de contexto para UI do cliente
-    addVariant("[1M]", " [1M]");
-    addVariant("-fast[1M]", " (Fast) [1M]");
-    addVariant("-thinking[1M]", " (Thinking) [1M]");
-  }
-
-  return [...variants.values()];
-}
-
-async function loadModelsWithVariants(): Promise<{
-  models: PublicModel[];
-  accountId?: string;
-}> {
-  const accountId = getPreferredModelsAccountId();
-  const models = (await fetchQwenModels(accountId)) as unknown as PublicModel[];
-  const expanded = expandModelVariants(models, accountId);
-
-  // Advertise media generation models so clients can discover them via
-  // /v1/models, including their supported generation modalities. Annotate a
-  // live model in place when Qwen already returned the same ID.
-  const mediaDefinitions = listMediaGenerationModels();
-  const mediaById = new Map(mediaDefinitions.map((definition) => [definition.id, definition]));
-  const expandedWithMedia = expanded.map((model) => {
-    const definition = mediaById.get(model.id);
-    if (!definition) return model;
-    return {
-      ...model,
-      media_generation: definition.kind,
-      media_modes: definition.modes,
-      media_reference_required: definition.modes.every(
-        (mode) => mode === "i2i" || mode === "i2v",
-      ),
-    };
-  });
-  const existing = new Set(expanded.map((model) => model.id));
-  const mediaModels: PublicModel[] = mediaDefinitions
-    .filter(({ id }) => !existing.has(id))
-    .map(({ id, kind, modes }) => ({
-      id,
-      object: "model",
-      created: MEDIA_MODELS_CREATED_AT,
-      owned_by: "qwen",
-      media_generation: kind,
-      media_modes: modes,
-      media_reference_required: modes.every(
-        (mode) => mode === "i2i" || mode === "i2v",
-      ),
-    }));
-
-  return {
-    models: [...expandedWithMedia, ...mediaModels],
-    accountId,
-  };
-}
-
-function findModel(
-  models: PublicModel[],
-  modelId: string,
-): PublicModel | undefined {
-  // Variants are materialized by expandModelVariants only when the live
-  // catalog says they are supported. Do not synthesize an invalid variant for
-  // a direct lookup.
-  return models.find((entry) => entry.id === modelId);
-}
-
-app.get("/v1/models", async (c) => {
+  let accountId: string | undefined
   try {
-    const { models: allModels } = await loadModelsWithVariants();
+    const accounts = loadAccounts()
+    const account = accounts.find(a => !getAccountCooldownInfo(a.id))
+    if (account) {
+      accountId = account.id
+    }
+  } catch (e) {
+    console.warn('Failed to retrieve account for model catalog:', e)
+  }
 
-    const etag = `"${createHash("md5").update(JSON.stringify(allModels)).digest("hex")}"`;
+  const { cookie, userAgent, bxV } = await getBasicHeaders(accountId)
+  const response = await fetch(`${config.qwen.baseUrl}/api/models`, {
+    headers: {
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'pt-BR,pt;q=0.9',
+      'Connection': 'keep-alive',
+      'Referer': `${config.qwen.baseUrl}/c/demo`,
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
+      'User-Agent': userAgent,
+      'X-Request-Id': crypto.randomUUID(),
+      'source': 'web',
+      'bx-v': bxV,
+      'sec-ch-ua': '"Chromium";v="137", "Google Chrome";v="137", "Not/A)Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'Timezone': new Date().toString(),
+      'Cookie': cookie,
+    },
+  })
 
-    if (c.req.header("if-none-match") === etag) {
-      return c.body(null, 304);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch models: ${response.status}`)
+  }
+
+  const data = await response.json()
+  const models = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : []
+
+  const formatted = {
+    object: 'list',
+    data: buildCatalog(models),
+  }
+
+  syncModelContextWindows(formatted.data)
+  await cache.set(cacheKey, formatted, 300)
+
+  return formatted.data
+}
+
+app.get('/v1/models', async (c) => {
+  try {
+    let accountId: string | undefined
+    try {
+      const accounts = loadAccounts()
+      const account = accounts.find(a => !getAccountCooldownInfo(a.id))
+      if (account) {
+        accountId = account.id
+      }
+    } catch (e) {
+      console.warn('Failed to retrieve account for models endpoint:', e)
     }
 
-    c.header("Cache-Control", "public, max-age=3600");
-    c.header("ETag", etag);
+    const cacheKey = `models:${accountId || 'global'}` as any
+    const cached = await cache.get<any>(cacheKey)
+    if (cached) {
+      return c.json(cached)
+    }
 
-    return c.json({
-      object: "list",
-      data: allModels,
-    });
-  } catch (error) {
-    console.error("❌ [Models] Error fetching models:", error);
-    return sendOpenAIError(c, error);
+    const { cookie, userAgent, bxV } = await getBasicHeaders(accountId)
+    const response = await fetch(`${config.qwen.baseUrl}/api/models`, {
+      headers: {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'pt-BR,pt;q=0.9',
+        'Connection': 'keep-alive',
+        'Referer': `${config.qwen.baseUrl}/c/demo`,
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+        'User-Agent': userAgent,
+        'X-Request-Id': crypto.randomUUID(),
+        'source': 'web',
+        'bx-v': bxV,
+        'sec-ch-ua': '"Chromium";v="137", "Google Chrome";v="137", "Not/A)Brand";v="99"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"Windows"',
+        'Timezone': new Date().toString(),
+        'Cookie': cookie,
+      },
+    })
+    
+    if (!response.ok) {
+      throw new Error(`Failed to fetch models: ${response.status}`)
+    }
+    
+    const data = await response.json()
+    
+    const models = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : []
+    
+    const formatted = {
+      object: 'list',
+      data: buildCatalog(models),
+    }
+
+    syncModelContextWindows(formatted.data)
+    await cache.set(cacheKey, formatted, 300)
+    
+    return c.json(formatted)
+  } catch (error: any) {
+    console.error('Error fetching models:', error)
+    return c.json({ error: error.message }, 500)
   }
-});
+})
 
-app.get("/v1/models/:model", async (c) => {
+app.get('/v1/models/:model', async (c) => {
   try {
-    const modelId = c.req.param("model");
-    const { models: allModels } = await loadModelsWithVariants();
-    const model = findModel(allModels, modelId);
+    const modelId = c.req.param('model')
 
+    let accountId: string | undefined
+    try {
+      const accounts = loadAccounts()
+      const account = accounts.find(a => !getAccountCooldownInfo(a.id))
+      if (account) {
+        accountId = account.id
+      }
+    } catch (e) {
+      console.warn('Failed to retrieve account for model endpoint:', e)
+    }
+
+    const cacheKey = `models:${accountId || 'global'}` as any
+    const formattedList = await cache.get<any>(cacheKey)
+    let models = formattedList?.data || []
+
+    if (models.length === 0) {
+      const { cookie, userAgent, bxV } = await getBasicHeaders(accountId)
+      const response = await fetch(`${config.qwen.baseUrl}/api/models`, {
+        headers: {
+          'Accept': 'application/json, text/plain, */*',
+          'Accept-Language': 'pt-BR,pt;q=0.9',
+          'Connection': 'keep-alive',
+          'Referer': `${config.qwen.baseUrl}/c/demo`,
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+          'Sec-Fetch-Site': 'same-origin',
+          'User-Agent': userAgent,
+          'X-Request-Id': crypto.randomUUID(),
+          'source': 'web',
+          'bx-v': bxV,
+          'sec-ch-ua': '"Chromium";v="137", "Google Chrome";v="137", "Not/A)Brand";v="99"',
+          'sec-ch-ua-mobile': '?0',
+          'sec-ch-ua-platform': '"Windows"',
+          'Timezone': new Date().toString(),
+          'Cookie': cookie,
+        },
+      })
+      
+      if (!response.ok) {
+        throw new Error(`Failed to fetch models: ${response.status}`)
+      }
+      
+      const data = await response.json()
+      const rawModels = Array.isArray(data?.data) ? data.data : Array.isArray(data) ? data : []
+      
+      const formatted = {
+        object: 'list',
+        data: buildCatalog(rawModels),
+      }
+
+      syncModelContextWindows(formatted.data)
+      await cache.set(cacheKey, formatted, 300)
+      models = formatted.data
+    }
+
+    const model = models.find((m: any) => m.id === modelId)
+    
     if (!model) {
-      return sendOpenAIError(c, new NotFoundError("Model not found"));
+      return c.json({ error: 'Model not found' }, 404)
     }
-
-    return c.json(model);
-  } catch (error) {
-    console.error("❌ [Models] Error fetching model:", error);
-    return sendOpenAIError(c, error);
+    
+    return c.json(model)
+  } catch (error: any) {
+    console.error('Error fetching model:', error)
+    return c.json({ error: error.message }, 500)
   }
-});
+})
 
-export { app };
+export { app }

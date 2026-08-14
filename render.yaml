@@ -1,0 +1,33 @@
+# Render blueprint — usado pelo botão "Deploy to Render" do README.
+# https://render.com/deploy?repo=https://github.com/pedrofariasx/qwenproxy
+services:
+  - type: web
+    name: qwenproxy
+    runtime: docker
+    repo: https://github.com/pedrofariasx/qwenproxy
+    plan: free
+    healthCheckPath: /health
+    healthCheckTimeout: 300
+    envVars:
+      - key: PORT
+        value: 3000
+      - key: HEADLESS
+        value: "true"
+      # Render permite apenas UM disk por serviço: perfis de browser ficam
+      # dentro do mesmo volume persistente (data + profiles em /app/data).
+      - key: USER_DATA_DIR
+        value: /app/data/qwen_profiles
+      - key: API_KEY
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: QWEN_EMAIL
+        sync: false
+      - key: QWEN_PASSWORD
+        sync: false
+      - key: SINGLE_ACCOUNT_MODE
+        sync: false
+    disk:
+      name: qwenproxy-data
+      mountPath: /app/data
+      sizeGB: 1

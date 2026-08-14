@@ -1,96 +1,59 @@
-import { metrics } from "./metrics.js";
+import { metrics } from './metrics.js'
 
-const activeStreams = new Map<
-  string,
-  {
-    abortController: AbortController;
-    accountId: string;
-    uiSessionId: string;
-    targetResponseId: string;
-    headers: Record<string, string>;
-    /** True once at least one model chunk reached the client. */
-    emittedChunk: boolean;
+export interface StreamRegistryEntry {
+  abortController: AbortController;
+  accountId: string;
+  uiSessionId: string;
+  targetResponseId: string;
+  headers: Record<string, string>;
+  stopToken: string;
+  createdAt: number;
+}
+
+const activeStreams = new Map<string, StreamRegistryEntry>();
+const knownStreamAccounts = new Set<string>();
+
+function updateStreamGauges(): void {
+  const byAccount = new Map<string, number>();
+  for (const entry of activeStreams.values()) {
+    const key = entry.accountId || 'unknown';
+    byAccount.set(key, (byAccount.get(key) || 0) + 1);
+    knownStreamAccounts.add(key);
   }
->();
+  metrics.gauge('streams.active', activeStreams.size);
+  for (const acct of knownStreamAccounts) {
+    metrics.gauge('streams.by.account', byAccount.get(acct) || 0, { account: acct });
+  }
+}
 
 export function registerStream(
   key: string,
-  entry: {
-    abortController: AbortController;
-    accountId: string;
-    uiSessionId: string;
-    targetResponseId: string;
-    headers: Record<string, string>;
-  },
+  entry: Omit<StreamRegistryEntry, 'createdAt'> & { createdAt?: number },
 ): void {
-  const existing = activeStreams.get(key);
-  if (existing && existing.abortController !== entry.abortController) {
-    existing.abortController.abort();
-  }
-
-  activeStreams.set(key, { emittedChunk: false, ...entry });
-  metrics.gauge("streams.active", activeStreams.size);
+  activeStreams.set(key, { ...entry, createdAt: entry.createdAt ?? Date.now() })
+  updateStreamGauges()
 }
 
-export function getStream(key: string): ReturnType<typeof activeStreams.get> {
-  return activeStreams.get(key);
+export function getStreamRegistry(): Map<string, StreamRegistryEntry> {
+  return activeStreams
 }
 
-export function getStreamKeysBySessionId(sessionId: string): string[] {
-  const keys: string[] = [];
-  for (const [key, entry] of activeStreams.entries()) {
-    if (entry.uiSessionId === sessionId) {
-      keys.push(key);
-    }
-  }
-  return keys;
-}
-
-export function getStreamKeyBySessionAndResponse(
-  sessionId: string,
-  responseId: string,
-): string | undefined {
-  for (const [key, entry] of activeStreams.entries()) {
-    if (
-      entry.uiSessionId === sessionId &&
-      entry.targetResponseId === responseId
-    ) {
-      return key;
-    }
-  }
-  return undefined;
+export function getStream(key: string): StreamRegistryEntry | undefined {
+  return activeStreams.get(key)
 }
 
 export function removeStream(key: string): void {
-  activeStreams.delete(key);
-  metrics.gauge("streams.active", activeStreams.size);
+  activeStreams.delete(key)
+  updateStreamGauges()
 }
 
-/**
- * Mark a stream as having emitted at least one model chunk to the client.
- * The emit-aware supersede uses this to avoid killing a generation the client
- * has not consumed yet (e.g. a parallel title request racing the main stream).
- */
-export function markStreamEmitted(key: string): void {
-  const entry = activeStreams.get(key);
+export function abortStream(key: string): boolean {
+  const entry = activeStreams.get(key)
   if (entry) {
-    entry.emittedChunk = true;
+    entry.abortController.abort()
+    activeStreams.delete(key)
+    updateStreamGauges()
+    return true
   }
-}
-
-export function updateStreamTargetResponseId(
-  key: string,
-  targetResponseId: string,
-): void {
-  const entry = activeStreams.get(key);
-  if (entry) {
-    entry.targetResponseId = targetResponseId;
-  }
-}
-
-export function updateStreamSessionId(key: string, uiSessionId: string): void {
-  const entry = activeStreams.get(key);
-  if (entry) {
-    entry.uiSessionId = uiSessionId;
-  }
+  return false
 }

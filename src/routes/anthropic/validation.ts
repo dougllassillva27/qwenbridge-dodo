@@ -1,4 +1,4 @@
-import type { AnthropicRequest } from "./types.ts";
+import type { AnthropicRequest } from "./types.js";
 
 export interface ValidationResult {
   valid: boolean;

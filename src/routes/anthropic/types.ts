@@ -20,7 +20,7 @@ export interface AnthropicMessage {
 }
 
 export interface AnthropicContentBlock {
-  type: "text" | "tool_use" | "tool_result" | "image" | "document";
+  type: "text" | "tool_use" | "tool_result" | "image" | "document" | "thinking";
   text?: string;
   id?: string;
   name?: string;
@@ -28,6 +28,7 @@ export interface AnthropicContentBlock {
   tool_use_id?: string;
   content?: string | AnthropicContentBlock[];
   source?: AnthropicImageSource;
+  thinking?: string;
 }
 
 export interface AnthropicImageSource {
@@ -60,11 +61,12 @@ export interface AnthropicResponse {
 }
 
 export interface AnthropicResponseContentBlock {
-  type: "text" | "tool_use";
+  type: "text" | "tool_use" | "thinking";
   text?: string;
   id?: string;
   name?: string;
   input?: Record<string, unknown>;
+  thinking?: string;
 }
 
 export interface AnthropicUsage {
@@ -86,15 +88,16 @@ export interface AnthropicStreamEvent {
   index?: number;
   content_block?: AnthropicResponseContentBlock;
   delta?: AnthropicStreamDelta;
-  usage?: AnthropicUsage;
 }
 
 export interface AnthropicStreamDelta {
-  type?: "text_delta" | "input_json_delta";
+  type?: "text_delta" | "input_json_delta" | "thinking_delta" | "signature_delta";
   text?: string;
   partial_json?: string;
+  thinking?: string;
+  signature?: string;
   stop_reason?: string;
-  stop_sequence?: string | null;
+  usage?: { output_tokens: number };
 }
 
 export interface AnthropicError {
@@ -124,6 +127,7 @@ export interface OpenAIMessage {
   content: string | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
+  reasoning_content?: string | null;
 }
 
 export interface OpenAITool {
