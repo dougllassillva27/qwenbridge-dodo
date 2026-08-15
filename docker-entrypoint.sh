@@ -17,7 +17,8 @@ ensure_writable_dir() {
 }
 
 ensure_writable_dir /app/data
-ensure_writable_dir /app/qwen_profiles
+ensure_writable_dir /app/data/db
+ensure_writable_dir /app/data/qwen_profiles
 ensure_writable_dir /tmp/playwright
 
 exec gosu pwuser "$@"

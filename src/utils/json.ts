@@ -1,322 +1,380 @@
-/*
- * File: json.ts
- * Project: qwenproxy
- * Robust JSON parsing utilities
- */
+import { logger } from "../core/logger.js";
 
-function sanitizeAndBalance(input: string): { result: string; openBraces: number; openBrackets: number; inString: boolean } {
-  let out = '';
+const isDebug = process.env.TOOLCALL_DEBUG === "1";
+
+function sanitizeAndBalance(input: string): {
+  result: string;
+  openBraces: number;
+  openBrackets: number;
+  recoveredUnclosedString: boolean;
+  /** Opening tokens `{`/`[` in the order they were opened (LIFO close order). */
+  openStack: string[];
+} {
+  let out = "";
   let openBraces = 0;
   let openBrackets = 0;
+  let openStack: string[] = [];
   let inString = false;
   let escaped = false;
 
   for (let i = 0; i < input.length; i++) {
     const char = input[i];
     if (escaped) {
-      const validEscapes = ['n', 'r', 't', 'u', '"', '\\', '/'];
+      const validEscapes = ["n", "r", "t", "u", '"', "\\", "/"];
       if (validEscapes.includes(char)) {
-        if (char === 'u') {
+        if (char === "u") {
           const next4 = input.substring(i + 1, i + 5);
-          out += /^[0-9a-fA-F]{4}$/.test(next4) ? '\\' + char : '\\\\' + char;
-        } else if (['n', 'r', 't'].includes(char)) {
-          const isWinPath = /[a-zA-Z]:\\/i.test(input) || /[a-zA-Z]:\//i.test(input);
-          const nextChar = input[i + 1] || '';
-          out += (isWinPath && /^[a-zA-Z0-9]/.test(nextChar)) ? '\\\\' + char : '\\' + char;
+          out += /^[0-9a-fA-F]{4}$/.test(next4) ? "\\" + char : "\\\\" + char;
+        } else if (["n", "r", "t"].includes(char)) {
+          // Local check: only double-escape if the 2 chars before this
+          // backslash form a Windows drive letter + colon (e.g. C:\, D:/).
+          // Scanning the whole input causes false positives with URLs
+          // like https:// or paths embedded elsewhere in the string.
+          const isWinPath = i >= 2 && /[a-zA-Z]:/.test(input.substring(i - 2, i));
+          const nextChar = input[i + 1] || "";
+          out +=
+            isWinPath && /^[a-zA-Z0-9]/.test(nextChar)
+              ? "\\\\" + char
+              : "\\" + char;
         } else {
-          out += '\\' + char;
+          out += "\\" + char;
         }
       } else {
-        out += '\\\\' + char;
+        out += "\\\\" + char;
       }
       escaped = false;
       continue;
     }
-    if (char === '\\') { escaped = true; continue; }
-    if (char === '"') { inString = !inString; out += char; continue; }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      out += char;
+      continue;
+    }
     if (inString) {
-      if (char === '\n') out += '\\n';
-      else if (char === '\r') out += '\\r';
-      else if (char === '\t') out += '\\t';
-      else if (char.charCodeAt(0) < 32) out += '\\u' + char.charCodeAt(0).toString(16).padStart(4, '0');
+      if (char === "\n") out += "\\n";
+      else if (char === "\r") out += "\\r";
+      else if (char === "\t") out += "\\t";
+      else if (char.charCodeAt(0) < 32)
+        out += "\\u" + char.charCodeAt(0).toString(16).padStart(4, "0");
       else out += char;
     } else {
       out += char;
-      if (char === '{') openBraces++;
-      if (char === '}') openBraces--;
-      if (char === '[') openBrackets++;
-      if (char === ']') openBrackets--;
+      if (char === "{") {
+        openBraces++;
+        openStack.push("{");
+      }
+      if (char === "}") {
+        openBraces--;
+        openStack.pop();
+      }
+      if (char === "[") {
+        openBrackets++;
+        openStack.push("[");
+      }
+      if (char === "]") {
+        openBrackets--;
+        openStack.pop();
+      }
     }
   }
-  return { result: out, openBraces, openBrackets, inString };
+
+  let recoveredUnclosedString = false;
+  if (escaped) {
+    out += "\\";
+  }
+  if (inString) {
+    out += '"';
+    recoveredUnclosedString = true;
+  }
+
+  return { result: out, openBraces, openBrackets, recoveredUnclosedString, openStack };
 }
 
-function closeBraces(input: string, openBraces: number, openBrackets: number, inString: boolean = false): string {
+/**
+ * Close unterminated containers in LIFO order (reverse of how they were
+ * opened). Appending all `]` then all `}` (the old counting-only approach)
+ * produces invalid JSON whenever an array is opened and then an object is
+ * opened inside it before truncation, e.g.
+ * `{"a":[{"old_text":"start` needs `}],}}` and not `]}}}`.
+ */
+function closeBraces(
+  input: string,
+  openBraces: number,
+  openBrackets: number,
+  openStack: string[],
+): string {
   let out = input;
-  if (inString) out += '"';
-  if (openBrackets > 0) out += ']'.repeat(openBrackets);
-  if (openBraces > 0) out += '}'.repeat(openBraces);
-  return out;
-}
-
-function quoteUnquotedStringValues(input: string): string {
-  let out = '';
-  let i = 0;
-  let inString = false;
-  let escaped = false;
-
-  while (i < input.length) {
-    const ch = input[i];
-
-    if (escaped) { out += ch; escaped = false; i++; continue; }
-    if (ch === '\\' && inString) { out += ch; escaped = true; i++; continue; }
-    if (ch === '"') { inString = !inString; out += ch; i++; continue; }
-    if (inString) { out += ch; i++; continue; }
-
-    if (ch === ':') {
-      out += ch;
-      i++;
-      let ws = '';
-      while (i < input.length && /\s/.test(input[i])) { ws += input[i]; i++; }
-      out += ws;
-      if (i >= input.length) break;
-
-      const next = input[i];
-      if (next === '"' || next === '{' || next === '[' || next === '-' || /[0-9]/.test(next)) {
-        continue;
-      }
-      const rest = input.substring(i);
-      if (/^(true|false|null)\b/.test(rest)) {
-        continue;
-      }
-
-      let val = '';
-      let depthBrace = 0;
-      let depthBracket = 0;
-      let j = i;
-      while (j < input.length) {
-        const c = input[j];
-        if (c === '{') depthBrace++;
-        else if (c === '}') {
-          if (depthBrace === 0) break;
-          depthBrace--;
-        } else if (c === '[') depthBracket++;
-        else if (c === ']') {
-          if (depthBracket === 0) break;
-          depthBracket--;
-        } else if (c === ',' && depthBrace === 0 && depthBracket === 0) {
-          break;
-        }
-        val += c;
-        j++;
-      }
-
-      if (val.length > 0) {
-        const escapedVal = val.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
-        out += '"' + escapedVal + '"';
-      }
-      i = j;
-      continue;
+  for (let i = openStack.length - 1; i >= 0; i--) {
+    out += openStack[i] === "{" ? "}" : "]";
+  }
+  if (openBraces > 0 || openBrackets > 0) {
+    // Open tokens shorter than the counted opens (no stack entries for them)
+    // cannot happen since the stack mirrors the counts; keep the historical
+    // count-based close as a safety net for callers without a stack.
+    if (openStack.length === 0) {
+      if (openBrackets > 0) out += "]".repeat(openBrackets);
+      if (openBraces > 0) out += "}".repeat(openBraces);
     }
-
-    out += ch;
-    i++;
   }
   return out;
 }
 
+/**
+ * Fixes missing opening quotes in JSON values.
+ * Handles cases like: {"key": value_without_quotes"}
+ * Upstream: a63f054, 9328bde
+ */
 function fixMissingOpeningQuotes(input: string): string {
   let out = input;
   let prev: string;
   do {
     prev = out;
+    // Pattern 1: {"key": value"} or {key: value"}
     out = out.replace(
       /([{,[]\s*"[a-zA-Z_][\w]*"\s*:\s*)([^"\s,}\]][^"\n]*?)"([\s,}\]])/g,
-      '$1"$2"$3'
+      '$1"$2"$3',
     );
     out = out.replace(
       /([{,[]\s*[a-zA-Z_][\w]*\s*:\s*)([^"\s,}\]][^"\n]*?)"([\s,}\]])/g,
-      '$1"$2"$3'
+      '$1"$2"$3',
     );
-    out = out.replace(
-      /(:\s*)([A-Za-z_][\w.-]*?)"([\s,}\]])/g,
-      '$1"$2"$3'
-    );
+    // Pattern 2: {: value"} - upstream 9328bde
+    out = out.replace(/(:\s*)([A-Za-z_][\w.-]*?)"([\s,}\]])/g, '$1"$2"$3');
   } while (out !== prev);
   return out;
 }
 
-function fixEqualsSeparators(input: string): string {
-  let out = '';
-  let inString = false;
-  let escaped = false;
-  let i = 0;
-  const n = input.length;
-  const ctxStack: ('o' | 'a')[] = [];
-  let expectKey = false;
-
-  while (i < n) {
-    const ch = input[i];
-
-    if (escaped) { out += ch; escaped = false; i++; continue; }
-    if (ch === '\\') { out += ch; escaped = true; i++; continue; }
-
-    if (ch === '"') {
-      inString = !inString;
-      out += ch;
-      if (!inString && expectKey) {
-        let k = i + 1;
-        while (k < n && /\s/.test(input[k])) k++;
-        if (k < n && input[k] === '=') {
-          out += ':';
-          i = k + 1;
-          expectKey = false;
-          continue;
-        }
-      }
-      i++;
-      continue;
-    }
-
-    if (inString) { out += ch; i++; continue; }
-
-    if (ch === '{') { ctxStack.push('o'); expectKey = true; out += ch; i++; continue; }
-    if (ch === '[') { ctxStack.push('a'); expectKey = false; out += ch; i++; continue; }
-    if (ch === '}') { ctxStack.pop(); expectKey = false; out += ch; i++; continue; }
-    if (ch === ']') { ctxStack.pop(); expectKey = false; out += ch; i++; continue; }
-    if (ch === ':') { expectKey = false; out += ch; i++; continue; }
-    if (ch === ',') { expectKey = ctxStack[ctxStack.length - 1] === 'o'; out += ch; i++; continue; }
-
-    if (expectKey && /[a-zA-Z_]/.test(ch)) {
-      let j = i;
-      while (j < n && /[a-zA-Z0-9_]/.test(input[j])) j++;
-      const ident = input.slice(i, j);
-      let k = j;
-      while (k < n && /\s/.test(input[k])) k++;
-      if (k < n && input[k] === '=') {
-        out += '"' + ident + '":';
-        i = k + 1;
-        expectKey = false;
-        continue;
-      }
-      out += ident;
-      i = j;
-      expectKey = false;
-      continue;
-    }
-
-    out += ch;
-    i++;
-  }
-  return out;
-}
-
-function quoteUnquotedKeys(input: string): string {
-  let out = '';
-  let inString = false;
-  let escaped = false;
-
-  for (let i = 0; i < input.length; i++) {
-    const ch = input[i];
-
-    if (escaped) {
-      out += ch;
-      escaped = false;
-      continue;
-    }
-
-    if (ch === '\\') {
-      out += ch;
-      escaped = true;
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = !inString;
-      out += ch;
-      continue;
-    }
-
-    if (inString) {
-      out += ch;
-      continue;
-    }
-
-    if (/[a-zA-Z_]/.test(ch)) {
-      let j = i;
-      while (j < input.length && /[a-zA-Z0-9_]/.test(input[j])) j++;
-      const ident = input.slice(i, j);
-      let k = j;
-      while (k < input.length && /\s/.test(input[k])) k++;
-      if (k < input.length && input[k] === ':') {
-        out += '"' + ident + '"';
-      } else {
-        out += ident;
-      }
-      i = j - 1;
-      continue;
-    }
-
-    out += ch;
-  }
-
-  return out;
-}
-
 export function robustParseJSON(str: string): any {
+  if (isDebug) {
+    logger.debug("[json] robustParseJSON: starting", {
+      inputLength: str.length,
+      inputPreview: str.substring(0, 200),
+    });
+  }
+
   let sanitized = str.trim();
-  sanitized = sanitized.replace(/^```json\s*/, '').replace(/```$/, '').trim();
+  sanitized = sanitized
+    .replace(/^```json\s*/, "")
+    .replace(/```$/, "")
+    .trim();
 
-  const firstBrace = sanitized.indexOf('{');
-  if (firstBrace === -1) return null;
+  const firstBrace = sanitized.indexOf("{");
+  if (firstBrace === -1) {
+    if (isDebug) {
+      logger.debug("[json] robustParseJSON: no opening brace found");
+    }
+    return null;
+  }
 
-  const jsonPart = sanitized.substring(firstBrace);
-  try { return JSON.parse(jsonPart); } catch { /* continue */ }
+  let jsonPart = sanitized.substring(firstBrace);
+  try {
+    const result = JSON.parse(jsonPart);
+    if (isDebug) {
+      logger.debug("[json] robustParseJSON: direct parse succeeded", {
+        resultType: typeof result,
+        resultPreview: JSON.stringify(result).substring(0, 200),
+      });
+    }
+    return result;
+  } catch (e) {
+    if (isDebug) {
+      logger.debug("[json] robustParseJSON: direct parse failed", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    // Fix double-escaped quotes (e.g., \\" -> ") only after direct parse
+    // fails, to avoid corrupting valid JSON with legitimate \\ sequences.
+    jsonPart = jsonPart.replace(/\\\\"/g, '\\"');
+  }
 
-  let currentJson = fixEqualsSeparators(jsonPart);
-  currentJson = quoteUnquotedKeys(currentJson);
+  let currentJson = jsonPart.replace(
+    /([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)/g,
+    '$1"$2"$3',
+  );
+  currentJson = currentJson.replace(
+    /([{,]\s*)"([a-zA-Z0-9_]+)"\s*:\s*"\2"\s*:/g,
+    '$1"$2":',
+  );
+  currentJson = currentJson.replace(
+    /([{,]\s*)([a-zA-Z0-9_]+)\s*:\s*\2\s*:/g,
+    "$1$2:",
+  );
+
+  // Fix missing opening quotes in values (upstream: a63f054, 9328bde)
   currentJson = fixMissingOpeningQuotes(currentJson);
-  currentJson = quoteUnquotedStringValues(currentJson);
-  currentJson = currentJson.replace(/([{,]\s*)"([a-zA-Z0-9_]+)"\s*:\s*"\2"\s*:/g, '$1"$2":');
-  currentJson = currentJson.replace(/([{,]\s*)([a-zA-Z0-9_]+)\s*:\s*\2\s*:/g, '$1$2:');
 
-  try { return JSON.parse(currentJson); } catch { /* continue */ }
+  // Handle unquoted string values after colon (e.g., "command":export CI=true)
+  // Matches: "key":value_without_quotes until comma, closing brace, or end
+  currentJson = currentJson.replace(
+    /"([a-zA-Z0-9_]+)":\s*([^"\s{\[\],}][^,}\]]*)/g,
+    (match, key, value) => {
+      // Don't quote if it's a number, boolean, or null
+      if (/^(true|false|null|\d+(\.\d+)?)$/.test(value.trim())) {
+        return match;
+      }
+      return `"${key}":"${value.trim()}"`;
+    },
+  );
+
+  try {
+    const result = JSON.parse(currentJson);
+    if (isDebug) {
+      logger.debug("[json] robustParseJSON: quote-fix parse succeeded", {
+        resultType: typeof result,
+        resultPreview: JSON.stringify(result).substring(0, 200),
+      });
+    }
+    return result;
+  } catch (e) {
+    if (isDebug) {
+      logger.debug("[json] robustParseJSON: quote-fix parse failed", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+    /* continue */
+  }
 
   let cleaned = currentJson.trim();
-  while (cleaned.length > 0 && !/[}\]"0-9a-z]/i.test(cleaned[cleaned.length - 1])) {
+  while (
+    cleaned.length > 0 &&
+    !/[}\]"0-9a-z]/i.test(cleaned[cleaned.length - 1])
+  ) {
     cleaned = cleaned.slice(0, -1).trim();
   }
 
-  const { result: fixedJson, openBraces, openBrackets, inString } = sanitizeAndBalance(cleaned);
+  const {
+    result: fixedJson,
+    openBraces,
+    openBrackets,
+    recoveredUnclosedString,
+    openStack: fixedJsonOpenStack,
+  } = sanitizeAndBalance(cleaned);
+
+  if (isDebug && recoveredUnclosedString) {
+    logger.debug(
+      "[json] robustParseJSON: recovered unclosed string at end of input",
+      {
+        originalPreview: cleaned.substring(0, 150),
+      },
+    );
+  }
+
   let lastBalancedIndex = -1;
 
-  { let ob = 0, bk = 0, ins = false, esc = false;
+  {
+    let ob = 0,
+      bk = 0,
+      ins = false,
+      esc = false;
     for (let i = 0; i < fixedJson.length; i++) {
       const c = fixedJson[i];
-      if (esc) { esc = false; continue; }
-      if (c === '\\') { esc = true; continue; }
-      if (c === '"') { ins = !ins; continue; }
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (c === "\\") {
+        esc = true;
+        continue;
+      }
+      if (c === '"') {
+        ins = !ins;
+        continue;
+      }
       if (!ins) {
-        if (c === '{') ob++; if (c === '}') ob--;
-        if (c === '[') bk++; if (c === ']') bk--;
+        if (c === "{") ob++;
+        if (c === "}") ob--;
+        if (c === "[") bk++;
+        if (c === "]") bk--;
         if (ob === 0 && bk === 0) lastBalancedIndex = i;
       }
     }
   }
 
   let tempJson = fixedJson;
-  if (lastBalancedIndex !== -1 && (openBraces !== 0 || openBrackets !== 0 || fixedJson.length > lastBalancedIndex + 1)) {
+  if (
+    lastBalancedIndex !== -1 &&
+    (openBraces !== 0 ||
+      openBrackets !== 0 ||
+      fixedJson.length > lastBalancedIndex + 1)
+  ) {
     tempJson = fixedJson.substring(0, lastBalancedIndex + 1);
-  } else if (openBraces > 0 || openBrackets > 0 || inString) {
-    tempJson = closeBraces(fixedJson, openBraces, openBrackets, inString);
+    if (isDebug) {
+      logger.debug("[json] robustParseJSON: truncated to balanced index", {
+        lastBalancedIndex,
+        originalLength: fixedJson.length,
+        truncatedLength: tempJson.length,
+      });
+    }
+  } else if (openBraces > 0 || openBrackets > 0) {
+    tempJson = closeBraces(
+      fixedJson,
+      openBraces,
+      openBrackets,
+      fixedJsonOpenStack,
+    );
+    if (isDebug) {
+      logger.debug("[json] robustParseJSON: closed braces", {
+        openBraces,
+        openBrackets,
+        resultLength: tempJson.length,
+      });
+    }
   }
 
-  try { return JSON.parse(tempJson); } catch {
+  try {
+    const result = JSON.parse(tempJson);
+    if (isDebug) {
+      logger.debug("[json] robustParseJSON: balanced-parse succeeded", {
+        resultType: typeof result,
+        resultPreview: JSON.stringify(result).substring(0, 200),
+      });
+    }
+    return result;
+  } catch (e) {
+    if (isDebug) {
+      logger.debug("[json] robustParseJSON: balanced-parse failed", {
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
     let aggressive = fixedJson.trim();
-    aggressive = aggressive.replace(/,\s*([}\]])/g, '$1');
-    const { result: aggFixed, openBraces: ob, openBrackets: bk, inString: aggInString } = sanitizeAndBalance(aggressive);
-  try { return JSON.parse(closeBraces(aggFixed, ob, bk, aggInString)); } catch {
-    return null;
+    if (aggressive.endsWith(",")) aggressive = aggressive.slice(0, -1);
+    const {
+      result: aggFixed,
+      openBraces: ob,
+      openBrackets: bk,
+      recoveredUnclosedString: aggRecovered,
+      openStack: aggOpenStack,
+    } = sanitizeAndBalance(aggressive);
+
+    if (isDebug && aggRecovered) {
+      logger.debug(
+        "[json] robustParseJSON: aggressive recovery of unclosed string",
+        {
+          originalPreview: aggressive.substring(0, 150),
+        },
+      );
+    }
+
+    try {
+      const result = JSON.parse(closeBraces(aggFixed, ob, bk, aggOpenStack));
+      if (isDebug) {
+        logger.debug("[json] robustParseJSON: aggressive-parse succeeded", {
+          resultType: typeof result,
+          resultPreview: JSON.stringify(result).substring(0, 200),
+        });
+      }
+      return result;
+    } catch {
+      if (isDebug) {
+        logger.debug("[json] robustParseJSON: all parse attempts failed", {
+          originalError: e instanceof Error ? e.message : String(e),
+        });
+      }
+      throw e;
+    }
   }
-}
 }

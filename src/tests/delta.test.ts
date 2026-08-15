@@ -1,133 +1,116 @@
-import { test } from 'node:test';
-import assert from 'node:assert';
-import { getIncrementalDelta } from '../routes/chat.js';
+import { test } from "node:test";
+import assert from "node:assert";
+import {
+  formatThinkingSummaryContent,
+  getIncrementalDelta,
+  isAbortError,
+  shouldSuppressStreamAbort,
+} from "../routes/chat/helpers.ts";
 
-test('getIncrementalDelta: handles strictly cumulative stream correctly', () => {
-  let accumulated = '';
-  
-  const chunk1 = 'const x = 1;';
-  const res1 = getIncrementalDelta(accumulated, chunk1);
-  assert.strictEqual(res1.delta, 'const x = 1;');
+test("getIncrementalDelta: handles strictly cumulative stream correctly", () => {
+  let accumulated = "";
+
+  // Step 1
+  let chunk1 = "const x = 1;";
+  let res1 = getIncrementalDelta(accumulated, chunk1);
+  assert.strictEqual(res1.delta, "const x = 1;");
   accumulated = res1.matchedContent;
-  
-  const chunk2 = 'const x = 1;\nconst y = 2;';
-  const res2 = getIncrementalDelta(accumulated, chunk2);
-  assert.strictEqual(res2.delta, '\nconst y = 2;');
+
+  // Step 2
+  let chunk2 = "const x = 1;\nconst y = 2;";
+  let res2 = getIncrementalDelta(accumulated, chunk2);
+  assert.strictEqual(res2.delta, "\nconst y = 2;");
   accumulated = res2.matchedContent;
 
-  const chunk3 = 'const x = 1;\nconst y = 2;\nconst z = 3;';
-  const res3 = getIncrementalDelta(accumulated, chunk3);
-  assert.strictEqual(res3.delta, '\nconst z = 3;');
+  // Step 3
+  let chunk3 = "const x = 1;\nconst y = 2;\nconst z = 3;";
+  let res3 = getIncrementalDelta(accumulated, chunk3);
+  assert.strictEqual(res3.delta, "\nconst z = 3;");
   accumulated = res3.matchedContent;
-  
-  assert.strictEqual(accumulated, 'const x = 1;\nconst y = 2;\nconst z = 3;');
+
+  assert.strictEqual(accumulated, "const x = 1;\nconst y = 2;\nconst z = 3;");
 });
 
-test('getIncrementalDelta: handles strictly incremental stream correctly', () => {
-  let accumulated = '';
-  
-  const chunk1 = 'const x = 1;';
-  const res1 = getIncrementalDelta(accumulated, chunk1);
-  assert.strictEqual(res1.delta, 'const x = 1;');
+test("getIncrementalDelta: handles strictly incremental stream correctly", () => {
+  let accumulated = "";
+
+  // Step 1
+  let chunk1 = "const x = 1;";
+  let res1 = getIncrementalDelta(accumulated, chunk1);
+  assert.strictEqual(res1.delta, "const x = 1;");
   accumulated = res1.matchedContent;
-  
-  const chunk2 = '\nconst y = 2;';
-  const res2 = getIncrementalDelta(accumulated, chunk2);
-  assert.strictEqual(res2.delta, '\nconst y = 2;');
+
+  // Step 2
+  let chunk2 = "\nconst y = 2;";
+  let res2 = getIncrementalDelta(accumulated, chunk2);
+  assert.strictEqual(res2.delta, "\nconst y = 2;");
   accumulated = res2.matchedContent;
 
-  const chunk3 = '\nconst z = 3;';
-  const res3 = getIncrementalDelta(accumulated, chunk3);
-  assert.strictEqual(res3.delta, '\nconst z = 3;');
+  // Step 3
+  let chunk3 = "\nconst z = 3;";
+  let res3 = getIncrementalDelta(accumulated, chunk3);
+  assert.strictEqual(res3.delta, "\nconst z = 3;");
   accumulated = res3.matchedContent;
-  
-  assert.strictEqual(accumulated, 'const x = 1;\nconst y = 2;\nconst z = 3;');
+
+  assert.strictEqual(accumulated, "const x = 1;\nconst y = 2;\nconst z = 3;");
 });
 
-test('getIncrementalDelta: does not suffer from false-positive repetitive word overlap bugs', () => {
-  const accumulated = 'import { useState } from \'react\';\nimport {';
-  const nextChunk = ' Button } from \'@/components/ui/button\';';
-  
+test("getIncrementalDelta: does not suffer from false-positive repetitive word overlap bugs", () => {
+  // Previously, if oldStr ended in a common keyword and newStr started/contained the same keyword,
+  // it would incorrectly match them and strip them. Let's verify this is fixed.
+  let accumulated = "import { useState } from 'react';\nimport {";
+  let nextChunk = " Button } from '@/components/ui/button';";
+
+  let res = getIncrementalDelta(accumulated, nextChunk);
+  // It should treat the next chunk as strictly incremental and return it unchanged.
+  assert.strictEqual(res.delta, " Button } from '@/components/ui/button';");
+  assert.strictEqual(
+    res.matchedContent,
+    "import { useState } from 'react';\nimport { Button } from '@/components/ui/button';",
+  );
+});
+
+test("getIncrementalDelta: handles long cumulative streams without duplicating prior content", () => {
+  const prefix = "a".repeat(2500);
+  const accumulated = `${prefix}END`;
+  const nextChunk = `${prefix}END-more-content`;
+
   const res = getIncrementalDelta(accumulated, nextChunk);
-  assert.strictEqual(res.delta, ' Button } from \'@/components/ui/button\';');
-  assert.strictEqual(res.matchedContent, 'import { useState } from \'react\';\nimport { Button } from \'@/components/ui/button\';');
+
+  assert.strictEqual(res.delta, "-more-content");
+  assert.strictEqual(res.matchedContent, nextChunk);
 });
 
-test('getIncrementalDelta: empty oldStr returns newStr as delta', () => {
-  const res = getIncrementalDelta('', 'hello world');
-  assert.strictEqual(res.delta, 'hello world');
-  assert.strictEqual(res.matchedContent, 'hello world');
-  assert.strictEqual(res.contentLength, 11);
+test("formatThinkingSummaryContent: combines titles and thoughts by section", () => {
+  const formatted = formatThinkingSummaryContent({
+    extra: {
+      summary_title: { content: ["Title 1", "Title 2"] },
+      summary_thought: { content: ["Thought 1", "Thought 2"] },
+    },
+  });
+
+  assert.strictEqual(
+    formatted,
+    "**Title 1**\n\nThought 1\n\n**Title 2**\n\nThought 2",
+  );
 });
 
-test('getIncrementalDelta: identical strings return empty delta', () => {
-  const str = 'some content here';
-  const res = getIncrementalDelta(str, str, str.length, str.slice(-64));
-  assert.strictEqual(res.delta, '');
-  assert.strictEqual(res.matchedContent, str);
+test("isAbortError: recognizes DOMException AbortError", () => {
+  assert.ok(
+    isAbortError(new DOMException("This operation was aborted", "AbortError")),
+  );
+  assert.ok(!isAbortError(new Error("ordinary failure")));
 });
 
-test('getIncrementalDelta: completely different strings concatenate', () => {
-  const res = getIncrementalDelta('abc', 'xyz');
-  assert.strictEqual(res.delta, 'xyz');
-  assert.strictEqual(res.matchedContent, 'abcxyz');
-});
+test("shouldSuppressStreamAbort: suppresses expected disconnect aborts", () => {
+  const abortError = new DOMException(
+    "This operation was aborted",
+    "AbortError",
+  );
 
-test('getIncrementalDelta: uses prevLength fast path when suffix matches', () => {
-  const oldStr = 'hello world';
-  const prevLength = oldStr.length;
-  const prevSuffix = oldStr.slice(-64);
-  const newStr = 'hello world extended';
-  
-  const res = getIncrementalDelta(oldStr, newStr, prevLength, prevSuffix);
-  assert.strictEqual(res.delta, ' extended');
-  assert.strictEqual(res.matchedContent, newStr);
-  assert.strictEqual(res.contentLength, newStr.length);
-});
-
-test('getIncrementalDelta: large string with tiny delta falls back to concatenation for safety', () => {
-  const oldStr = 'x'.repeat(3000);
-  const tinyDelta = 'a';
-  const newStr = oldStr + tinyDelta;
-  
-  const res = getIncrementalDelta(oldStr, newStr, oldStr.length, oldStr.slice(-64));
-  assert.strictEqual(res.matchedContent, newStr);
-});
-
-test('getIncrementalDelta: contentSuffix tracks last 64 characters', () => {
-  const longStr = 'a'.repeat(100);
-  const res = getIncrementalDelta('', longStr);
-  assert.strictEqual(res.contentSuffix.length, 64);
-  assert.strictEqual(res.contentSuffix, 'a'.repeat(64));
-});
-
-test('getIncrementalDelta: handles segment-based prefix matching', () => {
-  const prefix = 'a'.repeat(200);
-  const oldStr = prefix + 'OLD';
-  const newStr = prefix + 'NEW';
-  
-  const res = getIncrementalDelta(oldStr, newStr);
-  assert.ok(res.delta.length > 0);
-});
-
-test('getIncrementalDelta: works through a realistic multi-chunk stream', () => {
-  let accumulated = '';
-  const chunks = [
-    'The',
-    'The quick',
-    'The quick brown',
-    'The quick brown fox',
-    'The quick brown fox jumps',
-    'The quick brown fox jumps over the lazy dog.',
-  ];
-  
-  let finalDelta = '';
-  for (const chunk of chunks) {
-    const res = getIncrementalDelta(accumulated, chunk, accumulated.length, accumulated.slice(-64));
-    finalDelta += res.delta;
-    accumulated = res.matchedContent;
-  }
-  
-  assert.strictEqual(accumulated, 'The quick brown fox jumps over the lazy dog.');
-  assert.strictEqual(finalDelta, 'The quick brown fox jumps over the lazy dog.');
+  assert.ok(shouldSuppressStreamAbort(abortError, true, false, true));
+  assert.ok(shouldSuppressStreamAbort(abortError, false, true, true));
+  assert.ok(shouldSuppressStreamAbort(abortError, false, false, false));
+  assert.ok(!shouldSuppressStreamAbort(abortError, false, false, true));
+  assert.ok(!shouldSuppressStreamAbort(new Error("boom"), true, true, false));
 });

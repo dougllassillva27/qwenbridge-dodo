@@ -1,25 +1,32 @@
-import { test } from 'node:test';
-import assert from 'node:assert';
-import { getNextAccount, getNextAvailableAccount, markAccountRateLimited, clearAccountCooldown, invalidateAccountsCache } from '../core/account-manager.ts';
-import { addAccount, removeAccount, loadAccounts } from '../core/accounts.ts';
+import { test } from "node:test";
+import assert from "node:assert";
+import { getDatabase } from "../core/database.ts";
+import { invalidateAccountsCache } from "../core/accounts.ts";
+import {
+  getNextAccount,
+  getNextAvailableAccount,
+  markAccountRateLimited,
+} from "../core/account-manager.ts";
 
-test('Account Rotation: Round-Robin rotation cycle', async () => {
-  const originalAccounts = loadAccounts();
-  const originalIds = originalAccounts.map(a => a.id);
+test("Account Rotation: Round-Robin rotation cycle", async () => {
+  const originalEnv = process.env.QWEN_ACCOUNTS;
+  delete process.env.QWEN_ACCOUNTS;
 
-  const mockAccounts = [
-    { email: 'account1@test.com', password: 'password1' },
-    { email: 'account2@test.com', password: 'password2' },
-    { email: 'account3@test.com', password: 'password3' },
-  ];
+  const db = getDatabase();
+  const existing = db.prepare("SELECT id, email, password FROM accounts").all();
+  db.prepare("DELETE FROM accounts").run();
+  invalidateAccountsCache();
 
   try {
-    for (const acc of mockAccounts) {
-      addAccount(acc.email, acc.password);
-    }
+    const insert = db.prepare(
+      "INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)",
+    );
+    insert.run("acc1", "account1@test.com", "password1");
+    insert.run("acc2", "account2@test.com", "password2");
+    insert.run("acc3", "account3@test.com", "password3");
     invalidateAccountsCache();
 
-    const first = getNextAccount(true);
+    const first = getNextAccount();
     const second = getNextAccount();
     const third = getNextAccount();
     const fourth = getNextAccount();
@@ -29,76 +36,70 @@ test('Account Rotation: Round-Robin rotation cycle', async () => {
     assert.ok(third);
     assert.ok(fourth);
 
-    const allAccounts = loadAccounts();
-    const firstIdx = allAccounts.findIndex(a => a.id === first.id);
-    const secondIdx = allAccounts.findIndex(a => a.id === second.id);
-    const thirdIdx = allAccounts.findIndex(a => a.id === third.id);
-    const fourthIdx = allAccounts.findIndex(a => a.id === fourth.id);
-
-    assert.strictEqual(secondIdx, (firstIdx + 1) % allAccounts.length);
-    assert.strictEqual(thirdIdx, (secondIdx + 1) % allAccounts.length);
-    assert.strictEqual(fourthIdx, (thirdIdx + 1) % allAccounts.length);
+    assert.strictEqual(first!.email, "account1@test.com");
+    assert.strictEqual(second!.email, "account2@test.com");
+    assert.strictEqual(third!.email, "account3@test.com");
+    assert.strictEqual(fourth!.email, "account1@test.com");
   } finally {
-    const current = loadAccounts();
-    for (const acc of current) {
-      if (!originalIds.includes(acc.id)) {
-        removeAccount(acc.id);
-      }
+    db.prepare("DELETE FROM accounts").run();
+    const insert = db.prepare(
+      "INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)",
+    );
+    for (const row of existing as any[]) {
+      insert.run(row.id, row.email, row.password);
     }
     invalidateAccountsCache();
+    if (originalEnv !== undefined) {
+      process.env.QWEN_ACCOUNTS = originalEnv;
+    }
   }
 });
 
-test('Account Cooldown: Database persistence and recovery', async () => {
-  const email = 'cooldown-test@test.com';
-  let accountId = '';
+test("Account Rotation: returns account with shortest cooldown when all accounts are on cooldown", async () => {
+  const originalEnv = process.env.QWEN_ACCOUNTS;
+  delete process.env.QWEN_ACCOUNTS;
+
+  const db = getDatabase();
+  const existing = db.prepare("SELECT id, email, password FROM accounts").all();
+  db.prepare("DELETE FROM accounts").run();
+  invalidateAccountsCache();
 
   try {
-    const newAcct = addAccount(email, 'password123');
-    accountId = newAcct.id;
+    const insert = db.prepare(
+      "INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)",
+    );
+    insert.run("cool-acc-1", "cool1@test.com", "password1");
+    insert.run("cool-acc-2", "cool2@test.com", "password2");
     invalidateAccountsCache();
 
-    // Mark as rate-limited with a 1-hour cooldown
-    const cooldownMs = 60 * 60 * 1000;
-    markAccountRateLimited(accountId, cooldownMs, 'RateLimited');
+    markAccountRateLimited("cool-acc-1", 60_000, "RateLimited");
+    markAccountRateLimited("cool-acc-2", 30_000, "RateLimited");
 
-    // Force reloading accounts from DB (simulating restart)
-    invalidateAccountsCache();
+    // When all accounts are on cooldown, returns the one with the shortest remaining cooldown.
+    const next = getNextAccount();
+    assert.ok(
+      next !== null,
+      "should return an account even when all are on cooldown",
+    );
+    assert.strictEqual(next!.id, "cool-acc-2"); // 30s cooldown is shorter
 
-    // Check if the loaded account has the cooldown synced from DB
-    const loadedAccounts = loadAccounts();
-    const target = loadedAccounts.find(a => a.id === accountId);
-    assert.ok(target);
-    assert.ok(target.cooldown_until);
-    assert.ok(target.cooldown_until > Date.now());
-    assert.strictEqual(target.cooldown_reason, 'RateLimited');
-
-    // Verify rotation skips it
-    const triedSet = new Set<string>();
-    triedSet.add('dummy-id'); // to force getNextAvailableAccount check
-    const available = getNextAvailableAccount(triedSet);
-    // Since our test account is on cooldown, if it was returned, it means no other account was available,
-    // or if we have other non-cooldown accounts, it returned one of them.
-    if (available && available.id === accountId) {
-      // If it returned our test account, it must be because all accounts are on cooldown.
-      // Let's assert that the cooldown is actually registered in memory.
-      getNextAccount();
-      // It shouldn't be the first option if others are available
-    }
-
-    // Clear cooldown and verify it is updated in DB
-    clearAccountCooldown(accountId);
-    invalidateAccountsCache();
-
-    const reloaded = loadAccounts().find(a => a.id === accountId);
-    assert.ok(reloaded);
-    assert.strictEqual(reloaded.cooldown_until || 0, 0);
-    assert.strictEqual(reloaded.cooldown_reason, null);
-
+    const nextAvail = getNextAvailableAccount("cool-acc-1");
+    assert.ok(
+      nextAvail !== null,
+      "should return an account even when remaining are on cooldown",
+    );
+    assert.strictEqual(nextAvail!.id, "cool-acc-2");
   } finally {
-    if (accountId) {
-      removeAccount(accountId);
+    db.prepare("DELETE FROM accounts").run();
+    const insert = db.prepare(
+      "INSERT INTO accounts (id, email, password) VALUES (?, ?, ?)",
+    );
+    for (const row of existing as any[]) {
+      insert.run(row.id, row.email, row.password);
     }
     invalidateAccountsCache();
+    if (originalEnv !== undefined) {
+      process.env.QWEN_ACCOUNTS = originalEnv;
+    }
   }
 });

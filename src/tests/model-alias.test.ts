@@ -16,10 +16,10 @@ test("mapClientModelToQwen passes through non-Qwen ids (no GPT/Claude aliases)",
   // Codex/Grok custom provider sends the real Qwen id. Any other id must reach
   // the upstream unchanged so it responds with a clear model-not-found error
   // instead of silently mapping to an unrelated tier.
-  assert.equal(mapClientModelToQwen("gpt-5"), "qwen3.8-max");
-  assert.equal(mapClientModelToQwen("gpt-5-mini"), "qwen3.8-max");
-  assert.equal(mapClientModelToQwen("gpt-4o-mini"), "qwen3.8-max");
-  assert.equal(mapClientModelToQwen("claude-sonnet-4-6"), "qwen3.8-max");
+  assert.equal(mapClientModelToQwen("gpt-5"), "gpt-5");
+  assert.equal(mapClientModelToQwen("gpt-5-mini"), "gpt-5-mini");
+  assert.equal(mapClientModelToQwen("gpt-4o-mini"), "gpt-4o-mini");
+  assert.equal(mapClientModelToQwen("claude-sonnet-4-6"), "claude-sonnet-4-6");
   assert.equal(mapClientModelToQwen("totally-custom"), "totally-custom");
   assert.equal(mapClientModelToQwen(""), "");
 });

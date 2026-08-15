@@ -1,4 +1,3 @@
-import { accountTokenUsage } from "../../core/metrics.js";
 /*
  * File: streaming.ts
  * Project: QwenBridge
@@ -271,11 +270,11 @@ export async function processNonStreamingResponse(
     let lastThinkingSummary = "";
     let lastThinkingSummaryLength = 0;
     let lastThinkingSummarySuffix = "";
-    const reasoningChunks: string[] = [];
+    let reasoningBuffer = "";
     let lastRawContent = "";
     let lastRawContentLength = 0;
     let lastRawContentSuffix = "";
-    const finalContentChunks: string[] = [];
+    let finalContent = "";
     let targetResponseId: string | null = null;
     let pendingParentId: string | null = null;
     let currentUiSessionId = uiSessionId;
@@ -310,13 +309,13 @@ export async function processNonStreamingResponse(
 
     const consumeAnswerText = (textChunk: string) => {
       if (!toolParser) {
-        finalContentChunks.push(textChunk);
+        finalContent += textChunk;
         return;
       }
 
       const { text, toolCalls } = toolParser.feed(textChunk);
       if (text) {
-        finalContentChunks.push(text);
+        finalContent += text;
       }
       if (isToolcallDebugEnabled() && (text || toolCalls.length > 0)) {
         logger.debug("[chat] non-stream: parser feed result", {
@@ -478,7 +477,7 @@ export async function processNonStreamingResponse(
           if (foundStr && vStr !== "") {
             if (vStr === "FINISHED") continue;
             if (isThinkingChunk) {
-              reasoningChunks.push(vStr);
+              reasoningBuffer += vStr;
             } else {
               consumeAnswerText(vStr);
             }
@@ -534,7 +533,7 @@ export async function processNonStreamingResponse(
     }
 
     if (remainingText) {
-      finalContentChunks.push(remainingText);
+      finalContent += remainingText;
     }
     for (const tc of remainingToolCalls) {
       toolCallsOut.push({
@@ -551,8 +550,8 @@ export async function processNonStreamingResponse(
       logger.debug("[chat] non-stream: final toolcall summary", {
         totalToolCalls: toolCallsOut.length,
         toolCallNames: toolCallsOut.map((tc: any) => tc.function?.name),
-        contentLength: finalContentChunks.reduce((acc, c) => acc + c.length, 0),
-        hasReasoning: reasoningChunks.length > 0,
+        contentLength: finalContent.length,
+        hasReasoning: !!reasoningBuffer,
       });
     }
 
@@ -567,9 +566,9 @@ export async function processNonStreamingResponse(
     }
     const message: any = {
       role: "assistant",
-      content: toolCallsOut.length ? null : finalContentChunks.join(""),
+      content: toolCallsOut.length ? null : finalContent,
     };
-    if (reasoningChunks.length > 0) message.reasoning_content = reasoningChunks.join("");
+    if (reasoningBuffer) message.reasoning_content = reasoningBuffer;
     if (toolCallsOut.length) {
       message.tool_calls = toolCallsOut;
     }
@@ -757,8 +756,8 @@ export async function processNonStreamingResponse(
       model: body.model,
       finalPrompt,
       userPrompt,
-      assistantContent: finalContentChunks.join(""),
-      reasoningContent: reasoningChunks.length > 0 ? reasoningChunks.join("") : undefined,
+      assistantContent: finalContent,
+      reasoningContent: reasoningBuffer || undefined,
       usage,
       mode: "non-stream",
       context: currentTokenEstimationContext,
@@ -777,8 +776,8 @@ export async function processNonStreamingResponse(
       responseId: targetResponseId,
       userPrompt,
       finalPrompt,
-      assistantContent: finalContentChunks.join(""),
-      reasoningContent: reasoningChunks.length > 0 ? reasoningChunks.join("") : undefined,
+      assistantContent: finalContent,
+      reasoningContent: reasoningBuffer || undefined,
       usage,
       finishReason,
     });
@@ -870,6 +869,10 @@ export async function processStreamingResponse(
     let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let invalidInputSameAccountRetries = 0;
     let chatInProgressSameAccountRetries = 0;
+    // Set when the terminal [DONE] reached the client. The `| recovered`
+    // suffix on Stream done must only appear for attempts that COMPLETED after
+    // a mid-stream retry, not for failed attempts that consumed retries.
+    let streamCompletedOk = false;
 
     // The client socket went away. When config.stream.disconnectGraceMs > 0 we
     // do NOT tear down Qwen/stop/release the lease immediately: a transient
@@ -1134,8 +1137,8 @@ export async function processStreamingResponse(
       let lastRawContent = "";
       let lastRawContentLength = 0;
       let lastRawContentSuffix = "";
-      const finalContentChunks: string[] = [];
-      const reasoningChunks: string[] = [];
+      let finalContent = "";
+      let reasoningBuffer = "";
       let emittedModelOutput = false;
       let targetResponseId: string | null = null;
       let toolParser = shouldParseToolCalls
@@ -1169,7 +1172,7 @@ export async function processStreamingResponse(
       const emitAnswerText = async (textChunk: string) => {
         if (textChunk) emittedModelOutput = true;
         if (!toolParser) {
-          finalContentChunks.push(textChunk);
+          finalContent += textChunk;
           writeDeltaEvent({ content: textChunk });
           return;
         }
@@ -1193,7 +1196,7 @@ export async function processStreamingResponse(
         }
 
         if (text) {
-          finalContentChunks.push(text);
+          finalContent += text;
           writeDeltaEvent({ content: text });
         }
 
@@ -1329,6 +1332,15 @@ export async function processStreamingResponse(
           requestAborted: c.req.raw.signal.aborted,
         });
         if (!policy.retryable) return false;
+
+        // Full recovery decision — same rationale as the create-path policy
+        // log: the failure line shows the error, this line shows WHY the
+        // chosen action (retry same / switch / new chat / cooldown) was taken.
+        if (logger.isLevelEnabled("info")) {
+          console.log(
+            `🧭 [Chat] Stream recovery policy | account=${currentAccountId} | reason=${policy.reason} | retryable=${policy.retryable} | switch=${policy.switchAccount} | newChat=${policy.forceNewChat} | fullPrompt=${policy.retryWithFullPrompt} | retryAfter=${policy.retryAfterMs}ms`,
+          );
+        }
 
         if (policy.reason === "corrupted_chat_history") {
           invalidateLogicalThreadParent(midStreamRetry.sessionId);
@@ -1726,7 +1738,7 @@ export async function processStreamingResponse(
 
               if (isThinkingChunk) {
                 emittedModelOutput = true;
-                reasoningChunks.push(vStr);
+                reasoningBuffer += vStr;
                 writeDeltaEvent({ reasoning_content: vStr });
               } else {
                 await emitAnswerText(vStr);
@@ -1808,7 +1820,7 @@ export async function processStreamingResponse(
       }
 
       if (remainingText) {
-        finalContentChunks.push(remainingText);
+        finalContent += remainingText;
         await writeEvent({
           id: completionId,
           object: "chat.completion.chunk",
@@ -2184,7 +2196,7 @@ export async function processStreamingResponse(
                 if (vStr === "FINISHED") continue;
                 if (isThinkingChunk) {
                   emittedModelOutput = true;
-                  reasoningChunks.push(vStr);
+                  reasoningBuffer += vStr;
                   writeDeltaEvent({ reasoning_content: vStr });
                 } else {
                   await emitAnswerText(vStr);
@@ -2212,7 +2224,7 @@ export async function processStreamingResponse(
           if (toolParser) {
             const retryFlush = toolParser.flush();
             if (retryFlush.text) {
-              finalContentChunks.push(retryFlush.text);
+              finalContent += retryFlush.text;
               writeDeltaEvent({ content: retryFlush.text });
             }
             for (const tcDelta of retryFlush.toolCallDeltas) {
@@ -2279,11 +2291,6 @@ export async function processStreamingResponse(
         buildUsage(usageAccumulator),
         currentTokenEstimationContext?.contextMeter,
       );
-
-      // [Dodo] Injeta os tokens na telemetria (para exibir no Proxy Launcher)
-      if (activeAccountId && usage) {
-        recordAccountTokens(activeAccountId, usage.prompt_tokens || 0, usage.completion_tokens || 0);
-      }
       const finalFinishReason =
         toolParser && toolParser.getEmittedToolCallCount() > 0
           ? "tool_calls"
@@ -2372,6 +2379,7 @@ export async function processStreamingResponse(
         flushWrites();
         await streamWriter.write(payload);
         flushBuffer = null;
+        streamCompletedOk = true;
 
         scheduleAssistantComplete(onAssistantComplete, {
           sessionId: logicalSessionId,
@@ -2381,8 +2389,8 @@ export async function processStreamingResponse(
           responseId: targetResponseId,
           userPrompt,
           finalPrompt,
-          assistantContent: finalContentChunks.join(""),
-          reasoningContent: reasoningChunks.length > 0 ? reasoningChunks.join("") : undefined,
+          assistantContent: finalContent,
+          reasoningContent: reasoningBuffer || undefined,
           usage,
           finishReason: finalFinishReason,
         });
@@ -2401,8 +2409,8 @@ export async function processStreamingResponse(
           model: body.model,
           finalPrompt,
           userPrompt,
-          assistantContent: finalContentChunks.join(""),
-          reasoningContent: reasoningChunks.length > 0 ? reasoningChunks.join("") : undefined,
+          assistantContent: finalContent,
+          reasoningContent: reasoningBuffer || undefined,
           usage,
           mode: "stream",
           context: currentTokenEstimationContext,
@@ -2464,8 +2472,14 @@ export async function processStreamingResponse(
       }
 
       if (logger.isLevelEnabled("info")) {
+        const initialRetries = Math.max(0, config.retry.maxAttempts - 1);
+        // Only mark as recovered when the stream actually completed (the SSE
+        // terminal event was processed) after a mid-stream retry. A FAILED
+        // attempt that used retries then threw should not say "recovered".
+        const recovered =
+          streamCompletedOk && retryContext.retriesLeft < initialRetries;
         console.log(
-          `⏱️ [Chat] Stream done | req=${reqId} | ${Date.now() - streamStartedAt}ms | firstChunk=${firstChunkAt === null ? "none" : `${firstChunkAt - streamStartedAt}ms`}`,
+          `⏱️ [Chat] Stream done | req=${reqId} | ${Date.now() - streamStartedAt}ms | firstChunk=${firstChunkAt === null ? "none" : `${firstChunkAt - streamStartedAt}ms`}${recovered ? ` | recovered` : ""}`,
         );
       }
 
@@ -2587,16 +2601,39 @@ export function handleChatCompletionsError(c: Context, err: unknown): Response {
   const status = classified.statusCode;
   console.error(`❌ [Chat] Error | ${status} ${code} | ${message}`);
 
-  return sendOpenAIError(c, err);
-}
-
-
-// [Dodo] Funcao de registro de tokens injetada
-export function recordAccountTokens(accountId: string, promptTokens: number, completionTokens: number): void {
-  if (!accountTokenUsage[accountId]) {
-    accountTokenUsage[accountId] = { prompt: 0, completion: 0, total: 0 };
+  // The one-line error omits WHERE the failure originated (account/chat/reason)
+  // and the stack — both needed to reproduce. Emit the structured detail once;
+  // the classification line stays for the compact terminal.
+  if (logger.isLevelEnabled("info")) {
+    const detail: Record<string, unknown> = {
+      status,
+      code,
+      type: classified.type ?? undefined,
+      message,
+    };
+    if (err instanceof Error) {
+      detail.stack = err.stack;
+    }
+    const quota = (err as any)?.quotaInfo;
+    if (quota) {
+      detail.quota = {
+        email: quota.email,
+        cooldownSeconds: quota.cooldownSeconds,
+        until: quota.untilStr,
+        message: quota.message,
+      };
+    }
+    const createdChat = (err as any)?.createdNewChat;
+    if (createdChat) {
+      detail.createdNewChat = true;
+      const rawChatId = (err as any)?.chatSessionId;
+      detail.chatId = rawChatId ? String(rawChatId).substring(0, 12) : undefined;
+      detail.accountId = (err as any)?.accountId;
+    }
+    console.log(
+      `🧾 [Chat] Error details | ${JSON.stringify(detail)}`,
+    );
   }
-  accountTokenUsage[accountId].prompt += promptTokens;
-  accountTokenUsage[accountId].completion += completionTokens;
-  accountTokenUsage[accountId].total += (promptTokens + completionTokens);
+
+  return sendOpenAIError(c, err);
 }

@@ -1,32 +1,36 @@
-FROM mcr.microsoft.com/playwright:v1.60.0-noble
+FROM mcr.microsoft.com/playwright:v1.62.1-jammy
 
-RUN apt-get update && apt-get install -y --no-install-recommends dumb-init gosu \
-    && rm -rf /var/lib/apt/lists/*
+# Upgrade Node.js to v24 (base image ships with Node 22)
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+  && apt-get install -y --no-install-recommends nodejs \
+  && rm -rf /var/lib/apt/lists/*
+
+# Install native build tools for better-sqlite3, plus process helpers.
+# better-sqlite3 may compile from source on ARM64 when no prebuilt binary exists.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends build-essential python3 dumb-init gosu \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Install dependencies first for better caching
 COPY package*.json ./
-RUN npm ci && npm cache clean --force
+RUN npm ci --omit=dev && npm cache clean --force
 
-COPY tsconfig.json tsconfig.build.json ./
-COPY src/ ./src/
-COPY docker-entrypoint.sh ./docker-entrypoint.sh
+# Copy the rest of the application
+COPY . .
 
-RUN npm run build && npm prune --omit=dev
+# Prepare persistent directories and entrypoint
+RUN mkdir -p /app/data/db /app/data/qwen_profiles /tmp/playwright \
+  && chown -R pwuser:pwuser /app /tmp/playwright \
+  && chmod +x /app/docker-entrypoint.sh
 
-COPY web/package.json web/package-lock.json web/
-RUN npm --prefix web ci
-COPY web/ web/
-RUN npm --prefix web run build && rm -rf web/node_modules
-
-RUN mkdir -p /app/data /app/qwen_profiles /tmp/playwright \
-    && chown -R pwuser:pwuser /app /tmp/playwright \
-    && chmod +x /app/docker-entrypoint.sh
-
-VOLUME ["/app/data", "/app/qwen_profiles"]
+# Declare volume for persistent data (database, encryption key and browser profiles)
+VOLUME ["/app/data"]
 
 EXPOSE 3000
-ENV NODE_ENV=production PORT=3000
+ENV NODE_ENV=production
 
+# Use dumb-init to avoid zombie processes from Playwright and ensure writable volumes at startup
 ENTRYPOINT ["/usr/bin/dumb-init", "--", "/app/docker-entrypoint.sh"]
-CMD ["node", "dist/index.js"]
+CMD ["npx", "tsx", "src/index.ts"]

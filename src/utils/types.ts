@@ -1,21 +1,15 @@
-/*
- * File: types.ts
- * Project: qwenproxy
- * Author: Pedro Farias
- * Created: 2026-05-09
- * 
- * Last Modified: Sat May 09 2026
- * Modified By: Pedro Farias
- */
-
-import type { JsonSchema, FunctionToolDefinition } from '../tools/types.js';
+import type { JsonSchema, FunctionToolDefinition } from "../tools/types.ts";
 export type { JsonSchema, FunctionToolDefinition };
 
 /** Tool choice options */
-export type ToolChoice = 'auto' | 'none' | 'required' | {
-  type: 'function';
-  function: { name: string };
-};
+export type ToolChoice =
+  | "auto"
+  | "none"
+  | "required"
+  | {
+      type: "function";
+      function: { name: string };
+    };
 
 // --- Message Types ---
 
@@ -26,7 +20,7 @@ export interface ToolCallFunction {
 
 export interface MessageToolCall {
   id: string;
-  type: 'function';
+  type: "function";
   function: ToolCallFunction;
 }
 
@@ -49,8 +43,13 @@ export interface OpenAIRequest {
   model: string;
   messages: Message[];
   stream?: boolean;
+  /** QwenBridge media extension used by image/video chat models. */
+  size?: string;
   tools?: FunctionToolDefinition[];
   tool_choice?: ToolChoice;
+  user?: string;
+  session_id?: string;
+  conversation_id?: string;
   stream_options?: {
     include_usage?: boolean;
   };
@@ -88,6 +87,11 @@ export interface Usage {
   total_tokens: number;
   prompt_tokens_details?: {
     cached_tokens: number;
+    text_tokens?: number;
+  };
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
+    text_tokens?: number;
   };
 }
 

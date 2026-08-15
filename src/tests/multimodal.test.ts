@@ -1,146 +1,239 @@
-import test from 'node:test';
-import assert from 'node:assert';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import net from 'node:net';
-import { serve } from '@hono/node-server';
-import { app } from '../api/server.js';
-import { initPlaywright, closePlaywright } from '../services/playwright.js';
+import test from "node:test";
+import assert from "node:assert";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const mediaDir = path.join(__dirname, 'media');
+process.env.TEST_MOCK_QWEN_AUTH = "true";
 
-function isPortAvailable(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const server = net.createServer();
-    server.once('error', () => resolve(false));
-    server.once('listening', () => {
-      server.close(() => resolve(true));
-    });
-    server.listen(port);
-  });
-}
+import { processImagesForQwen } from "../routes/upload.ts";
+import { formatGeneratedVideoContent } from "../routes/chat/media.ts";
+import { fetchQwenModels } from "../services/qwen.ts";
+import {
+  resolveMediaModel,
+  classifyMediaModel,
+  isSupportedMediaSize,
+  MEDIA_SIZE_OPTIONS,
+  listMediaGenerationModels,
+  getMediaModelModes,
+  supportsPromptMediaGeneration,
+  mediaLog,
+} from "../services/media-generation.ts";
 
-async function getFreePort(startPort: number): Promise<number> {
-  let port = startPort;
-  while (true) {
-    const available = await isPortAvailable(port);
-    if (available) return port;
-    port++;
-  }
-}
+test("fetchQwenModels caches results per account", async () => {
+  const originalFetch = globalThis.fetch;
+  let modelRequests = 0;
 
-function fileToDataUri(filePath: string): string {
-  const buffer = fs.readFileSync(filePath);
-  const ext = path.extname(filePath).slice(1).toLowerCase();
-  const mimeMap: Record<string, string> = {
-    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
-    mp4: 'video/mp4', mp3: 'audio/mpeg',
-    pdf: 'application/pdf',
-    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  };
-  return `data:${mimeMap[ext] || 'application/octet-stream'};base64,${buffer.toString('base64')}`;
-}
-
-async function sendMultimodalRequest(
-  port: number,
-  prompt: string,
-  urlType: string,
-  dataUri: string,
-): Promise<{ content: string; reasoning: string }> {
-  const contentPart: any = { type: urlType };
-  if (urlType === 'image_url') contentPart.image_url = { url: dataUri };
-  else if (urlType === 'video_url') contentPart.video_url = { url: dataUri };
-  else if (urlType === 'audio_url') contentPart.audio_url = { url: dataUri };
-  else contentPart.file_url = { url: dataUri };
-
-  const response = await fetch(`http://localhost:${port}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'qwen3.6-plus',
-      messages: [{ role: 'user', content: [
-        { type: 'text', text: prompt },
-        contentPart,
-      ]}],
-      stream: true
-    })
-  });
-
-  assert.strictEqual(response.status, 200, `Expected 200, got ${response.status}`);
-
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-  let content = '';
-  let reasoning = '';
-  let buffer = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith('data: ')) continue;
-      const dataStr = trimmed.slice(6);
-      if (dataStr === '[DONE]') continue;
-      try {
-        const chunk = JSON.parse(dataStr);
-        const delta = chunk.choices?.[0]?.delta;
-        if (delta?.content) content += delta.content;
-        if (delta?.reasoning_content) reasoning += delta.reasoning_content;
-      } catch { /* ignore */ }
+  globalThis.fetch = async (input: any) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url.includes("/api/models")) {
+      modelRequests++;
+      return new Response(
+        JSON.stringify({
+          data: [
+            {
+              id: "qwen3.6-plus",
+              owned_by: "qwen",
+              info: {
+                meta: {
+                  capabilities: { thinking: true },
+                  modality: ["text"],
+                  think_skip: { enable: true },
+                },
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
     }
-  }
-
-  return { content, reasoning };
-}
-
-test('Multimodal: all media files with real Qwen responses', { skip: process.env.CI ? 'Requires real accounts - skipped in CI' : false }, async () => {
-  const port = await getFreePort(3200);
-  const server = serve({ fetch: app.fetch, port });
-  console.log(`[MultimodalTest] Server started on port ${port}`);
-
-  await initPlaywright(true);
+    return originalFetch(input);
+  };
 
   try {
-    const scenarios = [
-      { file: 'farias.png', urlType: 'image_url', prompt: 'Descreva essa imagem em detalhes', requireContent: true },
-      { file: 'video.mp4', urlType: 'video_url', prompt: 'Descreva o conteúdo deste vídeo', requireContent: true },
-      { file: 'audio.mp3', urlType: 'audio_url', prompt: 'Transcreva e descreva o que é dito neste áudio', requireContent: true },
-      { file: 'doc1.pdf', urlType: 'file_url', prompt: 'Resuma o conteúdo deste documento PDF', requireContent: false },
-      { file: 'doc2.xlsx', urlType: 'file_url', prompt: 'Analise os dados desta planilha e descreva o que contém', requireContent: false },
-    ];
+    const first = await fetchQwenModels("acc-a");
+    const second = await fetchQwenModels("acc-a");
+    const third = await fetchQwenModels("acc-b");
 
-    for (const scenario of scenarios) {
-      const filePath = path.join(mediaDir, scenario.file);
-      if (!fs.existsSync(filePath)) {
-        console.log(`[MultimodalTest] SKIP ${scenario.file} - not found`);
-        continue;
-      }
-
-      const dataUri = fileToDataUri(filePath);
-      console.log(`[MultimodalTest] Sending ${scenario.file} (${(fs.statSync(filePath).size / 1024).toFixed(1)}KB)...`);
-
-      const { content, reasoning } = await sendMultimodalRequest(port, scenario.prompt, scenario.urlType, dataUri);
-
-      console.log(`[MultimodalTest] ${scenario.file} => ${content.length} chars`);
-      if (content) console.log(`  Content: ${content.substring(0, 300)}`);
-      if (reasoning) console.log(`  Reasoning: ${reasoning.substring(0, 150)}...`);
-
-      if (scenario.requireContent) {
-        assert.ok(content.length > 10, `${scenario.file}: expected meaningful response, got ${content.length} chars`);
-      } else if (content.length === 0) {
-        console.log(`[MultimodalTest] WARN: ${scenario.file} returned empty response (Qwen may not support this file type via ${scenario.urlType})`);
-      }
-    }
+    assert.strictEqual(modelRequests, 2);
+    assert.strictEqual(first[0]?.id, "qwen3.6-plus");
+    assert.strictEqual(second.length, 1);
+    assert.strictEqual(second[0]?.id, "qwen3.6-plus");
+    assert.strictEqual(third[0]?.id, "qwen3.6-plus");
   } finally {
-    await closePlaywright();
-    server.close();
-    console.log('[MultimodalTest] Done.');
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("media generation uses the model selected by the client", async () => {
+  assert.deepEqual(resolveMediaModel("caller-selected-model"), {
+    chatModel: "caller-selected-model",
+    generationModel: undefined,
+  });
+  assert.throws(
+    () => resolveMediaModel(undefined),
+    /model selected by the client/i,
+  );
+});
+
+test("classifyMediaModel routes generation models for native chat media", () => {
+  assert.strictEqual(classifyMediaModel("qwen-image-3.0-pro"), "image");
+  assert.strictEqual(classifyMediaModel("qwen-image-max"), "image");
+  assert.strictEqual(classifyMediaModel("wan2.6-t2i"), "image");
+  assert.strictEqual(classifyMediaModel("wan2.6-t2v"), "video");
+  assert.strictEqual(classifyMediaModel("wan2.2-t2v-flash"), "video");
+  assert.strictEqual(classifyMediaModel("qwen3.8-max"), null);
+  assert.strictEqual(classifyMediaModel("qwen3.7-plus"), null);
+  assert.strictEqual(classifyMediaModel(undefined), null);
+  assert.strictEqual(classifyMediaModel("   "), null);
+});
+
+test("media catalog includes the requested model IDs and modality metadata", () => {
+  const models = new Map(
+    listMediaGenerationModels().map((model) => [model.id, model]),
+  );
+  const expectedIds = [
+    "qwen-image-2.0-pro-2026-06-22",
+    "qwen-image-2512",
+    "wan2.7-image-pro",
+    "wan2.7-image",
+    "z-image-turbo",
+    "qwen-image-prompt-extend",
+    "qwen-image-edit",
+    "qwen-image-edit-2511",
+    "wan2.6-image",
+    "wan2.5-i2i-preview",
+    "wan2.7-t2v",
+    "wan-v2.2-a14b",
+    "wan2.7-i2v",
+    "wan2.5-i2v-preview",
+    "wan2.6-i2v",
+  ];
+
+  for (const id of expectedIds) {
+    assert.ok(models.has(id), `missing media model: ${id}`);
+  }
+  assert.deepEqual(getMediaModelModes("qwen-image-2.0-pro-2026-06-22"), [
+    "t2i",
+    "i2i",
+  ]);
+  assert.strictEqual(supportsPromptMediaGeneration("qwen-image-edit", "image"), false);
+  assert.strictEqual(supportsPromptMediaGeneration("wan2.7-i2v", "video"), false);
+  assert.strictEqual(supportsPromptMediaGeneration("wan2.7-t2v", "video"), true);
+});
+
+test("media sizes include the Qwen portrait ratio and reject unknown ratios", () => {
+  assert.ok(isSupportedMediaSize("auto"));
+  assert.ok(isSupportedMediaSize("1:1"));
+  assert.ok(isSupportedMediaSize("3:4"));
+  assert.ok(isSupportedMediaSize("4:3"));
+  assert.ok(isSupportedMediaSize("16:9"));
+  assert.ok(isSupportedMediaSize("9:16"));
+  assert.ok(isSupportedMediaSize("1024x1024"));
+  assert.strictEqual(isSupportedMediaSize("2:5"), false);
+  assert.ok(MEDIA_SIZE_OPTIONS.includes("3:4"));
+});
+
+test("chat video results use a clickable Markdown link", () => {
+  const content = formatGeneratedVideoContent(
+    "https://cdn.qwenlm.ai/output/video.mp4?key=test-token",
+  );
+
+  assert.strictEqual(
+    content,
+    "[🎬 Generated video](https://cdn.qwenlm.ai/output/video.mp4?key=test-token)",
+  );
+});
+
+test("media logs are standardized and redact signed URLs", () => {
+  const message = mediaLog("image", "generation_completed", {
+    account: "1234567890abcdef",
+    url: "https://cdn.qwenlm.ai/output/image.png?key=secret-token",
+    error: "first line\nsecond line",
+  });
+
+  assert.match(message, /^🎨 \[Media\] generation_completed \|/);
+  assert.match(message, /account=1234567890ab/);
+  assert.match(message, /url=\[redacted-url\]/);
+  assert.doesNotMatch(message, /secret-token/);
+  assert.doesNotMatch(message, /\n/);
+});
+
+test("processImagesForQwen re-uploads remote HTTP files to Qwen OSS", async () => {
+  const originalFetch = globalThis.fetch;
+  const remoteUrl = "https://example.com/docs/report.pdf?download=1";
+  const remoteBuffer = Buffer.from("pdf");
+  let remoteDownloads = 0;
+  let stsRequests = 0;
+
+  globalThis.fetch = async (input: any, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input.url;
+
+    if (url === remoteUrl) {
+      remoteDownloads++;
+      return new Response(remoteBuffer, {
+        status: 200,
+        headers: {
+          "Content-Type": "application/pdf",
+        },
+      });
+    }
+
+    if (url.includes("/api/v2/files/getstsToken")) {
+      stsRequests++;
+      const body = JSON.parse(String(init?.body || "{}"));
+      assert.strictEqual(body.filename, "report.pdf");
+      assert.strictEqual(body.filetype, "file");
+      assert.strictEqual(body.filesize, String(remoteBuffer.length));
+
+      return new Response(
+        JSON.stringify({
+          success: true,
+          request_id: "req-1",
+          data: {
+            access_key_id: "ak",
+            access_key_secret: "sk",
+            security_token: "token",
+            file_url: "https://oss.example/report.pdf?signature=123",
+            file_path: "uploads/report.pdf",
+            file_id: "file-123",
+            bucketname: "bucket",
+            region: "oss-region",
+            endpoint: "oss.example",
+          },
+        }),
+        { status: 200 },
+      );
+    }
+
+    return originalFetch(input, init);
+  };
+
+  try {
+    const result = await processImagesForQwen(
+      [
+        { type: "text", text: "Veja o anexo" },
+        { type: "file_url", file_url: { url: remoteUrl } },
+      ],
+      {
+        cookie: "token=mock",
+        "user-agent": "mock",
+        "bx-ua": "mock-bx-ua",
+        "bx-umidtoken": "mock-bx-umidtoken",
+        "bx-v": "2.5.36",
+      },
+    );
+
+    assert.strictEqual(result.text, "Veja o anexo");
+    assert.strictEqual(remoteDownloads, 1);
+    assert.strictEqual(stsRequests, 1);
+    assert.strictEqual(result.files.length, 1);
+    assert.strictEqual(result.files[0].url, "https://oss.example/report.pdf");
+    assert.strictEqual(result.files[0].id, "file-123");
+    assert.strictEqual(result.files[0].name, "report.pdf");
+    assert.strictEqual(
+      result.files[0].file.meta.content_type,
+      "application/pdf",
+    );
+    assert.strictEqual(result.files[0].size, remoteBuffer.length);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });

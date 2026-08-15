@@ -9,19 +9,22 @@ dist/
 .env.local
 .env.production
 
-# Database
+# Persistent runtime data (DB, profiles, benchmarks, diagnostics)
 data/
+data-test/
 *.db
 *.db-wal
 *.db-shm
 accounts.json
 accounts.json.bak
 
-# Browser profiles (session data)
-qwen_profiles/
-
 # Logs
 *.log
+log*.txt
+qwenproxy-api-*.log.txt
+
+# Network captures
+network/
 
 # Coverage & cache
 coverage/
@@ -32,11 +35,4 @@ coverage/
 Thumbs.db
 
 # IDE / Editor
-.kilo
-
-
-
-
-# Admin web (React/shadcn build)
-web/node_modules
-web/dist
+AGENTS.md

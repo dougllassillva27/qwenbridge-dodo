@@ -1,55 +1,16 @@
 services:
-  qwenproxy:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: qwenproxy
+  qwenbridge:
+    build: .
+    container_name: qwenbridge
     ports:
-      # Match BOTH sides to PORT: o container escuta na mesma PORT que o .env
-      # injeta (env_file). Antes, PORT=3001 no .env mapeava 3001->3000 e o
-      # healthcheck quebrava.
       - "${PORT:-3000}:${PORT:-3000}"
     env_file:
-      # Carrega toda a config de runtime do .env. Opcional — sem .env o servidor
-      # sobe com os defaults do schema Zod (mas sem contas/quota configuradas).
-      - path: .env
-        required: false
+      - .env
     volumes:
-      # SQLite (sessões/cooldowns/usuários) + perfis de browser persistidos.
-      - qwenproxy_data:/app/data
-      - qwenproxy_profiles:/app/qwen_profiles
-      - type: tmpfs
-        target: /tmp
-        tmpfs:
-          size: 536870912
+      - ./data:/app/data
     restart: unless-stopped
-    shm_size: '1gb'
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          # Cada context chromium consome ~300-600MB. Suba para 6-8g se usar
-          # várias contas/lanes em paralelo.
-          memory: 4g
-          cpus: '2.0'
-        reservations:
-          memory: 1g
-    healthcheck:
-      # /health só responde após o boot completo (pre-captura de headers de
-      # todas as contas com stagger). start_period de 120s evita restarts falsos
-      # com várias contas. Usa ${PORT} para casar com o override acima.
-      test: ["CMD", "node", "-e", "fetch('http://localhost:${PORT:-3000}/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 120s
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  qwenproxy_data:
-  qwenproxy_profiles:
