@@ -1671,12 +1671,52 @@ export async function captureQwenHeaders(
       await clearVisibleChallenge(page);
       if (settled) return;
 
+      // Session-expiry fast path: if the page landed on the auth/login screen
+      // (redirection after a dead session), typing into the chat input would
+      // burn every trigger attempt on a textarea that does not exist. Re-login
+      // immediately when credentials are available; otherwise fail fast with a
+      // clear diagnosis instead of 3 pointless grace timeouts.
+      const currentUrl = page.url();
+      if (currentUrl.includes("/auth") || currentUrl.includes("/login")) {
+        const { getAccountCredentials } = await import("../core/accounts.ts");
+        const creds = getAccountCredentials(accountId);
+        if (creds && creds.email && creds.password) {
+          console.warn(
+            `⚠️  [Playwright] Session expired during header capture for ${accountId}; re-authenticating...`,
+          );
+          const ok = await loginToQwen(accountId, creds.email, creds.password);
+          if (!ok) {
+            settle(
+              new Error(
+                `Header capture failed for ${accountId}: re-login after session expiry did not succeed`,
+              ),
+            );
+            return;
+          }
+          // Re-login navigated away; reload the chat page so the send below
+          // types into a live chat input (never leave the loop parked).
+          await openChatPage();
+          if (settled) return;
+        } else {
+          settle(
+            new Error(
+              `Header capture failed for ${accountId}: session expired and no credentials available for re-login`,
+            ),
+          );
+          return;
+        }
+      }
+
       const inputSelector = 'textarea:visible, [contenteditable="true"]:visible';
-      await page.focus(inputSelector);
+      try {
+        await page.focus(inputSelector, { timeout: 5000 });
+      } catch {
+        // [Dodo] Continua resiliente caso demore para renderizar
+      }
       if (settled) return;
-      await page.fill(inputSelector, "");
+      await page.fill(inputSelector, "").catch(() => {});
       if (settled) return;
-      await page.type(inputSelector, "a", { delay: 100 });
+      await page.type(inputSelector, "a", { delay: 100 }).catch(() => {});
       if (settled) return;
       await sleep(2000);
       if (settled) return;

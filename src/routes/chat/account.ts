@@ -25,6 +25,7 @@ import {
 	abortLeaseByLabel,
 	acquireAccountLease,
 	isAccountBusy,
+	isAccountSlotHeldByOtherSession,
 	isAccountTemporarilyBusy,
 	markAccountTemporarilyBusy,
 	markLeaseCompletion,
@@ -92,14 +93,28 @@ const chatLocks = new Map<string, Mutex>();
 const personalizationLocks = new Map<string, Mutex>();
 
 export async function acquireChatLock(chatId: string): Promise<() => void> {
+	const acquireStartedAt = Date.now();
 	let mutex = chatLocks.get(chatId);
 	if (!mutex) {
 		mutex = new Mutex(`chat:${chatId.substring(0, 8)}`);
 		chatLocks.set(chatId, mutex);
 	}
 	const release = await mutex.acquire(60_000, `chat:${chatId.substring(0, 12)}`);
+	// Held time must exclude the wait: capture right after the acquire settles,
+	// not at function entry (the wait is already visible as `waited Xms` above).
+	const heldStartedAt = Date.now();
+	if (logger.isLevelEnabled("info")) {
+		console.log(
+			`🔐 [Chat] Chat lock acquired | chat=${chatId.substring(0, 12)} | waited ${heldStartedAt - acquireStartedAt}ms`,
+		);
+	}
 	return () => {
 		release();
+		if (logger.isLevelEnabled("info")) {
+			console.log(
+				`🔓 [Chat] Chat lock released | chat=${chatId.substring(0, 12)} | held ${Date.now() - heldStartedAt}ms`,
+			);
+		}
 		if (mutex!.isIdle()) {
 			chatLocks.delete(chatId);
 		}
@@ -357,6 +372,30 @@ export async function acquireUpstreamStream(
 	}
 
 	const resolved = resolveInitialAccount(resolvedPreferred, excludeSet);
+
+	if (logger.isLevelEnabled("info")) {
+		// Why THIS account? The operator needs the decision, not just the
+		// result — the previous rounds' "stale label" / "switching" confusion
+		// came from logs that showed only the outcome.
+		const poolSize = resolved.configuredAccounts.length;
+		const cooldownCount = resolved.configuredAccounts.filter((a) =>
+			isAccountOnCooldown(a.id),
+		).length;
+		const why =
+			resolved.account === null
+				? "pool-exhausted"
+				: stickyThreadAccountId &&
+					  resolved.account.id === stickyThreadAccountId
+					? "sticky"
+					: resolved.account.id === resolvedPreferred
+						? "preferred"
+						: resolvedPreferred === null
+							? "failover-rotate"
+							: "round-robin";
+		console.log(
+			`🎯 [Chat] Account selected | ${resolved.account ? maskEmail(resolved.account.email) : "none"} (${resolved.account?.id ?? "none"}) | reason=${why} | pool=${poolSize}${cooldownCount ? ` | cooldown=${cooldownCount}` : ""}${stickyThreadAccountId ? ` | sticky=${stickyThreadAccountId === resolved.account?.id}` : ""}`,
+		);
+	}
 
 	let account: SelectedAccount | null = resolved.account;
 	const configuredAccounts = resolved.configuredAccounts;
@@ -708,6 +747,27 @@ interface CreateStreamFailure {
 	error: any;
 }
 
+/**
+ * Decision helper for the per-account lease queue deadline.
+ *
+ * `true` means the request may wait up to `queueWaitForeverCapMs` for the
+ * slot (thread owner waiting on its OWN session, or the last usable account).
+ * `false` means it waits at most `busyWaitMs` and then fails with
+ * `account_busy` so the attempt loop can rotate accounts.
+ *
+ * The thread-owner preference is NOT enough on its own: when another session
+ * holds the slot, waiting long is pure latency (the other session may keep
+ * generating for minutes). Only the same-session holder justifies the long
+ * wait (same-session latest-wins / tool loop).
+ */
+export function shouldWaitQueueForever(
+	isThreadOwnerWaiting: boolean,
+	heldByOtherSession: boolean,
+	hasFreeAlternate: boolean,
+): boolean {
+	return (isThreadOwnerWaiting && !heldByOtherSession) || !hasFreeAlternate;
+}
+
 async function tryCreateStreamWithRetry(
 	params: {
 		finalPrompt: string;
@@ -752,6 +812,13 @@ async function tryCreateStreamWithRetry(
 	let accountSwitches = 0;
 	let chatInProgressCount = 0;
 	let chatInProgressEscalated = false;
+	// Account that accumulated the chat_in_progress failures (the one whose
+	// upstream chat is actually stuck "in progress"). The escalation branch
+	// switches currentAccountId to a FRESH account, and the loop-exit session
+	// clear must drop the binding to the stuck chat — NOT clear the sessions of
+	// an account that never served this session (cross-session damage).
+	let chatInProgressOriginAccountId: string | null = null;
+	let chatInProgressOriginAccountEmail: string | null = null;
 	let lastAttemptError: any = null;
 	let invalidInputSameAccountRetried = false;
 	const accounts = loadAccounts();
@@ -850,8 +917,23 @@ async function tryCreateStreamWithRetry(
 			const hasFreeAlt =
 				!isSingleAccount &&
 				hasFreeAlternateAccount(accounts, currentAccountId, triedAccounts);
-			const waitQueueForever =
-				params.queueSlotUntilFree === true || hasFreeAlt === false;
+			const sessionLabel = params.sessionId ?? currentAccountEmail;
+			// The thread owner (or the last usable account) may wait for the slot
+			// without a short deadline — but ONLY when the slot is busy with OUR
+			// session (same-session latest-wins / tool loop). If ANOTHER session is
+			// generating on this account, waiting 120s is pure latency: the other
+			// session may hold the slot for minutes. Fail fast with account_busy so
+			// the attempt loop rotates to a different account instead (or retries
+			// quickly when no alternative exists).
+			const heldByOtherSession = isAccountSlotHeldByOtherSession(
+				currentAccountId,
+				sessionLabel,
+			);
+			const waitQueueForever = shouldWaitQueueForever(
+				params.queueSlotUntilFree === true,
+				heldByOtherSession,
+				hasFreeAlt,
+			);
 
 			// Latest-wins: if the client retried the same session, abort the old
 			// generation and free the slot immediately instead of queueing behind it.
@@ -860,7 +942,6 @@ async function tryCreateStreamWithRetry(
 			// consumed. A PARALLEL request (parallelEscape) never kills at all: it
 			// runs on its own chat and must not abort the main generation even
 			// after the main emits its first chunk.
-			const sessionLabel = params.sessionId ?? currentAccountEmail;
 			if (params.sessionId && !params.parallelEscape) {
 				abortLeaseByLabel(currentAccountId, sessionLabel, {
 					onlyIfEmitted: true,
@@ -1239,6 +1320,13 @@ async function tryCreateStreamWithRetry(
 
 		attemptsLeft--;
 		const err = attemptError;
+		// The account that actually failed THIS attempt — captured before any
+		// branch below can switch currentAccountId/Email (chat_in_progress
+		// escalation moves to a fresh account). The generic retry log must name
+		// the account that failed, not the newly-selected one that was never
+		// attempted (observed: "Qwen request failed for 280wu" when 280wu had
+		// never been tried and ldyjl had failed 4x with chat_in_progress).
+		const failedAccountEmail = currentAccountEmail;
 
 		// Once the client request is aborted, do not rotate accounts or retry. The
 		// old request can otherwise keep acquiring leases after the client is gone.
@@ -1347,6 +1435,15 @@ async function tryCreateStreamWithRetry(
 			requestAborted: params.requestSignal?.aborted === true,
 		});
 
+		// The full retry decision — the `❌ Request failed` line shows the error
+		// but not WHY this action was chosen. Surface every field so the next
+		// escalation/switch/cooldown is explainable from the log alone.
+		if (logger.isLevelEnabled("info")) {
+			console.log(
+				`🧭 [Chat] Retry policy | account=${currentAccountEmail} | reason=${policy.reason} | retryable=${policy.retryable} | switch=${policy.switchAccount} | newChat=${policy.forceNewChat} | fullPrompt=${policy.retryWithFullPrompt}${policy.dropFiles ? ` | dropFiles` : ""} | retryAfter=${policy.retryAfterMs}ms${policy.accountCooldownMs ? ` | cooldown=${Math.round(policy.accountCooldownMs / 1000)}s (${policy.accountCooldownReason ?? ""})` : ""}`,
+			);
+		}
+
 		// Corrupted history means the stored parent chain is unusable. Purge the
 		// parent immediately so a failed recovery cannot leave the tainted thread
 		// bound for the next turn.
@@ -1376,6 +1473,12 @@ async function tryCreateStreamWithRetry(
 		// rotate: an escalation replays the full context on a cold account
 		// (~12s context reopen + captcha; observed 45s + a 495KB replay).
 		if (policy.reason === "chat_in_progress") {
+			if (chatInProgressOriginAccountId === null) {
+				// First chat_in_progress of this request: remember the account
+				// whose chat is stuck BEFORE any escalation switch happens.
+				chatInProgressOriginAccountId = currentAccountId;
+				chatInProgressOriginAccountEmail = currentAccountEmail;
+			}
 			chatInProgressCount++;
 			markAccountTemporarilyBusy(
 				currentAccountId,
@@ -1538,10 +1641,17 @@ async function tryCreateStreamWithRetry(
 				err instanceof RetryableQwenStreamError ||
 				isChatInProgressError(err)
 			) {
+				// After an escalation, currentAccountId points at the FRESH account
+				// that never served this session — clearing ITS sessions would wipe
+				// other sessions' bindings on an innocent account. Clear the ORIGIN
+				// account instead (the one whose chat is genuinely stuck).
+				const clearTargetId = chatInProgressOriginAccountId ?? currentAccountId;
+				const clearTargetEmail =
+					chatInProgressOriginAccountEmail ?? currentAccountEmail;
 				console.warn(
-					`🧹 [Chat] Clearing session state for ${currentAccountEmail} (${currentAccountId}) after exhausted retries`,
+					`🧹 [Chat] Clearing session state for ${clearTargetEmail} (${clearTargetId}) after exhausted retries`,
 				);
-				clearAllSessionsForAccount(currentAccountId);
+				clearAllSessionsForAccount(clearTargetId);
 			}
 
 			return { success: false, error: err };
@@ -1553,7 +1663,7 @@ async function tryCreateStreamWithRetry(
 		);
 
 		console.warn(
-			`🔄 [Chat] Qwen request failed for ${currentAccountEmail}, retrying in ${useDelay}ms... (${attemptsLeft} left). reason=${policy.reason} error=${errMsg.slice(0, 200)}`,
+			`🔄 [Chat] Qwen request failed for ${failedAccountEmail}, retrying in ${useDelay}ms... (${attemptsLeft} left). reason=${policy.reason} error=${errMsg.slice(0, 200)}`,
 		);
 		await new Promise((r) => setTimeout(r, useDelay));
 		retryDelay = Math.min(retryDelay * 2, config.retry.maxDelayMs);

@@ -21,6 +21,7 @@ accounts.json.bak
 # Logs
 *.log
 log*.txt
+qwenproxy-api-*.log.txt
 
 # Coverage & cache
 coverage/
