@@ -951,6 +951,26 @@ export async function getBasicHeaders(accountId: string): Promise<{
   }
 }
 
+/**
+ * Remove Chromium POSIX singleton locks (SingletonLock, SingletonCookie, SingletonSocket).
+ * In Docker/container environments, when a container restarts or changes hostname,
+ * Chromium treats leftover locks as 'profile in use by another machine' and crashes with exitCode 21.
+ */
+export function cleanChromiumSingletonLocks(profilePath: string): void {
+  try {
+    if (!fs.existsSync(profilePath)) return;
+    const lockFiles = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
+    for (const file of lockFiles) {
+      const p = path.join(profilePath, file);
+      if (fs.existsSync(p)) {
+        try {
+          fs.unlinkSync(p);
+        } catch {}
+      }
+    }
+  } catch {}
+}
+
 export async function initPlaywrightForAccount(
   account: QwenAccount,
   headless = true,
@@ -1004,8 +1024,13 @@ export async function initPlaywrightForAccount(
       } catch {}
     }
 
+    // In Docker with Xvfb (DISPLAY active), run headed on the virtual display to emulate real user rendering
+    const effectiveHeadless = process.env.DISPLAY ? false : headless;
+
+    cleanChromiumSingletonLocks(profilePath);
+
     const acctContext = await engineToUse.launchPersistentContext(profilePath, {
-      headless: false,
+      headless: effectiveHeadless,
       channel,
       userAgent: fingerprint.userAgent,
       locale: fingerprint.locale,
@@ -1154,7 +1179,7 @@ export async function initPlaywrightForAccount(
  */
 export async function validateAccountLogin(
   account: QwenAccount,
-  headless = false,
+  headless = true,
   browserType: BrowserType = "chromium",
 ): Promise<boolean> {
   if (accountPages.has(account.id)) {
@@ -1174,8 +1199,12 @@ export async function validateAccountLogin(
     const { engine, channel } = resolveBrowserEngine(browserType);
     const engineToUse = chromiumWithStealth || engine;
 
+    const effectiveHeadless = process.env.DISPLAY ? false : headless;
+
+    cleanChromiumSingletonLocks(profilePath);
+
     const acctContext = await engineToUse.launchPersistentContext(profilePath, {
-      headless: false,
+      headless: effectiveHeadless,
       channel,
       userAgent: fingerprint.userAgent,
       locale: fingerprint.locale,
@@ -2591,15 +2620,19 @@ export async function alignWindowPosition(page: any, left: number, top: number):
   await cdp.detach();
 }
 export async function minimizeWindow(page: any): Promise<void> {
-  const cdp = await page.context().newCDPSession(page);
-  const { windowId } = await cdp.send("Browser.getWindowForTarget");
-  await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "minimized" } });
-  await cdp.detach();
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    const { windowId } = await cdp.send("Browser.getWindowForTarget");
+    await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "minimized" } });
+    await cdp.detach();
+  } catch {}
 }
 
 export async function restoreWindow(page: any): Promise<void> {
-  const cdp = await page.context().newCDPSession(page);
-  const { windowId } = await cdp.send("Browser.getWindowForTarget");
-  await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } });
-  await cdp.detach();
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    const { windowId } = await cdp.send("Browser.getWindowForTarget");
+    await cdp.send("Browser.setWindowBounds", { windowId, bounds: { windowState: "normal" } });
+    await cdp.detach();
+  } catch {}
 }

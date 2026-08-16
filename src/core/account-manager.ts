@@ -65,6 +65,16 @@ export function clearAccountCooldown(accountId: string): void {
   }
 }
 
+export function clearAllCooldowns(): void {
+  const allAccounts = loadAccounts();
+  for (const acc of allAccounts) {
+    clearAccountCooldown(acc.id);
+  }
+  for (const accountId of Array.from(cooldowns.keys())) {
+    clearAccountCooldown(accountId);
+  }
+}
+
 export function getAccountCooldownInfo(
   accountId: string,
 ): { onCooldown: boolean; remainingMs: number; reason: string } | null {

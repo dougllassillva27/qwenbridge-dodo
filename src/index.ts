@@ -1,4 +1,5 @@
 import 'dotenv/config'
+import { logHub } from './core/log-hub.js'
 
 // [Dodo] Prefixo universal de timestamp em cada linha de log do proxy
 function getTimestamp(): string {
@@ -12,20 +13,23 @@ const originalWarn = console.warn;
 const originalError = console.error;
 const originalInfo = console.info;
 
-function wrapLog(originalFn: (...data: any[]) => void) {
+function wrapLog(originalFn: (...data: any[]) => void, level: "info" | "warn" | "error" | "debug" = "info") {
   return (...args: any[]) => {
     if (args.length === 0 || (args.length === 1 && typeof args[0] === "string" && args[0].trim() === "")) {
       originalFn(...args);
       return;
     }
-    originalFn(getTimestamp(), ...args);
+    const ts = getTimestamp();
+    const formatted = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
+    logHub.pushLog(`${ts} ${formatted}`, level);
+    originalFn(ts, ...args);
   };
 }
 
-console.log = wrapLog(originalLog);
-console.warn = wrapLog(originalWarn);
-console.error = wrapLog(originalError);
-console.info = wrapLog(originalInfo);
+console.log = wrapLog(originalLog, "info");
+console.warn = wrapLog(originalWarn, "warn");
+console.error = wrapLog(originalError, "error");
+console.info = wrapLog(originalInfo, "info");
 
 import { startServer } from './api/server.js'
 
@@ -40,4 +44,3 @@ startServer().catch((error: unknown) => {
   }
   process.exit(1)
 })
-

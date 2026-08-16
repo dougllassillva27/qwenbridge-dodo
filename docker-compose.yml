@@ -2,12 +2,20 @@ services:
   qwenbridge:
     build: .
     container_name: qwenbridge
+    shm_size: '1gb'
     ports:
-      - "${PORT:-3000}:${PORT:-3000}"
+      - "${PORT:-50002}:${PORT:-50002}"
     env_file:
       - .env
     volumes:
       - ./data:/app/data
+    deploy:
+      resources:
+        limits:
+          memory: 4096M
+          cpus: '2.0'
+        reservations:
+          memory: 512M
     restart: unless-stopped
     logging:
       driver: "json-file"
