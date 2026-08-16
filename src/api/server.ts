@@ -149,22 +149,20 @@ app.use("*", async (c, next) => {
 
   // Não logar OPTIONS ou rotas de saúde para não poluir
   if (method !== "OPTIONS" && path !== "/health") {
-    const ts = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
-    console.log(`🔍 [Diag ${ts}] ${method} ${path}`);
+    console.log(`🔍 [Diag] ${method} ${path}`);
   }
 
   await next();
 
   const status = c.res.status;
   if (status >= 400 && method !== "OPTIONS") {
-    const ts = new Date().toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
     // Clona a resposta para ler o corpo sem consumir o stream original
     let bodyText = "(unreadable)";
     try {
       const cloned = c.res.clone();
       bodyText = await cloned.text();
     } catch {}
-    console.error(`❌ [Diag ${ts}] ${method} ${path} → HTTP ${status}\n   Body: ${bodyText.slice(0, 500)}`);
+    console.error(`❌ [Diag] ${method} ${path} → HTTP ${status}\n   Body: ${bodyText.slice(0, 500)}`);
   }
 });
 
