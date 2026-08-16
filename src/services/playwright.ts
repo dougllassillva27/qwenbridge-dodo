@@ -103,6 +103,10 @@ export function buildChromiumLaunchArgs(viewport: {
       "--media-cache-size=1",
       "--disable-hang-monitor",
       "--disable-ipc-flooding-protection",
+      "--disable-breakpad",
+      "--disable-back-forward-cache",
+      "--disable-gpu-shader-disk-cache",
+      "--enable-features=AutoDiscardableTabs,AutomaticTabDiscarding",
     );
   }
 

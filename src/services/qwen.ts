@@ -40,8 +40,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const BROWSER_STREAM_BINDING = "__qwenBridgeStreamEvent";
 const BROWSER_ABORTERS_KEY = "__qwenBridgeAborters";
-const BROWSER_STREAM_FLUSH_BYTES = 4096;
-const BROWSER_STREAM_FLUSH_MS = 25;
+const BROWSER_STREAM_FLUSH_BYTES = 128;
+const BROWSER_STREAM_FLUSH_MS = 10;
 const METADATA_TIMEOUT_PER_PAYLOAD_MB_MS = 10_000;
 const POST_CAPTCHA_METADATA_GRACE_MS = 20_000;
 
@@ -1515,6 +1515,7 @@ async function createQwenBrowserResponse(
                   buffered += decoder.decode(value, { stream: true });
                   if (
                     !firstChunkSent ||
+                    buffered.includes("\n\n") ||
                     buffered.length >= flushBytes ||
                     Date.now() - lastFlushAt >= flushMs
                   ) {

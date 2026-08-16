@@ -31,15 +31,11 @@ const envSchema = z
     PLAYWRIGHT_IDLE_CONTEXT_TTL_MS: z.string().default("60000"),
     PLAYWRIGHT_JS_HEAP_MB: z.string().default("256"),
     PLAYWRIGHT_LOW_MEMORY_FLAGS: z.string().default("true"),
-    // Keep only 1 warm context by default (user preference over failover speed):
-    // after warmup exactly one browser stays open for immediate use; any extra
-    // context (simultaneous use / failover hop) is closed once idle. The cap
-    // only evicts IDLE contexts — busy mutexes and active streams are never
-    // touched, so concurrent accounts each keep their own context while serving.
-    // Tradeoff: an account whose context was evicted pays a context recreation
-    // on its next use (set higher, e.g. 3, to keep failover hops warm).
-    PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("1"),
-    PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("true"),
+    // Keep up to 2 warm contexts by default (balanced memory & failover speed):
+    // active browsers stay open for immediate use; any extra context above this
+    // cap is closed once idle.
+    PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("2"),
+    PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
     CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
     CAPTCHA_SOLVER_TIMEOUT_MS: z.string().default("15000"),
@@ -167,7 +163,7 @@ export const config = {
     jsHeapMb: Math.max(64, parseInt(env.PLAYWRIGHT_JS_HEAP_MB)),
     lowMemoryFlags: env.PLAYWRIGHT_LOW_MEMORY_FLAGS !== "false",
     maxActiveContexts: Math.max(0, parseInt(env.PLAYWRIGHT_MAX_ACTIVE_CONTEXTS)),
-    prepareAllOnStartup: env.PLAYWRIGHT_PREPARE_ALL_ON_STARTUP !== "false",
+    prepareAllOnStartup: env.PLAYWRIGHT_PREPARE_ALL_ON_STARTUP === "true",
   },
   captcha: {
     enabled: env.CAPTCHA_SOLVER_ENABLED === "true",
