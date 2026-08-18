@@ -222,20 +222,24 @@ export const toolcallDebugLevel: ToolcallDebugLevel =
       ? "errors"
       : "0";
 
+export function isVerboseLogEnabled(): boolean {
+  const level = process.env.LOG_LEVEL?.trim().toLowerCase();
+  return level === "true" || level === "debug" || level === "1";
+}
+
+const isExplicitTrue = process.env.LOG_LEVEL === "true" || process.env.LOG_LEVEL === "1";
+
 const initialLevel: LogLevel =
-  toolcallDebugLevel === "1"
+  toolcallDebugLevel === "1" || isExplicitTrue
     ? "debug"
     : envLevel && ["debug", "info", "warn", "error"].includes(envLevel)
-      ? envLevel
-      // Default for general users: quiet terminal with only warnings/errors
-      // (+ the always-on request/account console lines). Debugging opt-in via
-      // LOG_LEVEL=debug / TOOLCALL_DEBUG=1.
+      ? (envLevel as LogLevel)
       : "warn";
 
 export const logger = new Logger(initialLevel);
 
 export function isDebugEnabled(): boolean {
-  return logger.isLevelEnabled("debug");
+  return isVerboseLogEnabled() || logger.isLevelEnabled("debug");
 }
 
 // Helper to check if toolcall debug is enabled

@@ -16,7 +16,7 @@ import type { QwenAccount } from "../core/accounts.ts";
 // acyclic, while the reverse direction would drag the browser layer into core.
 import { hasActiveAccountLease } from "../core/account-concurrency.ts";
 import { config } from "../core/config.ts";
-import { maskEmail } from "../core/logger.ts";
+import { maskEmail, isVerboseLogEnabled } from "../core/logger.ts";
 import { Mutex } from "../core/mutex.ts";
 import { getAccountsByPriority } from "../core/account-priority.ts";
 import {

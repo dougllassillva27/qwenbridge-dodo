@@ -26,7 +26,10 @@ const CAPTCHA_EVENT_EMOJI: Record<string, string> = {
   recovery_failed: "❌",
 };
 
-const captchaDebugEnabled = process.env.CAPTCHA_DEBUG !== "false";
+import { isVerboseLogEnabled } from "../core/logger.ts";
+
+const captchaDebugEnabled =
+  process.env.CAPTCHA_DEBUG === "true" || isVerboseLogEnabled();
 
 function formatCaptchaLogValue(value: string | number | boolean): string {
   if (typeof value === "string") {
