@@ -29,6 +29,7 @@ function parseEnvAccounts(): QwenAccount[] {
     .split(separator)
     .map((entry, index) => {
       const trimmed = entry.trim();
+      if (!trimmed) return null;
       const colonIdx = trimmed.indexOf(":");
       if (colonIdx === -1) {
         console.warn(
@@ -36,8 +37,8 @@ function parseEnvAccounts(): QwenAccount[] {
         );
         return null;
       }
-      const email = trimmed.substring(0, colonIdx);
-      const password = trimmed.substring(colonIdx + 1);
+      const email = trimmed.substring(0, colonIdx).trim();
+      const password = trimmed.substring(colonIdx + 1).trim();
       if (!email || !password) {
         console.warn(
           `[Accounts] Invalid QWEN_ACCOUNTS entry at index ${index}: "${trimmed}"`,
@@ -46,8 +47,8 @@ function parseEnvAccounts(): QwenAccount[] {
       }
       return {
         id: generateId(email),
-        email: email.trim(),
-        password: password.trim(),
+        email,
+        password,
       };
     })
     .filter((a): a is QwenAccount => a !== null);
