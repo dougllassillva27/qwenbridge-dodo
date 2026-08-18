@@ -1453,7 +1453,8 @@ async function loginViaApi(
             },
           );
           const data = await response.json();
-          return { ok: response.ok, status: response.status, data };
+          const isSuccess = response.ok && data?.success === true && (!!data?.data?.token || !!data?.data?.id);
+          return { ok: isSuccess, status: response.status, data };
         } catch (e: any) {
           return { ok: false, error: e.message };
         }
@@ -1474,6 +1475,13 @@ async function loginViaApi(
       const success = !finalUrl.includes("auth") && !finalUrl.includes("login");
       console.log(`🏁 [Playwright:Login:API] Final check: success=${success} | url=${finalUrl}`);
       return success;
+    }
+
+    const errorObj = (result as any).data;
+    if (errorObj?.data?.code === "INVALID_CRED") {
+      console.warn(
+        `❌ [Playwright:Login:API] Invalid credentials for ${maskEmail(email)}: ${errorObj.data.details || "Senha ou email incorretos"}`,
+      );
     }
 
     return false;
