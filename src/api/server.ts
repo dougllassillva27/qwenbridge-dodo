@@ -731,6 +731,9 @@ export async function startServer(options?: {
         );
 
         for (let i = 0; i < warmOrder.length; i++) {
+          console.log(
+            `🚀 [Server] Initializing primary account (${i + 1}/${warmOrder.length}): ${maskEmail(warmOrder[i].email)}...`,
+          );
           const ok = await prepareAccountRuntime(
             warmOrder[i],
             getAccountCredentials,

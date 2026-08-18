@@ -26,7 +26,7 @@ const CAPTCHA_EVENT_EMOJI: Record<string, string> = {
   recovery_failed: "❌",
 };
 
-const captchaDebugEnabled = process.env.CAPTCHA_DEBUG === "true";
+const captchaDebugEnabled = process.env.CAPTCHA_DEBUG !== "false";
 
 function formatCaptchaLogValue(value: string | number | boolean): string {
   if (typeof value === "string") {

@@ -1080,6 +1080,10 @@ export async function initPlaywrightForAccount(
     // In Docker with Xvfb (DISPLAY active), run headed on the virtual display to emulate real user rendering
     const effectiveHeadless = process.env.DISPLAY ? false : headless;
 
+    console.log(
+      `🌐 [Playwright] Launching browser | account=${maskEmail(account.email)} | headless=${effectiveHeadless} | browser=${browserType}`,
+    );
+
     cleanChromiumSingletonLocks(profilePath);
 
     const acctContext = await engineToUse.launchPersistentContext(profilePath, {
@@ -1145,7 +1149,12 @@ export async function initPlaywrightForAccount(
           c.name.toLowerCase().includes("session"),
       );
 
+      console.log(
+        `🔐 [Playwright] Stored cookies: ${cookies.length} cookie(s) found | hasAuthCookie=${hasAuthCookie}`,
+      );
+
       if (!hasAuthCookie && account.email && account.password) {
+        console.log(`🔑 [Playwright] No auth cookie found, triggering initial login for ${maskEmail(account.email)}`);
         await loginToQwen(account.id, account.email, account.password);
       }
 
@@ -1155,15 +1164,17 @@ export async function initPlaywrightForAccount(
       let validationError: Error | null = null;
       for (let vAttempt = 1; vAttempt <= maxValidationAttempts; vAttempt++) {
         try {
+          console.log(`🌍 [Playwright] Validating session at ${qwenUrl("/")} (attempt ${vAttempt}/${maxValidationAttempts})...`);
           await acctPage.goto(qwenUrl("/"), {
             waitUntil: "domcontentloaded",
             timeout: config.timeouts.navigation,
           });
           const url = acctPage.url();
+          console.log(`📍 [Playwright] Navigation finished at URL: ${url}`);
           if (url.includes("auth") || url.includes("login")) {
             if (account.email && account.password) {
               console.warn(
-                `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
+                `⚠️  [Playwright] Session expired/redirected to auth for ${maskEmail(account.email)}, re-authenticating...`,
               );
               await loginToQwen(account.id, account.email, account.password);
             } else {
@@ -1192,8 +1203,10 @@ export async function initPlaywrightForAccount(
       }
 
       // Capture headers by navigating and intercepting
+      console.log(`📡 [Playwright] Intercepting anti-bot headers for ${maskEmail(account.email)}...`);
       await captureQwenHeaders(account.id);
       
+      console.log(`🪟 [Playwright] Minimizing window for ${maskEmail(account.email)}...`);
       await minimizeWindow(acctPage);
 
       // Header capture may leave the UI on a generated chat page. Return the
@@ -1354,33 +1367,44 @@ async function loginToQwen(
   password: string,
 ): Promise<boolean> {
   const page = accountPages.get(accountId);
-  if (!page) return false;
+  if (!page) {
+    console.error(`❌ [Playwright:Login] No page available for account ${accountId}`);
+    return false;
+  }
 
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(
+      `🔑 [Playwright:Login] Starting login for ${maskEmail(email)} (attempt ${attempt}/${maxAttempts})`,
+    );
+
     // Try API login first
+    console.log(`📡 [Playwright:Login] Attempting API sign-in (/api/v2/auths/signin)...`);
     const apiResult = await loginViaApi(page, email, password);
     if (apiResult) {
+      console.log(`✅ [Playwright:Login] API sign-in succeeded for ${maskEmail(email)}`);
       return true;
     }
+    console.log(`⚠️  [Playwright:Login] API sign-in did not succeed, falling back to UI login...`);
 
     // Fallback to UI login
     const uiResult = await loginViaUi(page, email, password);
     if (uiResult) {
+      console.log(`✅ [Playwright:Login] UI sign-in succeeded for ${maskEmail(email)}`);
       return true;
     }
 
     if (attempt < maxAttempts) {
       const backoffMs = attempt * 5_000;
       console.warn(
-        `⚠️  [Playwright] Login attempt ${attempt}/${maxAttempts} failed for ${maskEmail(email)}, retrying in ${backoffMs / 1000}s`,
+        `⚠️  [Playwright:Login] Login attempt ${attempt}/${maxAttempts} failed for ${maskEmail(email)}, retrying in ${backoffMs / 1000}s`,
       );
       await sleep(backoffMs);
     }
   }
 
   console.error(
-    `❌ [Playwright] All login methods failed for ${maskEmail(email)}`,
+    `❌ [Playwright:Login] All login methods failed for ${maskEmail(email)}`,
   );
   return false;
 }
@@ -1391,6 +1415,7 @@ async function loginViaApi(
   password: string,
 ): Promise<boolean> {
   try {
+    console.log(`🌐 [Playwright:Login:API] Navigating to ${qwenUrl("/auth")}...`);
     await page.goto(qwenUrl("/auth"), {
       waitUntil: "domcontentloaded",
       timeout: config.timeouts.navigation,
@@ -1399,6 +1424,7 @@ async function loginViaApi(
 
     // Check if already logged in
     if (!page.url().includes("/auth")) {
+      console.log(`✅ [Playwright:Login:API] Already logged in (redirected to ${page.url()})`);
       return true;
     }
 
@@ -1408,6 +1434,7 @@ async function loginViaApi(
       .digest("hex");
     const signinUrl = qwenUrl("/api/v2/auths/signin");
 
+    console.log(`📡 [Playwright:Login:API] Dispatching POST ${signinUrl}...`);
     const result = await page.evaluate(
       async ({ email, password, signinUrl }) => {
         try {
@@ -1426,7 +1453,7 @@ async function loginViaApi(
             },
           );
           const data = await response.json();
-          return { ok: response.ok, data };
+          return { ok: response.ok, status: response.status, data };
         } catch (e: any) {
           return { ok: false, error: e.message };
         }
@@ -1434,17 +1461,24 @@ async function loginViaApi(
       { email, password: hashedPassword, signinUrl },
     );
 
+    console.log(
+      `📡 [Playwright:Login:API] Result: ok=${result.ok} | status=${(result as any).status ?? "N/A"} | data=${JSON.stringify((result as any).data ?? (result as any).error)}`,
+    );
+
     if (result.ok) {
       await page.goto(qwenUrl("/"), {
         waitUntil: "domcontentloaded",
         timeout: config.timeouts.navigation,
       });
-      return !page.url().includes("auth") && !page.url().includes("login");
+      const finalUrl = page.url();
+      const success = !finalUrl.includes("auth") && !finalUrl.includes("login");
+      console.log(`🏁 [Playwright:Login:API] Final check: success=${success} | url=${finalUrl}`);
+      return success;
     }
 
     return false;
   } catch (err) {
-    console.warn(`⚠️  [Playwright] API login error: ${err}`);
+    console.warn(`⚠️  [Playwright:Login:API] Error: ${err}`);
     return false;
   }
 }
@@ -1455,6 +1489,7 @@ async function loginViaUi(
   password: string,
 ): Promise<boolean> {
   try {
+    console.log(`🖥️ [Playwright:Login:UI] Navigating to ${qwenUrl("/auth")}...`);
     await page.goto(qwenUrl("/auth"), {
       waitUntil: "domcontentloaded",
       timeout: config.timeouts.navigation,
@@ -1463,8 +1498,13 @@ async function loginViaUi(
 
     // Check if already logged in
     if (!page.url().includes("/auth")) {
+      console.log(`✅ [Playwright:Login:UI] Already logged in (redirected to ${page.url()})`);
       return true;
     }
+
+    // Check and solve any pre-existing challenge dialog before filling inputs
+    console.log(`🧩 [Playwright:Login:UI] Checking for pre-existing captcha dialog...`);
+    await clearVisibleChallenge(page).catch(() => {});
 
     // Wait for email input
     const emailSelector = [
@@ -1481,12 +1521,13 @@ async function loginViaUi(
     } catch {
       if (!page.url().includes("/auth")) return true;
       console.warn(
-        `⚠️  [Playwright] Email input not found on ${page.url()} (possible captcha or anti-bot challenge)`,
+        `⚠️  [Playwright:Login:UI] Email input not found on ${page.url()} (possible captcha or anti-bot challenge blocking view)`,
       );
       throw new Error("Email input not found");
     }
 
     // Fill email
+    console.log(`✍️ [Playwright:Login:UI] Filling email: ${maskEmail(email)}`);
     await page.fill(emailSelector, email);
 
     // The password field may already be visible (single-step form) or only
@@ -1500,6 +1541,7 @@ async function loginViaUi(
       .catch(() => false);
 
     if (!passwordAlreadyVisible) {
+      console.log(`⌨️ [Playwright:Login:UI] Submitting email to reveal password input...`);
       await page.keyboard.press("Enter");
       await page.waitForSelector(passwordSelector, {
         timeout: config.timeouts.page,
@@ -1508,6 +1550,7 @@ async function loginViaUi(
     await sleep(500);
 
     // Fill password
+    console.log(`✍️ [Playwright:Login:UI] Filling password...`);
     await page.fill(passwordSelector, password);
 
     // Prefer clicking the submit button; fall back to pressing Enter.
@@ -1519,20 +1562,31 @@ async function loginViaUi(
       await page.waitForSelector('button[type="submit"]:not([disabled])', {
         timeout: 5_000,
       });
+      console.log(`🔘 [Playwright:Login:UI] Clicking submit button...`);
       await submitButton.click();
     } catch {
+      console.log(`⌨️ [Playwright:Login:UI] Pressing Enter to submit...`);
       await page.keyboard.press("Enter");
     }
 
     // Wait and solve any visible captcha challenge (Baxia slider / Turnstile / Cloudflare)
     await sleep(2000);
+    console.log(`🧩 [Playwright:Login:UI] Checking for post-submit captcha challenge...`);
     await clearVisibleChallenge(page).catch(() => {});
 
     // Polling window: wait up to 45s for redirect to finish (gives time for auto-solver or manual solve)
+    console.log(`⏳ [Playwright:Login:UI] Waiting up to 45s for login redirect or captcha resolution...`);
     const loginDeadline = Date.now() + 45_000;
+    let pollCount = 0;
     while (Date.now() < loginDeadline) {
-      if (!page.url().includes("auth") && !page.url().includes("login")) {
+      pollCount++;
+      const currentUrl = page.url();
+      if (!currentUrl.includes("auth") && !currentUrl.includes("login")) {
+        console.log(`✅ [Playwright:Login:UI] Redirect detected! New URL: ${currentUrl}`);
         break;
+      }
+      if (pollCount % 3 === 0) {
+        console.log(`⏳ [Playwright:Login:UI] Still on ${currentUrl} (awaiting captcha/redirect)...`);
       }
       await clearVisibleChallenge(page).catch(() => {});
       await sleep(1500);
@@ -1549,9 +1603,10 @@ async function loginViaUi(
       }).catch(() => {});
     }
 
+    console.log(`🏁 [Playwright:Login:UI] Completed: isLoggedIn=${isLoggedIn} | finalUrl=${page.url()}`);
     return isLoggedIn;
   } catch (err) {
-    console.warn(`⚠️  [Playwright] UI login error: ${err}`);
+    console.warn(`⚠️  [Playwright:Login:UI] Error: ${err}`);
     return false;
   }
 }
