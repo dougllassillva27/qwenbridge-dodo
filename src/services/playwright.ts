@@ -1523,7 +1523,20 @@ async function loginViaUi(
     } catch {
       await page.keyboard.press("Enter");
     }
-    await sleep(3000);
+
+    // Wait and solve any visible captcha challenge (Baxia slider / Turnstile / Cloudflare)
+    await sleep(2000);
+    await clearVisibleChallenge(page).catch(() => {});
+
+    // Polling window: wait up to 45s for redirect to finish (gives time for auto-solver or manual solve)
+    const loginDeadline = Date.now() + 45_000;
+    while (Date.now() < loginDeadline) {
+      if (!page.url().includes("auth") && !page.url().includes("login")) {
+        break;
+      }
+      await clearVisibleChallenge(page).catch(() => {});
+      await sleep(1500);
+    }
 
     // Check if login was successful
     const isLoggedIn =
@@ -1533,7 +1546,7 @@ async function loginViaUi(
       await page.goto(qwenUrl("/"), {
         waitUntil: "domcontentloaded",
         timeout: config.timeouts.navigation,
-      });
+      }).catch(() => {});
     }
 
     return isLoggedIn;
