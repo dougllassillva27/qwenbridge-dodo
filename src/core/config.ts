@@ -39,7 +39,7 @@ const envSchema = z
     // (no WAF). Falls back to the browser relay on WAF/HTML/non-SSE; a
     // per-account circuit breaker opens after repeated failures.
     QWEN_DIRECT_FETCH: z.string().default("false"),
-    PLAYWRIGHT_HEADLESS: z.string().default("true"),
+    PLAYWRIGHT_HEADLESS: z.string().default("false"),
     PLAYWRIGHT_BROWSER: z
       .enum(["chromium", "chrome", "edge"])
       .default("chromium"),

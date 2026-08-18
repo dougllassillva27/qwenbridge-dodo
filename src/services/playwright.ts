@@ -1232,7 +1232,7 @@ export async function initPlaywrightForAccount(
  */
 export async function validateAccountLogin(
   account: QwenAccount,
-  headless = true,
+  headless = config.playwright.headless,
   browserType: BrowserType = "chromium",
 ): Promise<boolean> {
   if (accountPages.has(account.id)) {
@@ -1286,6 +1286,10 @@ export async function validateAccountLogin(
         existingPages[0] ??
         (await acctContext.newPage());
 
+      if (!effectiveHeadless) {
+        await minimizeWindow(acctPage).catch(() => {});
+      }
+
       // Check if already logged in via cookies
       const cookies = await acctContext.cookies();
       const hasAuthCookie = cookies.some(
@@ -1305,26 +1309,29 @@ export async function validateAccountLogin(
           accountPages.delete(account.id);
         }
       } else if (hasAuthCookie) {
-        // Validate session by navigating to chat page
-        try {
-          await acctPage.goto(qwenUrl("/"), {
-            waitUntil: "domcontentloaded",
-            timeout: config.timeouts.navigation,
-          });
-          const url = acctPage.url();
-          if (url.includes("auth") || url.includes("login")) {
-            loggedIn = false;
-            if (account.email && account.password) {
-              accountPages.set(account.id, acctPage);
-              try {
-                loggedIn = await loginToQwen(account.id, account.email, account.password);
-              } finally {
-                accountPages.delete(account.id);
+        const tokenValid = isAuthTokenValidFrom(cookies) && isShortestCookieValidFrom(cookies);
+        if (!tokenValid) {
+          // Validate session by navigating to chat page only when cookies are stale/expired
+          try {
+            await acctPage.goto(qwenUrl("/"), {
+              waitUntil: "domcontentloaded",
+              timeout: Math.min(config.timeouts.navigation, 15_000),
+            });
+            const url = acctPage.url();
+            if (url.includes("auth") || url.includes("login")) {
+              loggedIn = false;
+              if (account.email && account.password) {
+                accountPages.set(account.id, acctPage);
+                try {
+                  loggedIn = await loginToQwen(account.id, account.email, account.password);
+                } finally {
+                  accountPages.delete(account.id);
+                }
               }
             }
+          } catch {
+            loggedIn = false;
           }
-        } catch {
-          loggedIn = false;
         }
       }
 
@@ -2147,6 +2154,7 @@ function isPlaywrightProfileCorruptedError(error: unknown): boolean {
 
 async function resetPlaywrightProfileLocked(accountId: string): Promise<void> {
   await closePlaywrightForAccountLocked(accountId);
+  await sleep(300);
   const profilePath = path.resolve("data", "qwen_profiles", accountId);
   try {
     fs.rmSync(profilePath, { recursive: true, force: true });
