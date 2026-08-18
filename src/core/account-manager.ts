@@ -98,7 +98,7 @@ export function getAccountCooldownInfo(
   return { onCooldown: true, remainingMs: remaining, reason: entry.reason };
 }
 
-function isAccountOnCooldown(accountId: string): boolean {
+export function isAccountOnCooldown(accountId: string): boolean {
   return getAccountCooldownInfo(accountId) !== null;
 }
 

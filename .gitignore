@@ -23,9 +23,14 @@ accounts.json.bak
 log*.txt
 qwenproxy-api-*.log.txt
 
+# Network captures
+network/
+networkv2/
+
 # Coverage & cache
 coverage/
 .cache/
+graphify-out/
 
 # OS
 .DS_Store

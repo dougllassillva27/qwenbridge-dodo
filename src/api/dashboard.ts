@@ -91,7 +91,7 @@ try {
 
 dashboardApp.get("/favicon.ico", (c) => {
   if (cachedFavicon) {
-    return c.body(cachedFavicon, 200, {
+    return c.body(new Uint8Array(cachedFavicon), 200, {
       "Content-Type": "image/x-icon",
       "Cache-Control": "public, max-age=86400",
     });
@@ -101,7 +101,7 @@ dashboardApp.get("/favicon.ico", (c) => {
 
 dashboardApp.get("/assets/img/favicon.ico", (c) => {
   if (cachedFavicon) {
-    return c.body(cachedFavicon, 200, {
+    return c.body(new Uint8Array(cachedFavicon), 200, {
       "Content-Type": "image/x-icon",
       "Cache-Control": "public, max-age=86400",
     });

@@ -3,6 +3,7 @@ import {
 	getAccountCooldownInfo,
 	getNextAccount,
 	getNextAvailableAccount,
+	isAccountOnCooldown,
 	markAccountRateLimited,
 } from "../../core/account-manager.ts";
 import { markAccountSuccessful, markAccountFailed } from "../../core/account-priority.ts";
@@ -42,6 +43,7 @@ import {
 	getLogicalThreadState,
 	invalidateLogicalThreadParent,
 	type LogicalThreadEntry,
+	PersonalizationSyncError,
 	QwenSessionExpiredError,
 	RetryableQwenStreamError,
 	syncQwenRequestPersonalization,
@@ -1043,6 +1045,7 @@ async function tryCreateStreamWithRetry(
 					const instruction =
 						params.requestPersonalizationInstruction ?? "";
 					let personalizationApplied = false;
+					let syncFailure: string | null = null;
 					try {
 						// Hard deadline for the whole sync (browser ops each have
 						// their own 60s timeout; several sequential stuck ops can
@@ -1068,8 +1071,10 @@ async function tryCreateStreamWithRetry(
 								syncSettled = true;
 								return value;
 							},
-							() => {
+							(error) => {
 								syncSettled = true;
+								syncFailure =
+									error instanceof Error ? error.message : String(error);
 								return false;
 							},
 						);
@@ -1078,12 +1083,7 @@ async function tryCreateStreamWithRetry(
 							new Promise<boolean>((resolve) => {
 								personalizationDeadlineTimer = setTimeout(() => {
 									if (!syncSettled) {
-										logger.warn(
-											"[Chat] Personalization sync timed out; sending instructions inline",
-											{
-												accountId: currentAccountId,
-											},
-										);
+										syncFailure = `sync timed out after ${PERSONALIZATION_SYNC_DEADLINE_MS}ms`;
 									}
 									resolve(false);
 								}, PERSONALIZATION_SYNC_DEADLINE_MS);
@@ -1096,29 +1096,19 @@ async function tryCreateStreamWithRetry(
 							clearTimeout(personalizationDeadlineTimer);
 						}
 					} catch (error) {
-						logger.warn(
-							"[Chat] Personalization sync failed; sending instructions inline",
-							{
-								accountId: currentAccountId,
-								error:
-									error instanceof Error ? error.message : String(error),
-							},
-						);
+						syncFailure =
+							error instanceof Error ? error.message : String(error);
 					}
 
-					if (
-						!personalizationApplied &&
-						instruction &&
-						!promptForUpstream.startsWith(instruction)
-					) {
-						logger.warn(
-							"[Chat] Personalization was not confirmed; sending instructions inline",
-							{
-								accountId: currentAccountId,
-								instructionChars: instruction.length,
-							},
+					// Agent instructions ride ONLY the account-level personalization —
+					// the prompt never carries them. An unconfirmed sync must fail the
+					// attempt (retryable → rotates accounts, each re-syncs on its own
+					// account) instead of degrading to inline. An empty instruction has
+					// nothing to guarantee (plain chat), so it stays best-effort.
+					if (instruction && !personalizationApplied) {
+						throw new PersonalizationSyncError(
+							`personalization sync not confirmed for ${currentAccountEmail}: ${syncFailure ?? "settings response did not confirm the instruction"}`,
 						);
-						promptForUpstream = `${instruction}\n${promptForUpstream}`;
 					}
 					}
 					if (logger.isLevelEnabled("info")) {
