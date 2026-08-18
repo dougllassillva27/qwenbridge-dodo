@@ -5,7 +5,7 @@ import { Hono, type Context } from "hono";
 import { serve } from "@hono/node-server";
 import { config } from "../core/config.js";
 import { metrics } from "../core/metrics.js";
-import { logger, maskEmail } from "../core/logger.js";
+import { logger, maskEmail, isVerboseLogEnabled } from "../core/logger.js";
 import { MemoryCache } from "../cache/memory-cache.js";
 import { Watchdog } from "../core/watchdog.js";
 import { getAccountCooldownInfo } from "../core/account-manager.js";
@@ -142,14 +142,14 @@ app.use("*", async (c, next) => {
   c.header("openai-processing-ms", String(duration));
 });
 
-// [Dodo] Middleware de diagnóstico avançado — loga TODA requisição recebida
-// e TODA resposta de erro >= 400, independente do LOG_LEVEL.
+// [Dodo] Middleware de diagnóstico avançado — loga requisições quando LOG_LEVEL=true
+// e TODA resposta de erro >= 400.
 app.use("*", async (c, next) => {
   const method = c.req.method;
   const path = c.req.path;
 
-  // Não logar OPTIONS ou rotas de saúde para não poluir
-  if (method !== "OPTIONS" && path !== "/health") {
+  // Loga requisição apenas quando logs avançados (LOG_LEVEL=true/debug) estiverem ativos
+  if (isVerboseLogEnabled() && method !== "OPTIONS" && path !== "/health") {
     console.log(`🔍 [Diag] ${method} ${path}`);
   }
 

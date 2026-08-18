@@ -929,9 +929,11 @@ export async function getBasicHeaders(accountId: string): Promise<{
         const bxV = cache.headers["bx-v"] || "2.5.37";
         // Update lastRefresh to extend the cache
         cache.lastRefresh = Date.now();
-        console.log(
-          `🔄 [Playwright] Skipped header recapture for ${accountId} (token still valid, age: ${Math.round(headersAge / 60000)} min)`,
-        );
+        if (isVerboseLogEnabled()) {
+          console.log(
+            `🔄 [Playwright] Skipped header recapture for ${accountId} (token still valid, age: ${Math.round(headersAge / 60000)} min)`,
+          );
+        }
         return { cookie, userAgent, bxV, bxUa, bxUmidtoken, ...clientHints };
       }
     }
