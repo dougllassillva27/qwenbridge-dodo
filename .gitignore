@@ -25,6 +25,7 @@ qwenproxy-api-*.log.txt
 
 # Network captures
 network/
+networkv2/
 
 # Coverage & cache
 coverage/
@@ -36,7 +37,3 @@ Thumbs.db
 
 # IDE / Editor
 AGENTS.md
-
-qwen_profiles/
-_contexto-ia/
-resumo-de-trabalho.md

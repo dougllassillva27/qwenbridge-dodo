@@ -26,7 +26,7 @@ test("config exposes only Playwright/thread-native current auth and context sett
   // Warm-context lifecycle: 1 warm context by default (browsers close quickly
   // after capture; concurrent streams keep their own context — the cap only
   // evicts idle ones) + 60s idle TTL for the overflow contexts.
-  assert.equal(config.playwright.maxActiveContexts, 1);
+  assert.equal(config.playwright.maxActiveContexts, 2);
   assert.equal(config.playwright.idleContextTtlMs, 60_000);
   assert.equal(typeof config.playwright.jsHeapMb, "number");
   assert.equal(typeof config.playwright.lowMemoryFlags, "boolean");
@@ -52,11 +52,14 @@ test("config exposes only Playwright/thread-native current auth and context sett
   assert.ok(config.retry.chatInProgressBusyMs >= 100);
 });
 
-test("config keeps Qwen anti-bot static config limited to bx-v fallback", () => {
+test("config keeps Qwen anti-bot static config limited to bx-v fallback and web version", () => {
   assert.equal(typeof config.auth.userAgent, "string");
   assert.equal(typeof config.auth.bxV, "string");
   assert.equal("bxUa" in config.auth, false);
   assert.equal("bxUmidtoken" in config.auth, false);
+  // Version header default matches the audited real-client bundle snapshot
+  // (networkv2 HAR: qwen-chat-fe/0.2.86).
+  assert.equal(config.qwen.webVersion, "0.2.86");
 });
 
 test("prompt limits reject byte and model-context overages locally", () => {
