@@ -798,8 +798,9 @@ export async function startServer(options?: {
                 ensureAccountInPriority(account.id);
 
                 // Validate login in background
+                const credentials = getAccountCredentials(account.id) ?? account;
                 const ok = await validateAccountLogin(
-                  account,
+                  credentials,
                   config.playwright.headless,
                   config.playwright.browser,
                 );

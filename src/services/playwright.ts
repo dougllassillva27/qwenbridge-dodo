@@ -1372,6 +1372,15 @@ async function loginToQwen(
     return false;
   }
 
+  let effectivePassword = password;
+  if (!effectivePassword || effectivePassword === "***") {
+    const { getAccountCredentials } = await import("../core/accounts.ts");
+    const creds = getAccountCredentials(accountId);
+    if (creds?.password && creds.password !== "***") {
+      effectivePassword = creds.password;
+    }
+  }
+
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     console.log(
@@ -1380,7 +1389,7 @@ async function loginToQwen(
 
     // Try API login first
     console.log(`📡 [Playwright:Login] Attempting API sign-in (/api/v2/auths/signin)...`);
-    const apiResult = await loginViaApi(page, email, password);
+    const apiResult = await loginViaApi(page, email, effectivePassword);
     if (apiResult) {
       console.log(`✅ [Playwright:Login] API sign-in succeeded for ${maskEmail(email)}`);
       return true;
@@ -1388,7 +1397,7 @@ async function loginToQwen(
     console.log(`⚠️  [Playwright:Login] API sign-in did not succeed, falling back to UI login...`);
 
     // Fallback to UI login
-    const uiResult = await loginViaUi(page, email, password);
+    const uiResult = await loginViaUi(page, email, effectivePassword);
     if (uiResult) {
       console.log(`✅ [Playwright:Login] UI sign-in succeeded for ${maskEmail(email)}`);
       return true;
