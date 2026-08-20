@@ -1,7 +1,6 @@
-import { accountTokenUsage } from "../../core/metrics.js";
 /*
  * File: streaming.ts
- * Project: QwenBridge
+ * Project: QwenProxy
  *
  * Upstream stream consumption: both non-streaming (JSON) and streaming (SSE)
  * response modes. Encapsulates heartbeat, abort handling, reasoning tag
@@ -42,7 +41,7 @@ import {
   updateStreamSessionId,
   updateStreamTargetResponseId,
 } from "../../core/stream-registry.ts";
-import { metrics } from "../../core/metrics.js";
+import { metrics, recordAccountTokens } from "../../core/metrics.js";
 import {
   logger,
   isToolcallDebugEnabled,
@@ -271,11 +270,11 @@ export async function processNonStreamingResponse(
     let lastThinkingSummary = "";
     let lastThinkingSummaryLength = 0;
     let lastThinkingSummarySuffix = "";
-    const reasoningChunks: string[] = [];
+    let reasoningBuffer = "";
     let lastRawContent = "";
     let lastRawContentLength = 0;
     let lastRawContentSuffix = "";
-    const finalContentChunks: string[] = [];
+    let finalContent = "";
     let targetResponseId: string | null = null;
     let pendingParentId: string | null = null;
     let currentUiSessionId = uiSessionId;
@@ -310,13 +309,13 @@ export async function processNonStreamingResponse(
 
     const consumeAnswerText = (textChunk: string) => {
       if (!toolParser) {
-        finalContentChunks.push(textChunk);
+        finalContent += textChunk;
         return;
       }
 
       const { text, toolCalls } = toolParser.feed(textChunk);
       if (text) {
-        finalContentChunks.push(text);
+        finalContent += text;
       }
       if (isToolcallDebugEnabled() && (text || toolCalls.length > 0)) {
         logger.debug("[chat] non-stream: parser feed result", {
@@ -478,7 +477,7 @@ export async function processNonStreamingResponse(
           if (foundStr && vStr !== "") {
             if (vStr === "FINISHED") continue;
             if (isThinkingChunk) {
-              reasoningChunks.push(vStr);
+              reasoningBuffer += vStr;
             } else {
               consumeAnswerText(vStr);
             }
@@ -534,7 +533,7 @@ export async function processNonStreamingResponse(
     }
 
     if (remainingText) {
-      finalContentChunks.push(remainingText);
+      finalContent += remainingText;
     }
     for (const tc of remainingToolCalls) {
       toolCallsOut.push({
@@ -551,8 +550,8 @@ export async function processNonStreamingResponse(
       logger.debug("[chat] non-stream: final toolcall summary", {
         totalToolCalls: toolCallsOut.length,
         toolCallNames: toolCallsOut.map((tc: any) => tc.function?.name),
-        contentLength: finalContentChunks.reduce((acc, c) => acc + c.length, 0),
-        hasReasoning: reasoningChunks.length > 0,
+        contentLength: finalContent.length,
+        hasReasoning: !!reasoningBuffer,
       });
     }
 
@@ -560,6 +559,13 @@ export async function processNonStreamingResponse(
       buildUsage(usageAccumulator),
       currentTokenEstimationContext?.contextMeter,
     );
+    if (activeAccountId && usage) {
+      recordAccountTokens(
+        activeAccountId,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+      );
+    }
     for (const [name, value] of Object.entries(
       getContextMeterHeaders((usage as any).context_meter),
     )) {
@@ -567,9 +573,9 @@ export async function processNonStreamingResponse(
     }
     const message: any = {
       role: "assistant",
-      content: toolCallsOut.length ? null : finalContentChunks.join(""),
+      content: toolCallsOut.length ? null : finalContent,
     };
-    if (reasoningChunks.length > 0) message.reasoning_content = reasoningChunks.join("");
+    if (reasoningBuffer) message.reasoning_content = reasoningBuffer;
     if (toolCallsOut.length) {
       message.tool_calls = toolCallsOut;
     }
@@ -757,8 +763,8 @@ export async function processNonStreamingResponse(
       model: body.model,
       finalPrompt,
       userPrompt,
-      assistantContent: finalContentChunks.join(""),
-      reasoningContent: reasoningChunks.length > 0 ? reasoningChunks.join("") : undefined,
+      assistantContent: finalContent,
+      reasoningContent: reasoningBuffer || undefined,
       usage,
       mode: "non-stream",
       context: currentTokenEstimationContext,
@@ -777,8 +783,8 @@ export async function processNonStreamingResponse(
       responseId: targetResponseId,
       userPrompt,
       finalPrompt,
-      assistantContent: finalContentChunks.join(""),
-      reasoningContent: reasoningChunks.length > 0 ? reasoningChunks.join("") : undefined,
+      assistantContent: finalContent,
+      reasoningContent: reasoningBuffer || undefined,
       usage,
       finishReason,
     });
@@ -1145,8 +1151,8 @@ export async function processStreamingResponse(
       let lastRawContent = "";
       let lastRawContentLength = 0;
       let lastRawContentSuffix = "";
-      const finalContentChunks: string[] = [];
-      const reasoningChunks: string[] = [];
+      let finalContent = "";
+      let reasoningBuffer = "";
       let emittedModelOutput = false;
       let targetResponseId: string | null = null;
       let toolParser = shouldParseToolCalls
@@ -1180,7 +1186,7 @@ export async function processStreamingResponse(
       const emitAnswerText = async (textChunk: string) => {
         if (textChunk) emittedModelOutput = true;
         if (!toolParser) {
-          finalContentChunks.push(textChunk);
+          finalContent += textChunk;
           writeDeltaEvent({ content: textChunk });
           return;
         }
@@ -1204,7 +1210,7 @@ export async function processStreamingResponse(
         }
 
         if (text) {
-          finalContentChunks.push(text);
+          finalContent += text;
           writeDeltaEvent({ content: text });
         }
 
@@ -1746,7 +1752,7 @@ export async function processStreamingResponse(
 
               if (isThinkingChunk) {
                 emittedModelOutput = true;
-                reasoningChunks.push(vStr);
+                reasoningBuffer += vStr;
                 writeDeltaEvent({ reasoning_content: vStr });
               } else {
                 await emitAnswerText(vStr);
@@ -1828,7 +1834,7 @@ export async function processStreamingResponse(
       }
 
       if (remainingText) {
-        finalContentChunks.push(remainingText);
+        finalContent += remainingText;
         await writeEvent({
           id: completionId,
           object: "chat.completion.chunk",
@@ -2204,7 +2210,7 @@ export async function processStreamingResponse(
                 if (vStr === "FINISHED") continue;
                 if (isThinkingChunk) {
                   emittedModelOutput = true;
-                  reasoningChunks.push(vStr);
+                  reasoningBuffer += vStr;
                   writeDeltaEvent({ reasoning_content: vStr });
                 } else {
                   await emitAnswerText(vStr);
@@ -2232,7 +2238,7 @@ export async function processStreamingResponse(
           if (toolParser) {
             const retryFlush = toolParser.flush();
             if (retryFlush.text) {
-              finalContentChunks.push(retryFlush.text);
+              finalContent += retryFlush.text;
               writeDeltaEvent({ content: retryFlush.text });
             }
             for (const tcDelta of retryFlush.toolCallDeltas) {
@@ -2299,10 +2305,12 @@ export async function processStreamingResponse(
         buildUsage(usageAccumulator),
         currentTokenEstimationContext?.contextMeter,
       );
-
-      // [Dodo] Injeta os tokens na telemetria (para exibir no Proxy Launcher)
       if (activeAccountId && usage) {
-        recordAccountTokens(activeAccountId, usage.prompt_tokens || 0, usage.completion_tokens || 0);
+        recordAccountTokens(
+          activeAccountId,
+          usage.prompt_tokens,
+          usage.completion_tokens,
+        );
       }
       const finalFinishReason =
         toolParser && toolParser.getEmittedToolCallCount() > 0
@@ -2402,8 +2410,8 @@ export async function processStreamingResponse(
           responseId: targetResponseId,
           userPrompt,
           finalPrompt,
-          assistantContent: finalContentChunks.join(""),
-          reasoningContent: reasoningChunks.length > 0 ? reasoningChunks.join("") : undefined,
+          assistantContent: finalContent,
+          reasoningContent: reasoningBuffer || undefined,
           usage,
           finishReason: finalFinishReason,
         });
@@ -2422,8 +2430,8 @@ export async function processStreamingResponse(
           model: body.model,
           finalPrompt,
           userPrompt,
-          assistantContent: finalContentChunks.join(""),
-          reasoningContent: reasoningChunks.length > 0 ? reasoningChunks.join("") : undefined,
+          assistantContent: finalContent,
+          reasoningContent: reasoningBuffer || undefined,
           usage,
           mode: "stream",
           context: currentTokenEstimationContext,
@@ -2650,15 +2658,4 @@ export function handleChatCompletionsError(c: Context, err: unknown): Response {
   }
 
   return sendOpenAIError(c, err);
-}
-
-
-// [Dodo] Funcao de registro de tokens injetada
-export function recordAccountTokens(accountId: string, promptTokens: number, completionTokens: number): void {
-  if (!accountTokenUsage[accountId]) {
-    accountTokenUsage[accountId] = { prompt: 0, completion: 0, total: 0 };
-  }
-  accountTokenUsage[accountId].prompt += promptTokens;
-  accountTokenUsage[accountId].completion += completionTokens;
-  accountTokenUsage[accountId].total += (promptTokens + completionTokens);
 }

@@ -12,6 +12,7 @@ dist/
 # Persistent runtime data (DB, profiles, benchmarks, diagnostics)
 data/
 data-test/
+qwen_profiles/
 *.db
 *.db-wal
 *.db-shm
@@ -37,12 +38,4 @@ graphify-out/
 Thumbs.db
 
 # IDE / Editor
-.kilo
-.roo
-
-# Documentos Dodo
-resumo-de-trabalho.md
-
-_contexto-ia/
-
-qwen_profiles/
+AGENTS.md

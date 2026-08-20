@@ -78,7 +78,7 @@ test("server startup fails without configured accounts outside mock mode", async
 });
 
 test("server lifecycle starts and stops in mock mode without real accounts", async (t) => {
-  const port = 3000;
+  const port = config.server.port;
   if (!(await isPortAvailable(port))) {
     t.skip(`port ${port} is not available`);
     return;
@@ -90,9 +90,6 @@ test("server lifecycle starts and stops in mock mode without real accounts", asy
 
   process.env.TEST_MOCK_QWEN_AUTH = "true";
   delete process.env.QWEN_ACCOUNTS;
-  process.env.PORT = String(port);
-  const originalConfigPort = config.server.port;
-  config.server.port = port;
 
   try {
     getDatabase().prepare("DELETE FROM accounts").run();
@@ -113,9 +110,6 @@ test("server lifecycle starts and stops in mock mode without real accounts", asy
     } else {
       process.env.TEST_MOCK_QWEN_AUTH = originalMockAuth;
     }
-    
-    delete process.env.PORT;
-    config.server.port = originalConfigPort;
 
     if (originalQwenAccounts === undefined) {
       delete process.env.QWEN_ACCOUNTS;

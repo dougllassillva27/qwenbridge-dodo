@@ -2,8 +2,6 @@ import { EventEmitter } from "events";
 import { config } from "./config.js";
 import { getHeapUsageSnapshot, getRssUsageSnapshot } from "./memory-usage.js";
 
-export const accountTokenUsage: Record<string, { prompt: number, completion: number, total: number }> = {};
-
 interface MetricPoint {
   value: number;
   timestamp: number;
@@ -291,3 +289,21 @@ export class Metrics extends EventEmitter {
 }
 
 export const metrics = new Metrics();
+
+export const accountTokenUsage: Record<
+  string,
+  { prompt: number; completion: number; total: number }
+> = {};
+
+export function recordAccountTokens(
+  accountId: string,
+  promptTokens: number,
+  completionTokens: number,
+): void {
+  if (!accountTokenUsage[accountId]) {
+    accountTokenUsage[accountId] = { prompt: 0, completion: 0, total: 0 };
+  }
+  accountTokenUsage[accountId].prompt += promptTokens;
+  accountTokenUsage[accountId].completion += completionTokens;
+  accountTokenUsage[accountId].total += promptTokens + completionTokens;
+}

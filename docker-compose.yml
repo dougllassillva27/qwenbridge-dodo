@@ -1,5 +1,5 @@
 services:
-  qwenbridge:
+  qwenproxy:
     build: .
     container_name: qwenbridge
     shm_size: '1gb'

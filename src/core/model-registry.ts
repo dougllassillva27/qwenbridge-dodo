@@ -7,7 +7,7 @@ export const MAX_PAYLOAD_SIZE = 50 * 1024 * 1024;
  * Model metadata exposed by Qwen's live `/api/models` catalog.
  *
  * The registry deliberately has no model-name table. Qwen can add, remove or
- * change models without requiring a QwenBridge release. The values below are
+ * change models without requiring a QwenProxy release. The values below are
  * conservative fallbacks used only until the selected account's catalog has
  * been synchronized.
  */
@@ -71,16 +71,13 @@ function accountKey(accountId?: string): string {
 }
 
 export function getBaseModelId(modelId: string): string {
-  // [Dodo] Remove tags de contexto personalizadas (ex: [1M], [32k]) antes do parsing
-  let cleanId = modelId.trim().replace(/\[.*?\]$/, "").trim();
-
   // `-fast` is the only public variant. Keep legacy suffixes normalized for
   // account metadata lookups and old clients, without publishing them.
   // Check `-no-thinking` before `-thinking` (the former ends with the latter).
-  if (cleanId.endsWith("-no-thinking")) return cleanId.slice(0, -12);
-  if (cleanId.endsWith("-thinking")) return cleanId.slice(0, -9);
-  if (cleanId.endsWith("-fast")) return cleanId.slice(0, -5);
-  return cleanId;
+  if (modelId.endsWith("-no-thinking")) return modelId.slice(0, -12);
+  if (modelId.endsWith("-thinking")) return modelId.slice(0, -9);
+  if (modelId.endsWith("-fast")) return modelId.slice(0, -5);
+  return modelId;
 }
 
 function getAccountRegistry(accountId?: string): Map<string, RegistryEntry> {

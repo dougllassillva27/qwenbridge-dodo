@@ -80,13 +80,10 @@ function syncEnvAccounts(): void {
     for (const acc of accounts) {
       upsert.run(acc.id, acc.email, encrypt(acc.password));
     }
-    
-    // [Dodo] Faxina de banco de dados: remove contas fantasmas apagadas do .env
-    if (accounts.length > 0) {
-      const placeholders = accounts.map(() => "?").join(",");
-      const emails = accounts.map((a) => a.email);
-      db.prepare(`DELETE FROM accounts WHERE email NOT IN (${placeholders})`).run(...emails);
-    }
+    const placeholders = accounts.map(() => "?").join(",");
+    db.prepare(`DELETE FROM accounts WHERE email NOT IN (${placeholders})`).run(
+      ...accounts.map((a) => a.email),
+    );
   });
 
   sync();
@@ -126,20 +123,7 @@ export function loadAccounts(): QwenAccount[] {
   }));
 }
 
-export function loadConfiguredAccounts(): QwenAccount[] {
-  const envAccounts = parseEnvAccounts();
-  if (envAccounts.length === 0) return [];
-  
-  const allAccounts = getCachedAccounts();
-  const envEmails = new Set(envAccounts.map((a) => a.email));
-  
-  return allAccounts
-    .filter((account) => envEmails.has(account.email))
-    .map((account) => ({
-      ...account,
-      password: "***",
-    }));
-}
+export const loadConfiguredAccounts = loadAccounts;
 
 export function invalidateAccountsCache(): void {
   accountsCache = null;

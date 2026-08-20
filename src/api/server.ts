@@ -41,7 +41,7 @@ function formatAccountId(accountId: string): string {
 function buildPortInUseMessage(port: number, host: string): string {
   return (
     `❌ [Server] Port ${port} is already in use (${host}:${port}).` +
-    `\n   Another QwenBridge instance (or another program) is listening on this port.` +
+    `\n   Another QwenProxy instance (or another program) is listening on this port.` +
     `\n   Stop the other instance first, or start on another port: PORT=3001 npm start`
   );
 }
@@ -166,7 +166,6 @@ app.use("*", async (c, next) => {
     console.error(`❌ [Diag] ${method} ${path} → HTTP ${status}\n   Body: ${bodyText.slice(0, 500)}`);
   }
 });
-
 function constantTimeStringEqual(provided: string, expected: string): boolean {
   const providedBuf = Buffer.from(provided);
   const expectedBuf = Buffer.from(expected);
@@ -222,7 +221,6 @@ app.use("/v1/*", async (c, next) => {
 
 // Routes
 app.route("", modelsApp);
-app.route("", anthropicApp); // [Dodo] Rota de compatibilidade Anthropic original restaurada do Github
 app.post("/v1/chat/completions", chatCompletions);
 app.post("/v1/chat/completions/stop", chatCompletionsStop);
 app.post("/v1/completions", completionsLegacy);
@@ -236,6 +234,9 @@ app.route("", responsesApp);
 
 // Web Dashboard UI and Management Routes
 app.route("", dashboardApp);
+
+// Anthropic Messages API compatible routes
+app.route("", anthropicApp);
 
 // Accept paths without the /v1 prefix via a 308 redirect (method + body are
 // preserved on redirect). Most clients append /v1 themselves; the redirect
@@ -271,48 +272,6 @@ app.get("/health", async (c) => {
     },
   });
 });
-
-// [Dodo] Handler para o Dashboard Tauri
-const accountsHandler = async (c: any) => {
-  const { loadConfiguredAccounts } = await import("../core/accounts.ts");
-  const { accountTokenUsage } = await import("../core/metrics.ts");
-  const { getHeapUsageSnapshot } = await import("../core/memory-usage.ts");
-  
-  const configuredAccounts = loadConfiguredAccounts();
-  const accountsData = configuredAccounts.map(account => {
-    const memoryMB = Math.round(getHeapUsageSnapshot().heapUsed / 1024 / 1024);
-    const tokens = accountTokenUsage[account.id] || { prompt: 0, completion: 0, total: 0 };
-    return {
-      id: account.id,
-      email: account.email,
-      status: account.cooldown_until && account.cooldown_until > Date.now() ? "cooldown" : "active",
-      cooldown_until: account.cooldown_until,
-      cooldown_reason: account.cooldown_reason,
-      tokens
-    };
-  });
-  
-  const activeCount = accountsData.filter(a => a.status === "active").length;
-  const globalRamMb = Math.round(getHeapUsageSnapshot().heapUsed / 1024 / 1024);
-  
-  return c.json({
-    total: accountsData.length,
-    active: activeCount,
-    cooldown: accountsData.length - activeCount,
-    requests: metrics.get("requests.total")?.value || 0,
-    ram_mb: globalRamMb,
-    stream_errors: metrics.get("requests.errors")?.value || 0,
-    accounts: accountsData
-  });
-};
-
-app.options("/accounts", (c) => {
-  c.header("Access-Control-Allow-Origin", "*");
-  c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
-  return c.body(null, 204);
-});
-app.get("/accounts", accountsHandler);
-app.get("/metrics/accounts", accountsHandler);
 
 // Token TTL diagnostics: inspect real cookie/header lifetimes
 app.get("/diagnostics/tokens", async (c) => {
@@ -870,7 +829,7 @@ export async function startServer(options?: {
     console.log(`
 +${"-".repeat(W)}+
 |${blank()}|
-|${center("QwenBridge")}|
+|${center("QwenProxy")}|
 |${center("OpenAI-Compatible API")}|
 |${blank()}|
 +${"-".repeat(W)}+

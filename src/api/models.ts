@@ -108,7 +108,6 @@ export function expandModelVariants(
     if (!variants.has(model.id)) variants.set(model.id, model);
     addVariant("-fast", " (Fast)");
     addVariant("-thinking", " (Thinking)");
-    // [Dodo] Exposicao automatica de nomes com tag de contexto para UI do cliente
     addVariant("[1M]", " [1M]");
     addVariant("-fast[1M]", " (Fast) [1M]");
     addVariant("-thinking[1M]", " (Thinking) [1M]");

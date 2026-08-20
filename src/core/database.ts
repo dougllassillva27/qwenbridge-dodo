@@ -21,7 +21,7 @@ function isRunningUnderNodeTest(): boolean {
 
 const DATA_DIR = path.resolve(isRunningUnderNodeTest() ? "data-test" : "data");
 const DB_DIR = path.join(DATA_DIR, "db");
-const DB_PATH = path.join(DB_DIR, "qwenbridge.db");
+const DB_PATH = path.join(DB_DIR, "qwenproxy.db");
 const LEGACY_DB_PATH = path.join(DATA_DIR, "qwenproxy.db");
 const LEGACY_DB_IN_DIR_PATH = path.join(DB_DIR, "qwenproxy.db");
 const LEGACY_DB_WAL_PATH = `${LEGACY_DB_PATH}-wal`;
@@ -61,6 +61,12 @@ export function getDatabase(): Database.Database {
       }
     };
 
+    const LEGACY_BRIDGE_DB_PATH = path.join(DB_DIR, "qwenbridge.db");
+    migrateLegacyDatabase(
+      LEGACY_BRIDGE_DB_PATH,
+      `${LEGACY_BRIDGE_DB_PATH}-wal`,
+      `${LEGACY_BRIDGE_DB_PATH}-shm`,
+    );
     migrateLegacyDatabase(
       LEGACY_DB_PATH,
       LEGACY_DB_WAL_PATH,

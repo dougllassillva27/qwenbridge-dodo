@@ -1,6 +1,6 @@
 /*
  * File: playwright.ts
- * Project: QwenBridge
+ * Project: QwenProxy
  *
  * Playwright browser automation with stealth plugin for anti-bot evasion.
  * Captures real browser headers (bx-ua, bx-umidtoken) per account.
@@ -8,7 +8,7 @@
 
 import { chromium, type BrowserContext, type Page } from "playwright";
 import path from "path";
-import fs from "node:fs";
+import fs from "fs";
 import crypto from "crypto";
 import type { QwenAccount } from "../core/accounts.ts";
 // Imported here rather than injected from session-keeper.ts: account-concurrency
@@ -914,6 +914,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
       // cookie string (previously 3 round-trips: 2 validators + lightweight
       // refresh).
       const cookieSnapshot = await getCookieSnapshot(accountId);
+      await getCookieSnapshot(accountId);
       if (
         cookieSnapshot &&
         isAuthTokenValidFrom(cookieSnapshot) &&
@@ -1094,8 +1095,8 @@ export async function initPlaywrightForAccount(
       userAgent: fingerprint.userAgent,
       locale: fingerprint.locale,
       timezoneId: fingerprint.timezoneId,
-      viewport: { width: 800, height: 800 },
-      screen: { width: 800, height: 800 },
+      viewport: fingerprint.viewport,
+      screen: fingerprint.viewport,
       deviceScaleFactor: 1,
       isMobile: false,
       hasTouch: false,
@@ -1128,12 +1129,6 @@ export async function initPlaywrightForAccount(
         if (extraPage !== acctPage && extraPage.url() === "about:blank") {
           await extraPage.close({ runBeforeUnload: false }).catch(() => {});
         }
-      }
-
-      const cx = parseInt(process.env.LAUNCHER_WINDOW_X as string);
-      const cy = parseInt(process.env.LAUNCHER_WINDOW_Y as string);
-      if (!isNaN(cx) && !isNaN(cy)) {
-        await alignWindowPosition(acctPage, cx - 400, cy - 550).catch(() => {});
       }
 
       acctPage.setDefaultTimeout(config.timeouts.page);
@@ -1207,7 +1202,6 @@ export async function initPlaywrightForAccount(
       // Capture headers by navigating and intercepting
       console.log(`📡 [Playwright] Intercepting anti-bot headers for ${maskEmail(account.email)}...`);
       await captureQwenHeaders(account.id);
-      
       console.log(`🪟 [Playwright] Minimizing window for ${maskEmail(account.email)}...`);
       await minimizeWindow(acctPage);
 
@@ -1277,8 +1271,8 @@ export async function validateAccountLogin(
       userAgent: fingerprint.userAgent,
       locale: fingerprint.locale,
       timezoneId: fingerprint.timezoneId,
-      viewport: { width: 800, height: 800 },
-      screen: { width: 800, height: 800 },
+      viewport: fingerprint.viewport,
+      screen: fingerprint.viewport,
       deviceScaleFactor: 1,
       isMobile: false,
       hasTouch: false,
@@ -2768,7 +2762,6 @@ export async function getTokenDiagnostics(
     },
   };
 }
-
 // [Dodo] Funções CDP para gerenciar o estado da janela
 export async function alignWindowPosition(page: any, left: number, top: number): Promise<void> {
   const cdp = await page.context().newCDPSession(page);

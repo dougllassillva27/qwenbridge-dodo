@@ -33,7 +33,7 @@ function getDashboardData(cacheInstance?: MemoryCache) {
   const rss = getRssUsageSnapshot();
   const configuredAccounts = loadConfiguredAccounts();
 
-  const accounts = configuredAccounts.map((acc) => {
+  const accounts = configuredAccounts.map((acc: any) => {
     const cooldown = getAccountCooldownInfo(acc.id);
     const tokens = accountTokenUsage[acc.id] || { prompt: 0, completion: 0, total: 0 };
     return {
@@ -46,7 +46,7 @@ function getDashboardData(cacheInstance?: MemoryCache) {
     };
   });
 
-  const activeAccounts = accounts.filter((a) => a.status === "active").length;
+  const activeAccounts = accounts.filter((a: any) => a.status === "active").length;
   const uptimeSec = Math.floor((Date.now() - serverStartTime) / 1000);
 
   return {

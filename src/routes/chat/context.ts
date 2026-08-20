@@ -101,6 +101,7 @@ export async function buildFinalContext(
   const useRequestPersonalization =
     requestedPersonalization &&
     isRequestPersonalizationWithinLimit(personalizationInstruction);
+
   // Agent instructions and tools ride ONLY the account-level personalization
   // (confirmed before the completion request is sent — the real Qwen client
   // also never sends a system prompt in the completions payload). When the
