@@ -37,5 +37,7 @@ graphify-out/
 .DS_Store
 Thumbs.db
 
-# IDE / Editor
+# IDE / Editor / Local Docs
 AGENTS.md
+resumo-de-trabalho.md
+
