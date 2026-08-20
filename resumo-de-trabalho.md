@@ -139,3 +139,24 @@ Tudo verificado e passando livremente no Typecheck, pronto para deploy em produ�
    - **Debug HTML Dump Async**: Reescrita do despejo de depuração (`qwen_debug_dump.html`) para garantir persistência nativa de captchas do Alibaba via `await import('fs')`, garantindo a visibilidade da tela caso o fluxo gere a exceção "No completion request" por causa do WAF.
    - **Métricas do Tauri**: Mantida 100% da estrutura da rota de `/accounts` e `/metrics/accounts` no `server.ts` (RAM, streams, tempo de cooldown) para garantir a saúde das informações exibidas no Proxy Launcher Tauri.
 3. **Correção de Comunicação com Proxy Launcher**: Foi preciso retornar estritamente a variável de porta `PORT=50002` no arquivo `.env` e ativá-la, já que o Launcher Tauri usa ela fixada no Rust (`check_proxy_status`) via socket ping. Quando ausente, o Proxy Launcher ficava girando no estado "Iniciando..." infinitamente pois batia de frente com uma porta TCP não respondendo.
+
+## Atualização de Upstream e Merge Cirúrgico Estrito (20/08/2026) — Commit 96c3832
+1. **Integração de Upstream (johngbl/QwenBridge 9b61572..96c3832)**:
+   - **Parallel Escape**: Implementada rotação e escape para turnos e chats auxiliares/paralelos (`getNextFreeAccountForParallel`, `effectivePreferred = params.parallelEscape ? null : preferredAccountId`), impedindo que gerações secundárias travem por 18s aguardando a liberação de slots busy.
+   - **Remoção do Direct Completions Fetch**: O WAF Baxia do Alibaba barra requisições POST de completions feitas diretamente de Node (TLS/HTTP stack fingerprinting). Completions agora passam 100% pelo browser relay com `buildCompletionHeaders` (incluindo `bx-ua`/`bx-umidtoken`), enquanto o endpoint de `settings/update` (personalization) permanece em Node fetch rápido sem WAF.
+   - **Refactor de Branding e Limpeza**: Suporte ao branding `QwenProxy` e limpeza de arquivos obsoletos (`live-direct-probe-*`, `live-tls-fingerprint-test.ts`, `completions-direct-fetch.test.ts`).
+2. **Preservação Integral de 100% das Blindagens Dodo (`alterações-dodo.md`)**:
+   - **Checklist #1 (Telemetria Dashboard)**: Endpoints `/metrics/accounts`, `/accounts` e `/api/dashboard/*` preservados e acoplados com `recordAccountTokens`.
+   - **Checklist #2 e #3 (Janelas e Minimização CDP)**: Offsets do launcher (`cx - 400`, `cy - 550`), guard `!isNaN()`, limpeza de `window_placement` em `Preferences`, e minimização automática via CDP (`minimizeWindow`).
+   - **Checklist #4 (Headless)**: Padrão `PLAYWRIGHT_HEADLESS=false` mantido no `src/core/config.ts`.
+   - **Checklist #5 (Micro-buffering SSE)**: `BROWSER_STREAM_FLUSH_BYTES = 128` e `BROWSER_STREAM_FLUSH_MS = 10` para entregas de chunks em tempo real.
+   - **Checklist #6 (Scripts Package.json)**: Script `"start:qwenbridge": "npx tsx src/index.ts"` preservado.
+   - **Checklist #7 (Resiliência de Foco)**: `try { await page.focus(..., { timeout: 5000 }); } catch { ... }` intacto.
+   - **Checklist #8 e #9 (Porta e Inicialização)**: Porta `50002` e inicialização sequencial `PLAYWRIGHT_INIT_BATCH_SIZE=1` preservadas.
+   - **Checklist #10 (Contas Fantasma)**: `DELETE FROM accounts WHERE email NOT IN (...)` mantido no sync do SQLite.
+   - **Checklist #12 (Rota Anthropic)**: Sub-aplicação `src/routes/anthropic/` montada e mantida no `server.ts`.
+   - **Checklist #13 (Aliases 1M)**: Aliases de contexto estendido `[1M]`, `-fast[1M]` e `-thinking[1M]` mantidos no `src/api/models.ts`.
+   - **Checklist #14 (SQLite Cache & Migração)**: `cache_size = -8000` (8MB) e migração de `qwenbridge.db` legado para `qwenproxy.db` garantidas no `src/core/database.ts`.
+3. **Validação Completa**:
+   - `npm run typecheck`: **0 erros de tipagem**.
+   - `npm run test:mock`: **540/540 testes passando (100% verde)**.
