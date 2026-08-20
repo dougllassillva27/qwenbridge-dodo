@@ -267,16 +267,54 @@ export function translateStreamChunk(
 
   if (!choice?.delta && !choice?.finish_reason) return events;
 
-  // Reasoning content (Thinking models)
-  // [Dodo] Ocultado totalmente! Nós já injetamos eventos 'ping' no servidor para evitar
-  // timeout do Cline, então podemos simplesmente ignorar o raciocínio sem enviar lixo invisível.
+  // Reasoning content (Thinking phase)
   if (delta.reasoning_content) {
-    // Apenas retém o estado, não envia evento nenhum para o cliente.
-    return events;
+    if (state.currentBlockType !== "thinking") {
+      // Close previous block if it exists
+      if (state.currentBlockType) {
+        events.push(
+          JSON.stringify({
+            type: "content_block_stop",
+            index: state.contentBlockIndex,
+          }),
+        );
+        state.contentBlockIndex++;
+      }
+      // content_block_start for thinking
+      events.push(
+        JSON.stringify({
+          type: "content_block_start",
+          index: state.contentBlockIndex,
+          content_block: { type: "thinking", thinking: "" },
+        }),
+      );
+      state.currentBlockType = "thinking";
+    }
+
+    // content_block_delta for thinking
+    events.push(
+      JSON.stringify({
+        type: "content_block_delta",
+        index: state.contentBlockIndex,
+        delta: { type: "thinking_delta", thinking: delta.reasoning_content },
+      }),
+    );
   }
 
   // Text content
   if (delta.content) {
+    // If we were thinking, close the thinking block first
+    if (state.currentBlockType === "thinking") {
+      events.push(
+        JSON.stringify({
+          type: "content_block_stop",
+          index: state.contentBlockIndex,
+        }),
+      );
+      state.contentBlockIndex++;
+      state.currentBlockType = null;
+    }
+
     if (state.currentBlockType !== "text") {
       // content_block_start for text
       events.push(

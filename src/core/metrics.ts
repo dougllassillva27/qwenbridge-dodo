@@ -32,7 +32,12 @@ export class Metrics extends EventEmitter {
       // Core request metrics
       ["requests.total", "counter", "Total requests processed"],
       ["requests.errors", "counter", "Total request errors"],
+      ["requests.4xx", "counter", "Requests answered with 4xx status"],
+      ["requests.5xx", "counter", "Requests answered with 5xx status"],
+      ["requests.completions", "counter", "Chat completions requests"],
       ["latency.request", "histogram", "Request latency (ms)"],
+      ["latency.completion", "histogram", "Completion latency to response start (ms)"],
+      ["toolcalls.malformed", "counter", "Malformed tool call blocks dropped by the parser"],
 
       // Stream metrics
       ["streams.active", "gauge", "Active SSE streams"],

@@ -173,6 +173,28 @@ function runMigrations(db: Database.Database): void {
       instruction_hash TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT,
+      api_key TEXT UNIQUE NOT NULL,
+      rate_limit_rpm INTEGER NOT NULL DEFAULT 0,
+      max_concurrency INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      session_key TEXT PRIMARY KEY,
+      chat_id TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      headers TEXT NOT NULL,
+      parent_id TEXT,
+      history_complete INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL
+    );
   `);
 
   // Cooldown persistence columns — wrapped in try-catch because
@@ -282,3 +304,125 @@ export function closeDatabase(): void {
     db = null;
   }
 }
+
+// --- Users (per-user API keys, quotas) --------------------------------------
+
+export interface UserRow {
+  id: string;
+  email: string | null;
+  api_key: string;
+  rate_limit_rpm: number;
+  max_concurrency: number;
+}
+
+export function getUserByApiKey(apiKey: string): UserRow | null {
+  const row = getDatabase()
+    .prepare(
+      "SELECT id, email, api_key, rate_limit_rpm, max_concurrency FROM users WHERE api_key = ?",
+    )
+    .get(apiKey) as UserRow | undefined;
+  return row ?? null;
+}
+
+export function getUserById(id: string): UserRow | null {
+  const row = getDatabase()
+    .prepare(
+      "SELECT id, email, api_key, rate_limit_rpm, max_concurrency FROM users WHERE id = ?",
+    )
+    .get(id) as UserRow | undefined;
+  return row ?? null;
+}
+
+export function listUsers(): UserRow[] {
+  return getDatabase()
+    .prepare(
+      "SELECT id, email, api_key, rate_limit_rpm, max_concurrency FROM users ORDER BY created_at ASC",
+    )
+    .all() as UserRow[];
+}
+
+export function upsertUser(entry: {
+  id: string;
+  email?: string | null;
+  apiKey: string;
+  rateLimitRpm?: number;
+  maxConcurrency?: number;
+}): void {
+  getDatabase()
+    .prepare(
+      `
+      INSERT INTO users (id, email, api_key, rate_limit_rpm, max_concurrency, updated_at)
+      VALUES (?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(id) DO UPDATE SET
+        email = excluded.email,
+        api_key = excluded.api_key,
+        rate_limit_rpm = excluded.rate_limit_rpm,
+        max_concurrency = excluded.max_concurrency,
+        updated_at = datetime('now')
+    `,
+    )
+    .run(
+      entry.id,
+      entry.email ?? null,
+      entry.apiKey,
+      entry.rateLimitRpm ?? 0,
+      entry.maxConcurrency ?? 0,
+    );
+}
+
+export function deleteUserById(id: string): void {
+  getDatabase().prepare("DELETE FROM users WHERE id = ?").run(id);
+}
+
+// --- Sessions (persistent server-side conversation pins) ---------------------
+
+export interface SessionRow {
+  session_key: string;
+  chat_id: string;
+  account_id: string;
+  headers: string;
+  parent_id: string | null;
+  history_complete: number;
+  updated_at: number;
+}
+
+export function listSessions(): SessionRow[] {
+  return getDatabase()
+    .prepare(
+      "SELECT session_key, chat_id, account_id, headers, parent_id, history_complete, updated_at FROM sessions",
+    )
+    .all() as SessionRow[];
+}
+
+export function upsertSession(row: SessionRow): void {
+  getDatabase()
+    .prepare(
+      `
+      INSERT INTO sessions (session_key, chat_id, account_id, headers, parent_id, history_complete, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_key) DO UPDATE SET
+        chat_id = excluded.chat_id,
+        account_id = excluded.account_id,
+        headers = excluded.headers,
+        parent_id = excluded.parent_id,
+        history_complete = excluded.history_complete,
+        updated_at = excluded.updated_at
+    `,
+    )
+    .run(
+      row.session_key,
+      row.chat_id,
+      row.account_id,
+      row.headers,
+      row.parent_id,
+      row.history_complete,
+      row.updated_at,
+    );
+}
+
+export function deleteSession(sessionKey: string): void {
+  getDatabase()
+    .prepare("DELETE FROM sessions WHERE session_key = ?")
+    .run(sessionKey);
+}
+

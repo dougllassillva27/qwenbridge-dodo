@@ -10,6 +10,7 @@ const activeStreams = new Map<
     headers: Record<string, string>;
     /** True once at least one model chunk reached the client. */
     emittedChunk: boolean;
+    createdAt: number;
   }
 >();
 
@@ -21,6 +22,7 @@ export function registerStream(
     uiSessionId: string;
     targetResponseId: string;
     headers: Record<string, string>;
+    createdAt?: number;
   },
 ): void {
   const existing = activeStreams.get(key);
@@ -28,7 +30,7 @@ export function registerStream(
     existing.abortController.abort();
   }
 
-  activeStreams.set(key, { emittedChunk: false, ...entry });
+  activeStreams.set(key, { emittedChunk: false, createdAt: entry.createdAt || Date.now(), ...entry });
   metrics.gauge("streams.active", activeStreams.size);
 }
 
@@ -94,3 +96,18 @@ export function updateStreamSessionId(key: string, uiSessionId: string): void {
     entry.uiSessionId = uiSessionId;
   }
 }
+
+export function getStreamRegistry() {
+  return activeStreams;
+}
+
+export function abortStream(key: string): boolean {
+  const stream = activeStreams.get(key);
+  if (stream) {
+    stream.abortController.abort();
+    removeStream(key);
+    return true;
+  }
+  return false;
+}
+

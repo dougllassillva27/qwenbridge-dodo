@@ -4,7 +4,7 @@ import { v4 as uuidv4 } from "uuid";
 import { Hono, type Context } from "hono";
 import { serve } from "@hono/node-server";
 import { config } from "../core/config.js";
-import { metrics } from "../core/metrics.js";
+import { metrics, accountTokenUsage } from "../core/metrics.js";
 import { logger, maskEmail, isVerboseLogEnabled } from "../core/logger.js";
 import { MemoryCache } from "../cache/memory-cache.js";
 import { Watchdog } from "../core/watchdog.js";
@@ -22,6 +22,7 @@ import type { QwenAccount } from "../core/accounts.js";
 import { isAuthMockEnabled } from "../services/auth-playwright.js";
 import { anthropicApp } from "../routes/anthropic/index.js";
 import { dashboardApp } from "./dashboard.js";
+import { adminApp } from "./admin.ts";
 
 // Module-level state (initialized in startServer)
 let cache: MemoryCache | undefined;
@@ -143,8 +144,10 @@ app.use("*", async (c, next) => {
 });
 
 // [Dodo] Middleware de diagnóstico avançado — loga requisições quando LOG_LEVEL=true
-// e TODA resposta de erro >= 400.
+// e atualiza contadores/métricas de requisição e erros.
 app.use("*", async (c, next) => {
+  metrics.increment("requests.total");
+  const start = Date.now();
   const method = c.req.method;
   const path = c.req.path;
 
@@ -155,7 +158,19 @@ app.use("*", async (c, next) => {
 
   await next();
 
+  const duration = Date.now() - start;
+  metrics.histogram("latency.request", duration);
+  c.header("X-Response-Time", `${duration}ms`);
+
   const status = c.res.status;
+  if (status >= 500) {
+    metrics.increment("requests.errors");
+    metrics.increment("requests.5xx");
+  } else if (status >= 400) {
+    metrics.increment("requests.errors");
+    metrics.increment("requests.4xx");
+  }
+
   if (status >= 400 && method !== "OPTIONS") {
     // Clona a resposta para ler o corpo sem consumir o stream original
     let bodyText = "(unreadable)";
@@ -235,6 +250,9 @@ app.route("", responsesApp);
 // Web Dashboard UI and Management Routes
 app.route("", dashboardApp);
 
+// Admin Web Dashboard (Vite + React SPA & API at /admin)
+app.route("/admin", adminApp);
+
 // Anthropic Messages API compatible routes
 app.route("", anthropicApp);
 
@@ -250,6 +268,10 @@ const LEGACY_REDIRECTS: Array<[string, string]> = [
 for (const [from, to] of LEGACY_REDIRECTS) {
   app.all(from, (c) => c.redirect(to, 308));
 }
+
+// Compatibility probe routes (Continue.dev, Ollama client probes, etc.)
+app.all("/api/hello", (c) => c.text("QwenBridge is running", 200));
+app.all("/api/version", (c) => c.json({ version: "1.0.0" }, 200));
 
 app.get("/health", async (c) => {
   const status = await watchdog?.getStatus();
@@ -272,6 +294,92 @@ app.get("/health", async (c) => {
     },
   });
 });
+
+const accountsHandler = async (c: Context) => {
+  const { loadAccounts } = await import("../core/accounts.ts");
+  const { getCooldownStatus, getAccountCooldownInfo } =
+    await import("../core/account-manager.ts");
+  const { isPlaywrightInitialized, getCookies } =
+    await import("../services/playwright.ts");
+  const accounts = loadAccounts();
+  const cooldowns = getCooldownStatus();
+
+  const result = await Promise.all(
+    accounts.map(async (a) => {
+      const cooldownInfo = cooldowns[a.id] || getAccountCooldownInfo(a.id);
+      const isInit = isPlaywrightInitialized(a.id);
+      const tokens = accountTokenUsage[a.id] || {
+        prompt: 0,
+        completion: 0,
+        total: 0,
+      };
+      let hasCookies = false;
+      try {
+        const cookies = await getCookies(a.id);
+        hasCookies = Boolean(cookies && cookies.length > 0);
+      } catch {}
+
+      return {
+        id: a.id,
+        email: a.email,
+        status: cooldownInfo ? "cooldown" : isInit ? "ready" : "standby",
+        cooldown_until: cooldownInfo
+          ? Date.now() + cooldownInfo.remainingMs
+          : null,
+        cooldown_reason: cooldownInfo ? cooldownInfo.reason : null,
+        tokens,
+        playwright: {
+          initialized: isInit,
+          hasHeaders: hasCookies,
+        },
+      };
+    }),
+  );
+
+  const activeCount = result.filter((a) => a.status === "ready").length;
+  const cooldownCount = result.filter((a) => a.status === "cooldown").length;
+
+  return c.json(
+    {
+      accounts: result,
+      total: accounts.length,
+      active: activeCount,
+      cooldown: cooldownCount,
+      totalAccounts: accounts.length,
+      activeAccounts: activeCount,
+      requests: metrics.get("requests.total")?.value || 0,
+      ram_mb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      stream_errors: metrics.get("requests.errors")?.value || 0,
+      totalTokens: Object.values(accountTokenUsage).reduce(
+        (acc, curr) => acc + curr.total,
+        0,
+      ),
+      timestamp: Date.now(),
+    },
+    200,
+    {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, OPTIONS",
+    },
+  );
+};
+
+app.options("/accounts", (c) => {
+  c.header("Access-Control-Allow-Origin", "*");
+  c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+  c.header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
+  return c.body(null, 204);
+});
+
+app.options("/metrics/accounts", (c) => {
+  c.header("Access-Control-Allow-Origin", "*");
+  c.header("Access-Control-Allow-Methods", "GET, OPTIONS");
+  c.header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key");
+  return c.body(null, 204);
+});
+
+app.get("/accounts", accountsHandler);
+app.get("/metrics/accounts", accountsHandler);
 
 // Token TTL diagnostics: inspect real cookie/header lifetimes
 app.get("/diagnostics/tokens", async (c) => {
@@ -523,6 +631,9 @@ async function cleanupServerResources(): Promise<void> {
   const { closeAllPlaywright } = await import("../services/playwright.ts");
   await closeAllPlaywright();
 
+  const { stopTimeSeriesSampling } = await import("../core/time-series.ts");
+  stopTimeSeriesSampling();
+
   const activeServer = server;
   server = undefined;
   if (activeServer?.close) {
@@ -643,6 +754,10 @@ export async function startServer(options?: {
     const { startLeaseSweepTimer } =
       await import("../core/account-concurrency.ts");
     startLeaseSweepTimer();
+
+    const { startTimeSeriesSampling } =
+      await import("../core/time-series.ts");
+    startTimeSeriesSampling();
 
     // Bind HTTP server IMMEDIATELY so Dashboard, logs and API respond in <1 second
     const serverInstance = serve({

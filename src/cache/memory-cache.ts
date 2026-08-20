@@ -383,3 +383,6 @@ export class MemoryCache {
     return this.invalidateByPattern(pattern);
   }
 }
+
+export const cache = new MemoryCache();
+

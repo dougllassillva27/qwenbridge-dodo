@@ -322,6 +322,36 @@ export const config = {
     windowTokens: Math.max(0, parseInt(env.CONTEXT_METER_WINDOW_TOKENS)),
     reportUsage: env.CONTEXT_METER_REPORT_USAGE === "true",
   },
+  adminPassword: process.env.ADMIN_PASSWORD || "",
+  authRequired: process.env.AUTH_REQUIRED === "true",
+  users: {
+    defaultRateLimitRpm: Math.max(0, parseInt(process.env.USER_RATE_LIMIT_RPM || "0")),
+    defaultMaxConcurrency: Math.max(0, parseInt(process.env.USER_MAX_CONCURRENCY || "0")),
+    apiKeys: process.env.USER_API_KEYS || "",
+  },
+  accounts: {
+    singleAccountMode: process.env.SINGLE_ACCOUNT_MODE === "true",
+    singleAccountId: process.env.SINGLE_ACCOUNT_ID || "",
+    singleAccountEmail: process.env.SINGLE_ACCOUNT_EMAIL || "",
+    lanes: Math.max(1, parseInt(process.env.ACCOUNT_LANES || "1")),
+    initConcurrency: Math.max(1, parseInt(process.env.PLAYWRIGHT_INIT_BATCH_SIZE || "1")),
+    initStaggerMinMs: 500,
+    initStaggerMaxMs: 1500,
+  },
+  warmPool: {
+    size: Math.max(0, parseInt(process.env.WARM_POOL_SIZE || "0")),
+    lowWater: Math.max(0, parseInt(process.env.WARM_POOL_LOW_WATER || "0")),
+    ttlMs: Math.max(0, parseInt(process.env.WARM_POOL_TTL_MS || "1800000")),
+    startup: process.env.WARM_POOL_STARTUP === "true",
+  },
+  hybridSessions: {
+    enabled: process.env.HYBRID_SESSIONS_ENABLED === "true",
+    ttlMs: Math.max(0, parseInt(process.env.HYBRID_SESSION_TTL_MS || "1800000")),
+    verify: process.env.HYBRID_SESSION_VERIFY !== "false",
+  },
+  browser: {
+    headless: env.PLAYWRIGHT_HEADLESS !== "false",
+  },
 };
 
 export type Config = typeof config;

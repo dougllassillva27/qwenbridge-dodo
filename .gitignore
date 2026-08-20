@@ -37,7 +37,12 @@ graphify-out/
 .DS_Store
 Thumbs.db
 
-# IDE / Editor / Local Docs
+# IDE / Editor / Local Docs & Scripts
 AGENTS.md
 resumo-de-trabalho.md
+_contexto-ia/
+docs/
+*.bat
+
+
 

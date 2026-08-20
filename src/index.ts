@@ -1,5 +1,6 @@
 import 'dotenv/config'
 import { logHub } from './core/log-hub.js'
+import { logBuffer } from './core/log-buffer.js'
 
 // [Dodo] Prefixo universal de timestamp em cada linha de log do proxy
 function getTimestamp(): string {
@@ -22,6 +23,7 @@ function wrapLog(originalFn: (...data: any[]) => void, level: "info" | "warn" | 
     const ts = getTimestamp();
     const formatted = args.map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a))).join(" ");
     logHub.pushLog(`${ts} ${formatted}`, level);
+    logBuffer.push(level, formatted);
     originalFn(ts, ...args);
   };
 }

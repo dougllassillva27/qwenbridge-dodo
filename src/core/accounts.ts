@@ -9,6 +9,7 @@ export interface QwenAccount {
   password: string;
   cooldown_until?: number;
   cooldown_reason?: string | null;
+  created_at?: string;
 }
 
 function generateId(email: string): string {

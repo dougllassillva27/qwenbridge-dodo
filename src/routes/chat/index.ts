@@ -38,6 +38,8 @@ import {
 } from "./retry-policy.ts";
 import { classifyMediaModel } from "../../services/media-generation.ts";
 import { handleMediaChatCompletion } from "./media.ts";
+import { metrics } from "../../core/metrics.ts";
+import { trackModelUsage, trackUsage } from "../../core/usage-tracker.ts";
 
 
 
@@ -84,6 +86,11 @@ export async function chatCompletions(c: Context) {
     // upstream stream (and its queue wait) is resolved.
     const reqId = crypto.randomUUID().substring(0, 8);
     const reqStartedAt = Date.now();
+    metrics.increment("requests.completions");
+    trackModelUsage(body.model || modelId);
+    const user = (c as any).get?.("user");
+    trackUsage(user?.id || "global", prompt || currentPrompt || "", false);
+
     console.log(
       `📥 [Chat] Incoming | req=${reqId} | ${body.model} | ${messages.length} msg(s) | stream=${isStream}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${allFiles.length ? ` | ${allFiles.length} file(s)` : ""}`,
     );

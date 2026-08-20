@@ -148,6 +148,74 @@ function fixMissingOpeningQuotes(input: string): string {
   return out;
 }
 
+/**
+ * Fixes = separators where : was expected (e.g., {"arguments" = {"cmd": "ls"}} -> {"arguments": {"cmd": "ls"}})
+ */
+function fixEqualsSeparators(input: string): string {
+  let out = '';
+  let inString = false;
+  let escaped = false;
+  let i = 0;
+  const n = input.length;
+  const ctxStack: ('o' | 'a')[] = [];
+  let expectKey = false;
+
+  while (i < n) {
+    const ch = input[i];
+
+    if (escaped) { out += ch; escaped = false; i++; continue; }
+    if (ch === '\\') { out += ch; escaped = true; i++; continue; }
+
+    if (ch === '"') {
+      inString = !inString;
+      out += ch;
+      if (!inString && expectKey) {
+        let k = i + 1;
+        while (k < n && /\s/.test(input[k])) k++;
+        if (k < n && input[k] === '=') {
+          out += ':';
+          i = k + 1;
+          expectKey = false;
+          continue;
+        }
+      }
+      i++;
+      continue;
+    }
+
+    if (inString) { out += ch; i++; continue; }
+
+    if (ch === '{') { ctxStack.push('o'); expectKey = true; out += ch; i++; continue; }
+    if (ch === '[') { ctxStack.push('a'); expectKey = false; out += ch; i++; continue; }
+    if (ch === '}') { ctxStack.pop(); expectKey = false; out += ch; i++; continue; }
+    if (ch === ']') { ctxStack.pop(); expectKey = false; out += ch; i++; continue; }
+    if (ch === ':') { expectKey = false; out += ch; i++; continue; }
+    if (ch === ',') { expectKey = ctxStack[ctxStack.length - 1] === 'o'; out += ch; i++; continue; }
+
+    if (expectKey && /[a-zA-Z_]/.test(ch)) {
+      let j = i;
+      while (j < n && /[a-zA-Z0-9_]/.test(input[j])) j++;
+      const ident = input.slice(i, j);
+      let k = j;
+      while (k < n && /\s/.test(input[k])) k++;
+      if (k < n && input[k] === '=') {
+        out += '"' + ident + '":';
+        i = k + 1;
+        expectKey = false;
+        continue;
+      }
+      out += ident;
+      i = j;
+      expectKey = false;
+      continue;
+    }
+
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
 export function robustParseJSON(str: string): any {
   if (isDebug) {
     logger.debug("[json] robustParseJSON: starting", {
@@ -191,7 +259,8 @@ export function robustParseJSON(str: string): any {
     jsonPart = jsonPart.replace(/\\\\"/g, '\\"');
   }
 
-  let currentJson = jsonPart.replace(
+  let currentJson = fixEqualsSeparators(jsonPart);
+  currentJson = currentJson.replace(
     /([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)/g,
     '$1"$2"$3',
   );

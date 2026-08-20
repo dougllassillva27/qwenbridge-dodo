@@ -596,6 +596,17 @@ export interface QwenFileEntry {
   uploadTaskId: string;
 }
 
+const TEXT_DOC_EXTENSIONS = new Set([
+  'txt', 'log', 'md', 'markdown', 'csv', 'json', 'xml', 'yml', 'yaml', 'html', 'htm', 'ini', 'conf', 'env', 'py', 'js', 'ts', 'tsx', 'jsx', 'c', 'cpp', 'h', 'java', 'go', 'rs', 'sh', 'sql',
+]);
+
+export function isTextDocument(filename: string, mime: string): boolean {
+  if (mime.startsWith('text/')) return true;
+  if (mime === 'application/json' || mime === 'application/xml' || mime === 'application/javascript') return true;
+  const ext = filename.split('.').pop()?.toLowerCase() || '';
+  return TEXT_DOC_EXTENSIONS.has(ext);
+}
+
 /**
  * Process OpenAI-style image/video content into Qwen file format
  */
@@ -609,9 +620,10 @@ export async function processImagesForQwen(
     file_url?: { url: string };
   }>,
   headers: Record<string, string>,
-): Promise<{ text: string; files: QwenFileEntry[] }> {
+): Promise<{ text: string; files: QwenFileEntry[]; docText?: string }> {
   const textParts: string[] = [];
   const files: QwenFileEntry[] = [];
+  const docTexts: string[] = [];
 
   for (const part of content) {
     if (part.type === "text" && part.text) {
@@ -634,12 +646,14 @@ export async function processImagesForQwen(
       let filename = "";
       let fileSize = 0;
       let fileId = "";
+      let fileBuffer: Buffer | null = null;
 
       if (mediaUrl.startsWith("http://") || mediaUrl.startsWith("https://")) {
         try {
           const remoteMedia = await downloadRemoteMedia(mediaUrl);
           filename = remoteMedia.filename;
           fileSize = remoteMedia.buffer.length;
+          fileBuffer = remoteMedia.buffer;
           const typeInfo = detectFileType(filename);
           const stsData = await getSTSToken(
             filename,
@@ -668,6 +682,7 @@ export async function processImagesForQwen(
             (isVideoData ? "mp4" : isAudioData ? "mp3" : "png");
           const base64Data = mediaUrl.split(",")[1];
           const buffer = Buffer.from(base64Data, "base64");
+          fileBuffer = buffer;
           filename = `${isVideoData ? "video" : isAudioData ? "audio" : "file"}_${Date.now()}.${detectedExt}`;
           fileSize = buffer.length;
           const typeInfo = detectFileType(filename);
@@ -687,6 +702,14 @@ export async function processImagesForQwen(
 
       if (fileUrl) {
         const typeInfo = detectFileType(filename);
+        if (isTextDocument(filename, typeInfo.mime) && fileBuffer) {
+          // Text documents are inlined into the prompt so the model reliably sees
+          // their content. Attaching them as `files` and letting Qwen read them
+          // is unreliable and produces terse/degenerate replies.
+          const docText = fileBuffer.toString("utf-8");
+          docTexts.push(`[File: ${filename}]\n${docText}`);
+          continue;
+        }
         files.push({
           type: typeInfo.showType,
           file: {
@@ -727,5 +750,6 @@ export async function processImagesForQwen(
     }
   }
 
-  return { text: textParts.join("\n"), files };
+  const combinedText = [...docTexts, ...textParts].join("\n\n");
+  return { text: combinedText, files, docText: docTexts.join("\n\n") };
 }

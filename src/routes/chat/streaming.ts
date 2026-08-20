@@ -53,6 +53,10 @@ import { ClientAbortedError } from "../../core/errors.js";
 import { config } from "../../core/config.js";
 import { parseQwenErrorPayload } from "./errors.ts";
 import {
+  isDegenerateAnswer,
+  buildAnswerDirective,
+} from "../../utils/degenerate-answer.ts";
+import {
   isNetworkLikeError,
   throwFromSseUpstreamError,
   toRetryableStreamError,
@@ -718,6 +722,72 @@ export async function processNonStreamingResponse(
       });
     }
 
+    // Degenerate answer guard (non-streaming): if the reply is a terse acknowledgment like "Yes", "OK", "Sim"
+    // and we have midStreamRetry context without tool calls, regenerate on a clean chat with directive.
+    if (
+      isDegenerateAnswer(finalContent) &&
+      toolCallsOut.length === 0 &&
+      midStreamRetry &&
+      !(params.midStreamRetry as any)?.degenerateRetried
+    ) {
+      console.warn(
+        `[Chat] Non-stream degenerate reply detected ("${finalContent.trim()}"). Regenerating with directive...`,
+      );
+      const retryPrompt = `${midStreamRetry.fullPrompt}\n${buildAnswerDirective(finalContent)}`;
+      try {
+        await stream.cancel();
+      } catch {}
+      midStreamRetry.releaseAccountLease();
+
+      const newStreamResult = await acquireUpstreamStream({
+        finalPrompt: retryPrompt,
+        fullPrompt: retryPrompt,
+        isThinkingModel: midStreamRetry.isThinkingModel,
+        model: body.model,
+        reasoningMode: midStreamRetry.reasoningMode,
+        shouldResetUpstreamThread: true,
+        allFiles: midStreamRetry.allFiles,
+        isNewSession: midStreamRetry.isNewSession,
+        sessionId: midStreamRetry.sessionId,
+        useThreadNative: midStreamRetry.useThreadNative,
+        updateLogicalThread: midStreamRetry.updateLogicalThread,
+        parallelEscape: midStreamRetry.parallelEscape,
+        allowThreadReuse: midStreamRetry.allowThreadReuse,
+        forceNewChat: true,
+        preferredAccountId: midStreamRetry.activeAccountId,
+        excludeAccountIds: undefined,
+        messageCount: midStreamRetry.messageCount,
+        fullMessageCount: midStreamRetry.fullMessageCount,
+        toolsCount: midStreamRetry.toolsCount,
+        requestPersonalizationInstruction: midStreamRetry.requestPersonalizationInstruction,
+        contextMode: "replay",
+        requestSignal: c.req.raw.signal,
+        messages: midStreamRetry.messages,
+      });
+
+      if (!("error" in newStreamResult) && !c.req.raw.signal.aborted) {
+        return processNonStreamingResponse({
+          ...params,
+          stream: newStreamResult.stream,
+          uiSessionId: newStreamResult.uiSessionId,
+          activeAccountId: newStreamResult.activeAccountId,
+          activeAccountLabel: newStreamResult.activeAccountLabel,
+          finalPrompt: retryPrompt,
+          tokenEstimationContext: newStreamResult.tokenEstimationContext,
+          midStreamRetry: {
+            ...midStreamRetry,
+            degenerateRetried: true,
+            activeAccountId: newStreamResult.activeAccountId,
+            releaseAccountLease: newStreamResult.releaseAccountLease,
+          } as any,
+          onStreamComplete: () => {
+            newStreamResult.releaseAccountLease();
+            onStreamComplete?.();
+          },
+        });
+      }
+    }
+
     // Tool calls dropped and NOT recovered by the auto-retry. Keep this out of
     // the user-visible response entirely: the retry path already told Qwen what
     // went wrong in the upstream prompt, and an echoed [WARNING] text block
@@ -788,6 +858,8 @@ export async function processNonStreamingResponse(
       usage,
       finishReason,
     });
+
+    metrics.histogram("latency.completion", Date.now() - streamStartedAt);
 
     return c.json({
       id: completionId,
@@ -1024,13 +1096,39 @@ export async function processStreamingResponse(
     const WRITE_FLUSH_BYTES = 8192;
     const WRITE_FLUSH_MS = 3;
 
+    // Streaming degenerate guard: holds the initial output up to GUARD_HOLD_BYTES
+    // so if Qwen produces a terse degenerate answer ("Yes", "OK", "Sim"),
+    // it can be discarded and regenerated on a clean chat before reaching the client.
+    const GUARD_HOLD_BYTES = 800;
+    let guardActive =
+      !!midStreamRetry &&
+      ((midStreamRetry.allFiles?.length || 0) > 0 ||
+        (midStreamRetry.toolsCount || 0) > 0 ||
+        (midStreamRetry.messageCount || 0) > 1 ||
+        (midStreamRetry.fullPrompt?.length || 0) > 500);
+    let heldOutput = '';
+
+    const releaseGuard = () => {
+      if (!guardActive) return;
+      guardActive = false;
+      if (heldOutput) {
+        writeBuffer = heldOutput + writeBuffer;
+        heldOutput = '';
+      }
+    };
+
     const flushWrites = () => {
       if (clientDisconnected) {
         writeBuffer = '';
+        heldOutput = '';
         writeTimer = null;
         return;
       }
       if (writeTimer) { clearTimeout(writeTimer); writeTimer = null; }
+      if (guardActive) {
+        if (heldOutput.length > GUARD_HOLD_BYTES) releaseGuard();
+        return;
+      }
       if (writeBuffer) {
         const data = writeBuffer;
         writeBuffer = '';
@@ -1071,6 +1169,13 @@ export async function processStreamingResponse(
 
       const bufferedWrite = (data: string) => {
         if (clientDisconnected) return;
+        if (guardActive) {
+          heldOutput += data;
+          if (heldOutput.length >= GUARD_HOLD_BYTES) {
+            releaseGuard();
+          }
+          return;
+        }
         writeBuffer += data;
         if (writeBuffer.length >= WRITE_FLUSH_BYTES) {
           flushWrites();
@@ -1108,12 +1213,16 @@ export async function processStreamingResponse(
       const eventTail = `,"logprobs":null,"finish_reason":null}]}`;
 
       const writeDeltaEvent = (delta: Record<string, unknown>) => {
+        if (delta.reasoning_content || delta.tool_calls) {
+          releaseGuard();
+        }
         // First model output to reach the client: the emit-aware supersede uses
         // this to allow latest-wins only AFTER the client consumed something.
         markStreamEmitted(completionId);
         const now = Date.now();
         if (firstChunkAt === null) {
           firstChunkAt = now;
+          metrics.histogram("latency.completion", firstChunkAt - streamStartedAt);
           if (logger.isLevelEnabled("info")) {
             console.log(
               `⏱️ [Chat] First chunk | req=${reqId} | +${firstChunkAt - streamStartedAt}ms`,
@@ -1187,6 +1296,9 @@ export async function processStreamingResponse(
         if (textChunk) emittedModelOutput = true;
         if (!toolParser) {
           finalContent += textChunk;
+          if (guardActive && finalContent.length >= GUARD_HOLD_BYTES) {
+            releaseGuard();
+          }
           writeDeltaEvent({ content: textChunk });
           return;
         }
@@ -1194,6 +1306,9 @@ export async function processStreamingResponse(
         const { text, toolCalls, toolCallDeltas } = toolParser.feed(textChunk);
         if (text || toolCalls.length > 0 || toolCallDeltas.length > 0) {
           emittedModelOutput = true;
+        }
+        if (toolCalls.length > 0 || toolCallDeltas.length > 0) {
+          releaseGuard();
         }
 
         if (
@@ -1211,6 +1326,9 @@ export async function processStreamingResponse(
 
         if (text) {
           finalContent += text;
+          if (guardActive && finalContent.length >= GUARD_HOLD_BYTES) {
+            releaseGuard();
+          }
           writeDeltaEvent({ content: text });
         }
 
@@ -2291,6 +2409,136 @@ export async function processStreamingResponse(
           malformedRetryCount++;
         }
       }
+
+      // Degenerate answer guard (streaming): if the reply is a terse acknowledgment ("Yes", "OK", "Sim")
+      // and we have midStreamRetry context without emitted tool calls, regenerate on a clean chat with directive.
+      if (
+        guardActive &&
+        isDegenerateAnswer(finalContent) &&
+        midStreamRetry &&
+        !(params.midStreamRetry as any)?.degenerateRetried &&
+        (!toolParser || toolParser.getEmittedToolCallCount() === 0)
+      ) {
+        console.warn(
+          `[Chat] Streaming degenerate reply detected ("${finalContent.trim()}"). Regenerating on a clean chat...`,
+        );
+        heldOutput = ""; // discard held output so client sees nothing
+        const retryPrompt = `${midStreamRetry.fullPrompt}\n${buildAnswerDirective(finalContent)}`;
+        try {
+          await stream.cancel();
+        } catch {}
+        midStreamRetry.releaseAccountLease();
+
+        const newStreamResult = await acquireUpstreamStream({
+          finalPrompt: retryPrompt,
+          fullPrompt: retryPrompt,
+          isThinkingModel: midStreamRetry.isThinkingModel,
+          model: body.model,
+          reasoningMode: midStreamRetry.reasoningMode,
+          shouldResetUpstreamThread: true,
+          allFiles: midStreamRetry.allFiles,
+          isNewSession: midStreamRetry.isNewSession,
+          sessionId: midStreamRetry.sessionId,
+          useThreadNative: midStreamRetry.useThreadNative,
+          updateLogicalThread: midStreamRetry.updateLogicalThread,
+          parallelEscape: midStreamRetry.parallelEscape,
+          allowThreadReuse: midStreamRetry.allowThreadReuse,
+          forceNewChat: true,
+          preferredAccountId: midStreamRetry.activeAccountId,
+          excludeAccountIds: undefined,
+          messageCount: midStreamRetry.messageCount,
+          fullMessageCount: midStreamRetry.fullMessageCount,
+          toolsCount: midStreamRetry.toolsCount,
+          requestPersonalizationInstruction:
+            midStreamRetry.requestPersonalizationInstruction,
+          contextMode: "replay",
+          requestSignal: c.req.raw.signal,
+          messages: midStreamRetry.messages,
+        });
+
+        if (
+          !("error" in newStreamResult) &&
+          !clientDisconnected &&
+          !c.req.raw.signal.aborted
+        ) {
+          console.log(
+            `🔄 [Chat] Degenerate reply retry | ${newStreamResult.activeAccountLabel} | ${body.model} | chat=${newStreamResult.uiSessionId.substring(0, 12)}`,
+          );
+          guardActive = false; // retry streams directly
+          finalContent = "";
+          lastRawContent = "";
+          lastRawContentLength = 0;
+          lastRawContentSuffix = "";
+          lastThinkingSummary = "";
+          lastThinkingSummaryLength = 0;
+          lastThinkingSummarySuffix = "";
+
+          const retryEntry = getStream(newStreamResult.completionId);
+          removeStream(newStreamResult.completionId);
+          if (retryEntry) {
+            registerStream(completionId, {
+              ...retryEntry,
+              targetResponseId: "",
+            });
+          }
+
+          toolParser = shouldParseToolCalls
+            ? new StreamingToolParser(declaredTools, {
+                incrementalToolCalls: true,
+                maxToolCallsPerTurn: config.retry.maxToolCallsPerTurn,
+              })
+            : null;
+          targetResponseId = null;
+
+          reader = newStreamResult.stream.getReader();
+          activeReader = reader;
+          currentAccountId = newStreamResult.activeAccountId;
+          currentUiSessionId = newStreamResult.uiSessionId;
+          upstreamDone = false;
+
+          const retryDecoder = new TextDecoder();
+          let retryBuf = "";
+          retryLoop: while (!clientDisconnected) {
+            const { done: rDone, value: rVal } = await reader.read();
+            if (rDone) break;
+            retryBuf += retryDecoder.decode(rVal, { stream: true });
+            let lineStart = 0;
+            while (true) {
+              const lineEnd = retryBuf.indexOf("\n", lineStart);
+              if (lineEnd === -1) {
+                retryBuf = retryBuf.substring(lineStart);
+                break;
+              }
+              const line = retryBuf.substring(lineStart, lineEnd).trim();
+              lineStart = lineEnd + 1;
+              if (!line.startsWith("data:")) continue;
+              const dataStr = line.substring(5).trim();
+              if (dataStr === "[DONE]") {
+                upstreamDone = true;
+                break retryLoop;
+              }
+              try {
+                const parsed = JSON.parse(dataStr);
+                if (parsed.response_id && !targetResponseId) {
+                  targetResponseId = parsed.response_id;
+                  pendingParentId = parsed.response_id;
+                }
+                const d = parsed?.choices?.[0]?.delta;
+                if (d?.content) {
+                  finalContent += d.content;
+                  writeDeltaEvent({ content: d.content });
+                }
+              } catch {}
+            }
+          }
+          upstreamDone = true;
+          midStreamRetry.releaseAccountLease = newStreamResult.releaseAccountLease;
+          midStreamRetry.activeAccountId = newStreamResult.activeAccountId;
+        }
+      }
+
+      // Flush whatever remains
+      releaseGuard();
 
       // The active upstream attempt completed: persist the next-turn parent.
       // Failed/aborted attempts simply never commit, leaving the last successful

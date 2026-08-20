@@ -141,6 +141,19 @@ function scanCloseTagOutsideStringsAndFences(lower: string): ToolEndMatch | null
 
     if (codeFenceLength > 0) continue;
 
+    // Some editor clients append environment metadata immediately after a model
+    // emits a truncated closing tag, producing values like
+    // `</tool<environment_details>` or `</<environment_details>`. Treat only
+    // those prefixes as closing boundaries; otherwise wait for more chunks.
+    for (const truncatedClose of ['</tool', '</']) {
+      if (lower.startsWith(truncatedClose, i) && lower[i + truncatedClose.length] === '<') {
+        const after = lower.substring(i + truncatedClose.length);
+        if (startsWithEnvironmentDetails(after)) {
+          return { index: i, tag: truncatedClose };
+        }
+      }
+    }
+
     const tag = TOOL_END_ALIASES.find((candidate) =>
       lower.startsWith(candidate, i),
     );
@@ -148,6 +161,14 @@ function scanCloseTagOutsideStringsAndFences(lower: string): ToolEndMatch | null
   }
 
   return null;
+}
+
+function startsWithEnvironmentDetails(buffer: string): boolean {
+  // Match an <environment_details> block at the start of the buffer. Editor clients
+  // sometimes glue a stray/truncated closing fragment right before it (e.g.
+  // "</environment_details>", "</tool</environment_details>", "</<environment_details>"),
+  // so tolerate an optional leading "</...tool..." / "</" fragment before the tag.
+  return /^\s*(?:<\/(?:tool[a-z_]*)?<?\/?)?\s*<?\/?environment_details\b/i.test(buffer);
 }
 
 /** All occurrences of either closing marker, in ascending index order. */

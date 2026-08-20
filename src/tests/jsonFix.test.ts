@@ -64,3 +64,22 @@ test("robustParseJSON: handles stream truncation mid-string with escaped quote",
     assert.strictEqual(result.name, "apply_diff");
     assert.ok(result.arguments.diff.includes('content with "quote'), "Should recover the string with escaped quote");
 });
+
+test("robustParseJSON: handles equals separators instead of colons", () => {
+    const equalsJson = '{"name": "bash", "arguments" = {"command": "ls -la"}}';
+    const result = robustParseJSON(equalsJson);
+
+    assert.ok(result !== null, "Should not return null");
+    assert.strictEqual(result.name, "bash");
+    assert.strictEqual(result.arguments.command, "ls -la");
+});
+
+test("robustParseJSON: handles unquoted key with equals separator", () => {
+    const equalsJson = '{"name": "bash", arguments = {"command": "git status"}}';
+    const result = robustParseJSON(equalsJson);
+
+    assert.ok(result !== null, "Should not return null");
+    assert.strictEqual(result.name, "bash");
+    assert.strictEqual(result.arguments.command, "git status");
+});
+
