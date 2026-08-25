@@ -204,10 +204,75 @@ function closeTagContentIsParseable(buffer: string, endIdx: number): boolean {
 }
 
 /**
+ * Close unclosed object braces `}` or array brackets `]` ONLY when the payload
+ * is not inside an unclosed string. This handles the very common LLM mistake of
+ * omitting the outer closing `}` of a tool-call object before `</tool_call>`
+ * (e.g. `{"name": "foo", "arguments": {"bar": 1}}` vs `...{"bar": 1}`).
+ *
+ * Crucially, if the JSON ends mid-string, this function returns the input
+ * unmodified so truncated string payloads are never falsely balanced.
+ */
+function closeUnclosedBrackets(input: string): string {
+  const trimmed = input.trimEnd();
+  // Only complete unclosed outer brackets when the inner structure was actually closed
+  // (ends with `}` or `]`). Genuinely truncated payloads ending mid-value (string, number,
+  // boolean, identifier) must remain unclosed so they are dropped and tracked as malformed.
+  if (!/[}\]]$/.test(trimmed)) {
+    return input;
+  }
+
+  let inString = false;
+  let escaped = false;
+  const stack: Array<"}" | "]"> = [];
+
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === "{") {
+      stack.push("}");
+    } else if (ch === "[") {
+      stack.push("]");
+    } else if (ch === "}" || ch === "]") {
+      if (stack.length > 0 && stack[stack.length - 1] === ch) {
+        stack.pop();
+      }
+    }
+  }
+
+  // Never close unclosed strings (that would fabricate truncated string values)
+  if (inString || stack.length === 0) {
+    return input;
+  }
+
+  // Remove any trailing comma before closing brackets
+  const base = trimmed.replace(/,\s*$/, "");
+  return base + stack.reverse().join("");
+}
+
+/**
  * Plain-JSON.parse based candidate checks, in increasing tolerance order:
- * raw payload -> narrow typo repairs -> doubled trailing brace/bracket ->
- * missing opening brace/quote. Truncated payloads (unclosed strings) never
- * pass, so a mid-string literal marker is not mistaken for a real close tag.
+ * raw payload -> narrow typo repairs -> unclosed brackets -> doubled trailing
+ * brace/bracket -> missing opening brace/quote. Truncated payloads (unclosed
+ * strings) never pass, so a mid-string literal marker is not mistaken for a real close tag.
  */
 function tryParseJsonToolPayload(content: string): boolean {
   const tryParse = (s: string): boolean => {
@@ -222,13 +287,22 @@ function tryParseJsonToolPayload(content: string): boolean {
   if (tryParse(content)) return true;
 
   const repaired = repairCommonMalformedToolJson(content);
+  if (tryParse(repaired)) return true;
+
+  const closed = closeUnclosedBrackets(content);
+  if (closed !== content && tryParse(closed)) return true;
+
+  const closedRepaired = closeUnclosedBrackets(repaired);
+  if (closedRepaired !== repaired && tryParse(closedRepaired)) return true;
+
   const stripped = content.replace(/\}+$/, "").replace(/\]+$/, "");
   const strippedRepaired = repaired.replace(/\}+$/, "").replace(/\]+$/, "");
 
-  const candidates = [repaired, stripped];
+  const candidates = [stripped];
   if (repaired !== content) candidates.push(strippedRepaired);
   candidates.push(`{\"${content}`, `{${content}`);
   if (repaired !== content) candidates.push(`{\"${repaired}`, `{${repaired}`);
+  if (closed !== content) candidates.push(`{\"${closed}`, `{${closed}`);
 
   return candidates.some((candidate) => tryParse(candidate));
 }
@@ -326,6 +400,55 @@ function findNextToolOpenTagOutsideMarkdownCode(
     }
 
     i++;
+  }
+
+  return null;
+}
+
+function findToolOpenOutsideJsonString(
+  buffer: string,
+): { index: number; openTag: string } | null {
+  let inString = false;
+  let codeFenceLength = 0;
+
+  for (let i = 0; i < buffer.length; i++) {
+    const ch = buffer[i];
+    if (inString) {
+      if (ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === "`") {
+      let runLength = 1;
+      while (i + runLength < buffer.length && buffer[i + runLength] === "`") {
+        runLength++;
+      }
+      if (codeFenceLength === 0) {
+        codeFenceLength = runLength;
+      } else if (runLength >= codeFenceLength) {
+        codeFenceLength = 0;
+      }
+      i += runLength - 1;
+      continue;
+    }
+
+    if (codeFenceLength > 0) continue;
+
+    const match = buffer.substring(i).match(/^<tool_call(?:s)?\b[^>]*>/i);
+    if (match && !isPrecededByBacktick(buffer, i)) {
+      return { index: i, openTag: match[0] };
+    }
   }
 
   return null;
@@ -931,7 +1054,8 @@ function repairCommonMalformedToolJson(content: string): string {
       /([,{]\s*"[a-zA-Z_][a-zA-Z0-9_]*"\s*:\s*)(?=(?!true|false|null)[A-Za-z_])/g,
       '$1"',
     );
-  return repairMissingArrayClose(repaired);
+  const arrayRepaired = repairMissingArrayClose(repaired);
+  return closeUnclosedBrackets(arrayRepaired);
 }
 
 /**
@@ -987,6 +1111,7 @@ function scanJsonStructureIncomplete(content: string): boolean {
  * - missing opening `{`/quote changes the quote parity (`name": ...}}`)
  * - escaped quotes in surrounding junk text misalign string state
  * - double-encoded JSON (`\"` on every quote)
+ * - unclosed outer brackets when the inner values and closing braces are intact
  */
 function isJsonPayloadTruncated(content: string): boolean {
   if (!scanJsonStructureIncomplete(content)) return false;
@@ -1009,6 +1134,14 @@ function isJsonPayloadTruncated(content: string): boolean {
   if (content.includes('\\"')) {
     alt.push(content.replace(/\\"/g, '"'));
   }
+  const closed = closeUnclosedBrackets(content);
+  if (closed !== content) {
+    alt.push(closed);
+  }
+  const repaired = repairCommonMalformedToolJson(content);
+  if (repaired !== content) {
+    alt.push(repaired);
+  }
   for (const candidate of alt) {
     if (!scanJsonStructureIncomplete(candidate)) return false;
   }
@@ -1029,6 +1162,12 @@ function parseToolArgumentsStrict(raw: string): unknown {
   }
   try {
     return JSON.parse(repairCommonMalformedToolJson(raw));
+  } catch {}
+  try {
+    const closed = closeUnclosedBrackets(raw);
+    if (closed !== raw) {
+      return JSON.parse(closed);
+    }
   } catch {
     return null;
   }
@@ -1786,6 +1925,35 @@ export class StreamingToolParser {
           this.currentCloseTag = TOOL_END;
           this.clearIncrementalToolCall();
         } else {
+          // Check if a new <tool_call> opening tag appeared without closing the current one
+          const nextOpenMatch = findToolOpenOutsideJsonString(this.buffer);
+          if (nextOpenMatch && nextOpenMatch.index > 0) {
+            const content = this.buffer.substring(0, nextOpenMatch.index).trim();
+            if (tryParseJsonToolPayload(content)) {
+              if (isToolcallDebugEnabled()) {
+                logger.debug(
+                  "[parser] new tool_call open tag detected inside unclosed tool_call",
+                  {
+                    contentLength: content.length,
+                    contentPreview: content.substring(0, 300),
+                    nextOpenTag: nextOpenMatch.openTag,
+                  },
+                );
+              }
+              this.emitIncrementalToolCallDeltas(content);
+              this.buffer = this.buffer.substring(
+                nextOpenMatch.index + nextOpenMatch.openTag.length,
+              );
+              this.processToolContent(content, result);
+              this.insideTool = true;
+              this.currentOpenTag = nextOpenMatch.openTag;
+              this.currentCloseTag = TOOL_END;
+              this.clearIncrementalToolCall();
+              this.startIncrementalToolCall();
+              continue;
+            }
+          }
+
           this.emitIncrementalToolCallDeltas(this.buffer);
           if (isToolcallDebugEnabled()) {
             logger.debug("[parser] waiting for more data inside tool_call", {
@@ -1861,12 +2029,24 @@ export class StreamingToolParser {
         // buffer reaches flush and tryRecoverToolCall would otherwise skip the
         // narrow typo repairs that processToolContent runs.
         const repairedTrimmed = repairCommonMalformedToolJson(trimmed);
+        const multipleCalls =
+          this.parseToolContent(repairedTrimmed).length > 1
+            ? this.parseToolContent(repairedTrimmed)
+            : this.parseToolContent(trimmed).length > 1
+              ? this.parseToolContent(trimmed)
+              : [];
         const recovered =
           this.tryRecoverToolCall(repairedTrimmed) ||
           this.tryRecoverToolCall(trimmed) ||
           this.tryRecoverIncrementalToolCall(trimmed) ||
           this.lastChanceRecoverToolCall(trimmed);
-        if (recovered) {
+        if (multipleCalls.length > 1) {
+          for (const tc of multipleCalls) {
+            const resolvedName = this.resolveDeclaredToolName(tc.name);
+            if (resolvedName) tc.name = resolvedName;
+            this.finalizeSuccessfulToolCall(tc, result);
+          }
+        } else if (recovered) {
           if (isToolcallDebugEnabled()) {
             logger.debug("[parser] flush: recovery successful", {
               name: recovered.name,
@@ -2564,6 +2744,14 @@ export class StreamingToolParser {
     if (str.includes('\\"')) {
       jsonCandidates.push(str.replace(/\\"/g, '"'));
     }
+    const closed = closeUnclosedBrackets(str);
+    if (closed !== str && !jsonCandidates.includes(closed)) {
+      jsonCandidates.push(closed);
+    }
+    const repaired = repairCommonMalformedToolJson(str);
+    if (repaired !== str && !jsonCandidates.includes(repaired)) {
+      jsonCandidates.push(repaired);
+    }
 
     // Never robust-recover a structurally TRUNCATED payload: robustParseJSON
     // balances unclosed strings and would accept the cut as valid, silently
@@ -2606,6 +2794,7 @@ export class StreamingToolParser {
       const lines = str
         .split("\n")
         .map((l) => l.trim())
+        .map((l) => closeUnclosedBrackets(l))
         .filter((l) => l.startsWith("{") && l.endsWith("}"));
       if (isToolcallDebugEnabled()) {
         logger.debug(

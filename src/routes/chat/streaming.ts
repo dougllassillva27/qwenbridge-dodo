@@ -52,6 +52,7 @@ import { classifyError } from "../../api/error-classifier.js";
 import { ClientAbortedError } from "../../core/errors.js";
 import { config } from "../../core/config.js";
 import { parseQwenErrorPayload } from "./errors.ts";
+import { estimateTokenCount } from "../../utils/context-truncation.ts";
 import {
   isDegenerateAnswer,
   buildAnswerDirective,
@@ -557,6 +558,17 @@ export async function processNonStreamingResponse(
         contentLength: finalContent.length,
         hasReasoning: !!reasoningBuffer,
       });
+    }
+
+    if (!usageAccumulator.hasRealCompletionTokens) {
+      const genTokens = estimateTokenCount(
+        finalContent,
+        reasoningBuffer || "",
+        ...toolCallsOut.map((tc: any) => JSON.stringify(tc)),
+      );
+      usageAccumulator.completionTokens = Math.max(1, genTokens);
+      usageAccumulator.totalTokens =
+        (usageAccumulator.promptTokens || 0) + usageAccumulator.completionTokens;
     }
 
     const usage = enrichUsageWithContextMeter(
@@ -2549,6 +2561,16 @@ export async function processStreamingResponse(
       }
 
       // Finish reason + usage + [DONE]
+      if (!usageAccumulator.hasRealCompletionTokens) {
+        const genTokens = estimateTokenCount(
+          finalContent,
+          reasoningBuffer || "",
+        );
+        usageAccumulator.completionTokens = Math.max(1, genTokens);
+        usageAccumulator.totalTokens =
+          (usageAccumulator.promptTokens || 0) + usageAccumulator.completionTokens;
+      }
+
       const usage = enrichUsageWithContextMeter(
         buildUsage(usageAccumulator),
         currentTokenEstimationContext?.contextMeter,

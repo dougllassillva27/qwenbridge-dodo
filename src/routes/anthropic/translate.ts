@@ -12,6 +12,71 @@ import type {
 } from "./types.ts";
 
 import { mapClientModelToQwen } from "../../core/model-alias.ts";
+import { estimateTokenCount } from "../../utils/context-truncation.ts";
+
+/**
+ * Estimate token count for an Anthropic request payload (system, messages, tools).
+ */
+export function estimateAnthropicTokens(body: AnthropicRequest): number {
+  const promptParts: string[] = [];
+
+  // System prompt
+  if (body.system) {
+    if (typeof body.system === "string") {
+      promptParts.push(body.system);
+    } else if (Array.isArray(body.system)) {
+      for (const block of body.system) {
+        if (block.type === "text" && block.text) {
+          promptParts.push(block.text);
+        }
+      }
+    }
+  }
+
+  // Messages
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      promptParts.push(msg.role);
+      if (typeof msg.content === "string") {
+        promptParts.push(msg.content);
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "text" && block.text) {
+            promptParts.push(block.text);
+          } else if (block.type === "tool_use") {
+            if (block.name) promptParts.push(block.name);
+            if (block.input) promptParts.push(JSON.stringify(block.input));
+          } else if (block.type === "tool_result") {
+            if (typeof block.content === "string") {
+              promptParts.push(block.content);
+            } else if (Array.isArray(block.content)) {
+              for (const part of block.content) {
+                if (part.type === "text" && part.text) {
+                  promptParts.push(part.text);
+                }
+              }
+            }
+          } else if ((block as any).thinking) {
+            promptParts.push((block as any).thinking);
+          }
+        }
+      }
+    }
+  }
+
+  // Tools
+  if (Array.isArray(body.tools)) {
+    for (const tool of body.tools) {
+      if (tool.name) promptParts.push(tool.name);
+      if (tool.description) promptParts.push(tool.description);
+      if (tool.input_schema) promptParts.push(JSON.stringify(tool.input_schema));
+    }
+  }
+
+  const baseOverhead = 10 + (Array.isArray(body.messages) ? body.messages.length * 3 : 0);
+  const estimated = estimateTokenCount(...promptParts) + baseOverhead;
+  return Math.max(1, estimated);
+}
 
 /**
  * Map model names for Qwen compatibility
@@ -187,12 +252,13 @@ export function translateAnthropicToOpenAI(
 export function translateOpenAIToAnthropic(
   openaiResponse: OpenAIResponse,
   requestModel: string,
+  requestBody?: AnthropicRequest,
 ): AnthropicResponse {
   const choice = openaiResponse.choices[0];
   const content: AnthropicResponseContentBlock[] = [];
 
   // Text content
-  const msgContent = choice.message.content || "";
+  const msgContent = choice?.message?.content || "";
 
   if (msgContent) {
     content.push({
@@ -202,7 +268,7 @@ export function translateOpenAIToAnthropic(
   }
 
   // Tool calls → tool_use blocks
-  if (choice.message.tool_calls) {
+  if (choice?.message?.tool_calls) {
     for (const tc of choice.message.tool_calls) {
       let input: Record<string, unknown> = {};
       try {
@@ -228,17 +294,32 @@ export function translateOpenAIToAnthropic(
     content_filter: "end_turn",
   };
 
+  const promptTokens =
+    openaiResponse.usage?.prompt_tokens && openaiResponse.usage.prompt_tokens > 0
+      ? openaiResponse.usage.prompt_tokens
+      : requestBody
+        ? estimateAnthropicTokens(requestBody)
+        : estimateTokenCount(msgContent);
+
+  const completionTokens =
+    openaiResponse.usage?.completion_tokens && openaiResponse.usage.completion_tokens > 0
+      ? openaiResponse.usage.completion_tokens
+      : estimateTokenCount(
+          msgContent,
+          ...(choice?.message?.tool_calls || []).map((t) => JSON.stringify(t)),
+        );
+
   return {
     id: generateMessageId(),
     type: "message",
     role: "assistant",
     content,
     model: requestModel,
-    stop_reason: stopReasonMap[choice.finish_reason || "stop"] || "end_turn",
+    stop_reason: stopReasonMap[choice?.finish_reason || "stop"] || "end_turn",
     stop_sequence: null,
     usage: {
-      input_tokens: openaiResponse.usage.prompt_tokens,
-      output_tokens: openaiResponse.usage.completion_tokens,
+      input_tokens: promptTokens,
+      output_tokens: Math.max(1, completionTokens),
     },
   };
 }
@@ -253,13 +334,18 @@ export function translateStreamChunk(
     currentBlockType: string | null;
     requestModel: string;
     inputTokens: number;
+    outputTokens: number;
     inReasoning?: boolean;
   },
 ): string[] {
   const events: string[] = [];
+
   const usage = chunk.usage;
-  if (usage?.prompt_tokens !== undefined) {
+  if (typeof usage?.prompt_tokens === "number" && usage.prompt_tokens > 0) {
     state.inputTokens = usage.prompt_tokens;
+  }
+  if (typeof usage?.completion_tokens === "number" && usage.completion_tokens > 0) {
+    state.outputTokens = usage.completion_tokens;
   }
 
   const choice = chunk.choices?.[0];
@@ -269,6 +355,7 @@ export function translateStreamChunk(
 
   // Reasoning content (Thinking phase)
   if (delta.reasoning_content) {
+    state.outputTokens += estimateTokenCount(delta.reasoning_content);
     if (state.currentBlockType !== "thinking") {
       // Close previous block if it exists
       if (state.currentBlockType) {
@@ -303,6 +390,7 @@ export function translateStreamChunk(
 
   // Text content
   if (delta.content) {
+    state.outputTokens += estimateTokenCount(delta.content);
     // If we were thinking, close the thinking block first
     if (state.currentBlockType === "thinking") {
       events.push(
@@ -340,6 +428,7 @@ export function translateStreamChunk(
   if (delta.tool_calls) {
     for (const tc of delta.tool_calls) {
       if (tc.function?.name) {
+        state.outputTokens += estimateTokenCount(tc.function.name);
         // Close previous block if exists
         if (state.currentBlockType) {
           events.push(
@@ -368,6 +457,7 @@ export function translateStreamChunk(
       }
 
       if (tc.function?.arguments) {
+        state.outputTokens += estimateTokenCount(tc.function.arguments);
         // content_block_delta for input_json
         events.push(
           JSON.stringify({
@@ -412,8 +502,7 @@ export function translateStreamChunk(
           stop_sequence: null,
         },
         usage: {
-          input_tokens: state.inputTokens,
-          output_tokens: usage?.completion_tokens || 0,
+          output_tokens: Math.max(1, state.outputTokens),
         },
       }),
     );

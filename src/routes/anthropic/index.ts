@@ -7,6 +7,7 @@ import {
   translateAnthropicToOpenAI,
   translateOpenAIToAnthropic,
   translateStreamChunk,
+  estimateAnthropicTokens,
 } from "./translate.js";
 import type { AnthropicRequest, OpenAIResponse } from "./types.js";
 
@@ -144,6 +145,8 @@ app.post("/v1/messages", async (c) => {
           await stream.write(encoder.encode(data));
         };
 
+        const estimatedInputTokens = estimateAnthropicTokens(body);
+
         // Send message_start event
         const messageStart = {
           type: "message_start",
@@ -155,7 +158,7 @@ app.post("/v1/messages", async (c) => {
             model: requestModel,
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
+            usage: { input_tokens: estimatedInputTokens, output_tokens: 0 },
           },
         };
         await write(
@@ -166,7 +169,8 @@ app.post("/v1/messages", async (c) => {
           contentBlockIndex: 0,
           currentBlockType: null as string | null,
           requestModel,
-          inputTokens: 0,
+          inputTokens: estimatedInputTokens,
+          outputTokens: 0,
           inReasoning: false,
         };
 
@@ -204,7 +208,11 @@ app.post("/v1/messages", async (c) => {
                 "Content-Type": "application/json",
                 Authorization: `Bearer ${process.env.API_KEY || config.apiKey || ""}`,
               },
-              body: JSON.stringify({ ...openaiRequest, stream: true }),
+              body: JSON.stringify({
+                ...openaiRequest,
+                stream: true,
+                stream_options: { include_usage: true },
+              }),
               signal: controller.signal,
             },
           );
@@ -310,6 +318,7 @@ app.post("/v1/messages", async (c) => {
       const anthropicResponse = translateOpenAIToAnthropic(
         openaiResponse,
         requestModel,
+        body,
       );
 
       console.log(
@@ -337,11 +346,8 @@ app.post("/v1/messages/count_tokens", async (c) => {
   }
 
   try {
-    const body = await c.req.json();
-
-    // Simple estimation: ~4 chars per token
-    const text = JSON.stringify(body.messages || []);
-    const estimatedTokens = Math.ceil(text.length / 4);
+    const body: AnthropicRequest = await c.req.json();
+    const estimatedTokens = estimateAnthropicTokens(body);
 
     return c.json({
       input_tokens: estimatedTokens,
