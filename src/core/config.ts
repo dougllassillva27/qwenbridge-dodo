@@ -29,6 +29,12 @@ const envSchema = z
     // tokens regardless of this flag (buildCompletionHeaders). Set true
     // to inject them everywhere (legacy behavior).
     QWEN_SEND_BX_UA: z.string().default("false"),
+    // Conversation mode: "thread" (default) reuses the upstream Qwen chat via
+    // parent_id and sends the thread-native delta; "temp" creates a NEW Qwen
+    // temp chat (chat_mode:"local") for every request and sends the full
+    // history inline (OpenAI standard). Temp chats are ephemeral and never
+    // appear in the account's chat list (live-probed).
+    QWEN_CHAT_MODE: z.enum(["thread", "temp"]).default("thread"),
     PLAYWRIGHT_HEADLESS: z.string().default("true"),
     PLAYWRIGHT_BROWSER: z
       .enum(["chromium", "chrome", "edge"])
@@ -91,7 +97,7 @@ const envSchema = z
     RETRY_ON_UNKNOWN_UPSTREAM: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS: z.string().default("true"),
     RETRY_AUTO_MALFORMED_TOOLS_MAX: z.string().default("2"),
-    MAX_TOOL_CALLS_PER_TURN: z.string().default("8"),
+    MAX_TOOL_CALLS_PER_TURN: z.string().default("24"),
     QWEN_REPEATED_TOOL_CALL_WARN: z.string().default("2"),
     ACCOUNT_MAX_CONCURRENT_STREAMS: z.string().default("1"),
     ACCOUNT_BUSY_WAIT_MS: z.string().default("30000"),
@@ -106,6 +112,16 @@ const envSchema = z
     ACQUIRE_DEADLINE_MS: z.string().default("120000"),
     ACCOUNT_LEASE_MAX_DURATION_MS: z.string().default("600000"),
     ACCOUNT_INIT_FAILURE_COOLDOWN_MS: z.string().default("300000"),
+    // Timeout before a request waiting on the CHAT lock gives up. The chat lock
+    // is held for the entire stream lifetime, so it must cover the longest
+    // legitimate generation (reasoning models with huge contexts can spend
+    // 2-3 min producing the first byte chain). A 60s hard cap turned a normal
+    // long turn into a 500 for every concurrent request on the same chat
+    // (2026-08-22 production log: lock held 130s -> acquire_deadline 120s).
+    CHAT_LOCK_TIMEOUT_MS: z
+      .string()
+      .regex(/^\d+$/, "CHAT_LOCK_TIMEOUT_MS must be a number")
+      .default("180000"),
     STREAM_DISCONNECT_GRACE_MS: z
       .string()
       .regex(/^\d+$/, "STREAM_DISCONNECT_GRACE_MS must be a number")
@@ -116,6 +132,14 @@ const envSchema = z
     // turn of the sticky owner is not pushed to a cold account with a full
     // context replay (8s caused a needless 13.3s hop in the 20:04 session).
     CHAT_IN_PROGRESS_BUSY_MS: z.string().default("4000"),
+    // Same-chat retry budget for chat_in_progress. The upstream chat stays "in
+    // progress" for 2-16s after a completed turn (grows with turn size); each
+    // retry waits a jittered window (busyMs-based) and NO retry re-sends the
+    // full context — the escalation (new chat + full replay on a cold account)
+    // was the ~1MB re-upload that made tool loops feel like ~40 minutes. After
+    // this budget the request FAILS (thread binding kept) and the client's own
+    // retry lands on the settled chat with the delta intact.
+    CHAT_IN_PROGRESS_MAX_RETRIES: z.string().default("6"),
     MID_STREAM_FAILOVER_THRESHOLD: z.string().default("2"),
     MID_STREAM_FAILOVER_BUSY_MS: z.string().default("60000"),
 
@@ -236,6 +260,7 @@ export const config = {
     onUnknownUpstream: env.RETRY_ON_UNKNOWN_UPSTREAM !== "false",
     chatInProgressDelayMs: Math.max(0, parseInt(env.CHAT_IN_PROGRESS_RETRY_DELAY_MS)),
     chatInProgressBusyMs: Math.max(0, parseInt(env.CHAT_IN_PROGRESS_BUSY_MS)),
+    chatInProgressMaxAttempts: Math.max(1, parseInt(env.CHAT_IN_PROGRESS_MAX_RETRIES)),
     midStreamFailoverThreshold: Math.max(
       0,
       parseInt(env.MID_STREAM_FAILOVER_THRESHOLD),
@@ -283,6 +308,11 @@ export const config = {
       30_000,
       parseInt(env.ACCOUNT_INIT_FAILURE_COOLDOWN_MS),
     ),
+    /** Max time a request waits on the per-chat lock (default 3 min). */
+    chatLockTimeoutMs: Math.max(
+      0,
+      parseInt(env.CHAT_LOCK_TIMEOUT_MS),
+    ),
   },
   stream: {
     disconnectGraceMs: Math.max(
@@ -310,6 +340,8 @@ export const config = {
     personalizationFromRequest:
       env.QWEN_PERSONALIZATION_FROM_REQUEST === "true",
     personalizationVerifyGet: env.QWEN_PERSONALIZATION_VERIFY_GET !== "false",
+    /** "thread" (reuse upstream chat) or "temp" (new ephemeral chat per request). */
+    chatMode: env.QWEN_CHAT_MODE,
     maxPromptBytes: Math.max(0, parseInt(env.QWEN_MAX_PROMPT_BYTES)),
     maxPersonalizationBytes: Math.max(
       0,
@@ -329,3 +361,6 @@ export const config = {
 };
 
 export type Config = typeof config;
+
+/** Conversation mode: thread-native reuse vs ephemeral temp chat per request. */
+export type ChatMode = "thread" | "temp";

@@ -18,6 +18,7 @@ import {
   invalidateLogicalThreadParent,
   getQwenErrorCode,
   RetryableQwenStreamError,
+  setToolCapNotice,
 } from "../../services/qwen.ts";
 import { acquireUpstreamStream } from "./account.ts";
 import { markAccountRateLimited } from "../../core/account-manager.ts";
@@ -50,7 +51,7 @@ import {
 import { sendOpenAIError } from "../../api/error-helpers.js";
 import { classifyError } from "../../api/error-classifier.js";
 import { ClientAbortedError } from "../../core/errors.js";
-import { config } from "../../core/config.js";
+import { config, type ChatMode } from "../../core/config.js";
 import { parseQwenErrorPayload } from "./errors.ts";
 import {
   isNetworkLikeError,
@@ -205,6 +206,8 @@ export interface StreamProcessingParams {
     updateLogicalThread: boolean;
     /** Parallel request (own chat): recovery must not kill or rebind. */
     parallelEscape?: boolean;
+    /** "thread" (reuse upstream chat) or "temp" (new ephemeral chat per request). */
+    chatMode: ChatMode;
     allowThreadReuse: boolean;
     messageCount: number;
     fullMessageCount: number;
@@ -642,6 +645,7 @@ export async function processNonStreamingResponse(
         updateLogicalThread: midStreamRetry.updateLogicalThread,
         parallelEscape: midStreamRetry.parallelEscape,
         allowThreadReuse: midStreamRetry.allowThreadReuse,
+        chatMode: midStreamRetry.chatMode,
         forceNewChat: true,
         preferredAccountId: midStreamRetry.activeAccountId,
         excludeAccountIds: undefined,
@@ -878,6 +882,12 @@ export async function processStreamingResponse(
     // suffix on Stream done must only appear for attempts that COMPLETED after
     // a mid-stream retry, not for failed attempts that consumed retries.
     let streamCompletedOk = false;
+    // Set when the turn is closed early because the per-turn tool-call cap was
+    // reached. The turn ends CLEANLY (finish_reason "tool_calls" + [DONE]) and
+    // the upstream generation is stopped — this is a success path, never a
+    // mid-stream retry. The next turn carries a notice so the model knows calls
+    // beyond the cap were not executed.
+    let stoppedByToolCap = false;
 
     // The client socket went away. When config.stream.disconnectGraceMs > 0 we
     // do NOT tear down Qwen/stop/release the lease immediately: a transient
@@ -961,7 +971,14 @@ export async function processStreamingResponse(
             chat_id: stopSessionId,
             response_id: targetResponseId,
           }),
-          { referrer: qwenUrl(`/c/${encodeURIComponent(stopSessionId)}`) },
+          {
+            referrer: qwenUrl(`/c/${encodeURIComponent(stopSessionId)}`),
+            // The client is already gone and a retry may own the page mutex.
+            // A mutex timeout here must NOT trigger the stuck-mutex recovery
+            // (close context + reset profile) or a best-effort stop cools the
+            // account for 300s.
+            noMutexRecovery: true,
+          },
         )
           .then(() => {
             // A successful stop response means the account no longer needs the
@@ -1374,10 +1391,22 @@ export async function processStreamingResponse(
         if (retryChatInProgressOnSameAccount) {
           chatInProgressSameAccountRetries++;
         }
+        // chat_in_progress never escalates to an account switch with a
+        // full-context replay (the ~1MB re-upload cost the settle design
+        // removes). After the same-chat settle budget, fail the stream and let
+        // the request-level policy surface the error — the client's own retry
+        // lands on the settled chat, thread intact.
+        if (
+          policy.reason === "chat_in_progress" &&
+          !retryChatInProgressOnSameAccount
+        ) {
+          console.warn(
+            `🛑 [Chat] Stream recovery: chat_in_progress budget exhausted | account=${currentAccountId} | failing without full-context replay`,
+          );
+          return false;
+        }
         const switchAccount =
-          (policy.switchAccount && !retryInvalidInputOnSameAccount) ||
-          (policy.reason === "chat_in_progress" &&
-            !retryChatInProgressOnSameAccount);
+          policy.switchAccount && !retryInvalidInputOnSameAccount;
 
         if (
           switchAccount &&
@@ -1420,6 +1449,7 @@ export async function processStreamingResponse(
           updateLogicalThread: midStreamRetry.updateLogicalThread,
           parallelEscape: midStreamRetry.parallelEscape,
           allowThreadReuse: midStreamRetry.allowThreadReuse,
+          chatMode: midStreamRetry.chatMode,
           forceNewChat: forceRetryNewChat || switchAccount,
           preferredAccountId: switchAccount ? null : currentAccountId,
           excludeAccountIds: switchAccount ? [currentAccountId] : undefined,
@@ -1627,6 +1657,11 @@ export async function processStreamingResponse(
                 lastRawContentLength = result.contentLength;
                 lastRawContentSuffix = result.contentSuffix;
                 await emitAnswerText(vStr);
+                if (toolParser?.isToolCapReached()) {
+                  stoppedByToolCap = true;
+                  if (!clientDisconnected) flushWrites();
+                  break;
+                }
               }
             }
             continue;
@@ -1749,6 +1784,11 @@ export async function processStreamingResponse(
                 writeDeltaEvent({ reasoning_content: vStr });
               } else {
                 await emitAnswerText(vStr);
+                if (toolParser?.isToolCapReached()) {
+                  stoppedByToolCap = true;
+                  if (!clientDisconnected) flushWrites();
+                  break;
+                }
               }
             }
           } catch (_e) {
@@ -1776,8 +1816,26 @@ export async function processStreamingResponse(
         // lingering keep-alive upstream connection doesn't stall the tail
         // (finish_reason + [DONE]) until the idle timeout or connection close.
         if (upstreamDone) break;
+        if (stoppedByToolCap) break;
 
         buffer = lineStart > 0 ? buffer.slice(lineStart) : buffer;
+      }
+
+      // Tool-call cap reached: stop the upstream generation now. The turn
+      // closes cleanly below (finish_reason "tool_calls" + [DONE]); this is a
+      // SUCCESS path, never a mid-stream retry. Cancelling the active reader
+      // closes the upstream connection so Qwen stops generating the calls that
+      // would only be dropped.
+      if (stoppedByToolCap) {
+        logger.warn("[chat] stream: tool-call cap reached — closing turn early", {
+          completionId,
+          maxToolCallsPerTurn: config.retry.maxToolCallsPerTurn,
+          emittedToolCalls: toolParser?.getEmittedToolCallCount() ?? 0,
+        });
+        // Tell the NEXT turn of this session that calls beyond the cap were not
+        // executed, so the model can re-issue them.
+        setToolCapNotice(logicalSessionId);
+        await reader.cancel().catch(() => undefined);
       }
 
       // Post-stream: error check + flush remaining content
@@ -1994,6 +2052,7 @@ export async function processStreamingResponse(
             updateLogicalThread: midStreamRetry.updateLogicalThread,
             parallelEscape: midStreamRetry.parallelEscape,
             allowThreadReuse: midStreamRetry.allowThreadReuse,
+            chatMode: midStreamRetry.chatMode,
             forceNewChat: true,
             preferredAccountId: midStreamRetry.activeAccountId,
             excludeAccountIds: undefined,

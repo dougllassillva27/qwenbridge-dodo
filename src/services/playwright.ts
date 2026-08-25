@@ -18,6 +18,10 @@ import { hasActiveAccountLease } from "../core/account-concurrency.ts";
 import { config } from "../core/config.ts";
 import { maskEmail } from "../core/logger.ts";
 import { Mutex } from "../core/mutex.ts";
+import {
+  markAccountHeadersReady,
+  unmarkAccountHeadersReady,
+} from "../core/account-manager.ts";
 import { getAccountsByPriority } from "../core/account-priority.ts";
 import {
   clearFingerprintCache,
@@ -109,13 +113,19 @@ export function buildChromiumLaunchArgs(viewport: {
   return args;
 }
 
-// Per-account mutexes for browser access
+// Per-account mutexes for browser access. maxHoldMs = 60s: a page operation
+// legitimately takes a few seconds per step, but one exceeding 60s is a stuck
+// browser op (closed context / WAF page swallow) and the account should return
+// to the pool quickly (the 2026-08-22 log showed a lock held for 154s before
+// the waiter's recovery path finally ran). The chat lock keeps its own longer
+// hold budget (see acquireChatLock).
+const ACCOUNT_MUTEX_MAX_HOLD_MS = 60_000;
 const accountMutexes = new Map<string, Mutex>();
 
 function getAccountMutex(accountId: string): Mutex {
   let mutex = accountMutexes.get(accountId);
   if (!mutex) {
-    mutex = new Mutex(`playwright:${accountId.substring(0, 8)}`);
+    mutex = new Mutex(`playwright:${accountId.substring(0, 8)}`, ACCOUNT_MUTEX_MAX_HOLD_MS);
     accountMutexes.set(accountId, mutex);
   }
   return mutex;
@@ -156,12 +166,14 @@ async function acquireAccountMutex(
   accountId: string,
   key: string,
   timeoutMs = PLAYWRIGHT_MUTEX_WAIT_MS,
+  recoverOnTimeout = true,
 ): Promise<() => void> {
   const mutex = getAccountMutex(accountId);
   try {
     return await mutex.acquire(timeoutMs, key);
   } catch (error) {
     if (
+      recoverOnTimeout &&
       error instanceof Error &&
       error.message.startsWith("Mutex[playwright:") &&
       error.message.includes("acquire timeout")
@@ -895,6 +907,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
       headersAge < HEADER_CACHE_TTL * HEADER_REFRESH_THRESHOLD
     ) {
       await tryLightweightCookieRefresh(accountId, cache);
+      markAccountHeadersReady(accountId);
       const bxUa = cache.headers["bx-ua"];
       const bxUmidtoken = cache.headers["bx-umidtoken"];
       const bxV = cache.headers["bx-v"] || "2.5.37";
@@ -924,8 +937,8 @@ export async function getBasicHeaders(accountId: string): Promise<{
         const bxUa = cache.headers["bx-ua"];
         const bxUmidtoken = cache.headers["bx-umidtoken"];
         const bxV = cache.headers["bx-v"] || "2.5.37";
-        // Update lastRefresh to extend the cache
         cache.lastRefresh = Date.now();
+        markAccountHeadersReady(accountId);
         console.log(
           `🔄 [Playwright] Skipped header recapture for ${accountId} (token still valid, age: ${Math.round(headersAge / 60000)} min)`,
         );
@@ -981,6 +994,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
       );
     }
 
+    markAccountHeadersReady(accountId);
     const bxUa = cache.headers["bx-ua"];
     const bxUmidtoken = cache.headers["bx-umidtoken"];
     const bxV = cache.headers["bx-v"] || "2.5.37";
@@ -1671,6 +1685,9 @@ export async function captureQwenHeaders(
       if (timeout) clearTimeout(timeout);
       cache.headers = capturedHeaders;
       cache.lastRefresh = Date.now();
+      // The account now has a valid anti-bot header set — the rotation gate
+      // (account-manager `markAccountHeadersReady`) may route requests to it.
+      markAccountHeadersReady(accountId);
       // Header interception can set challenge/session cookies, so do not reuse
       // a cookie snapshot taken before this browser request.
       cookieCaches.delete(accountId);
@@ -1685,19 +1702,20 @@ export async function captureQwenHeaders(
     // a re-trigger types into the page that is already loaded, and reloading
     // would throw away the bx SDK state that just finished warming up.
     const openChatPage = async () => {
+      if (settled || page.isClosed()) return;
       await page.goto(qwenUrl("/"), {
         waitUntil: "domcontentloaded",
         timeout: Math.min(config.timeouts.navigation, timeoutMs),
       });
-      if (settled) return;
+      if (settled || page.isClosed()) return;
       await sleep(2000);
     };
 
     /** Type the probe message and send it, then wait out the grace window. */
     const triggerSend = async (attempt: number) => {
-      if (settled) return;
+      if (settled || page.isClosed()) return;
       await clearVisibleChallenge(page);
-      if (settled) return;
+      if (settled || page.isClosed()) return;
 
       // Session-expiry fast path: if the page landed on the auth/login screen
       // (redirection after a dead session), typing into the chat input would
@@ -1724,7 +1742,7 @@ export async function captureQwenHeaders(
           // Re-login navigated away; reload the chat page so the send below
           // types into a live chat input (never leave the loop parked).
           await openChatPage();
-          if (settled) return;
+          if (settled || page.isClosed()) return;
         } else {
           settle(
             new Error(
@@ -1735,19 +1753,21 @@ export async function captureQwenHeaders(
         }
       }
 
+      if (settled || page.isClosed()) return;
+
       // Prefer the Qwen-specific input selector first (stable against the DOM
       // picking a sibling textarea/contenteditable), then fall back to generic.
       // Mirrors upstream 5b3fd3e (robust account header capture).
       const inputSelector =
         'textarea.message-input-textarea:visible, textarea:visible, [contenteditable="true"]:visible';
       await page.focus(inputSelector);
-      if (settled) return;
+      if (settled || page.isClosed()) return;
       await page.fill(inputSelector, "");
-      if (settled) return;
+      if (settled || page.isClosed()) return;
       await page.type(inputSelector, "a", { delay: 100 });
-      if (settled) return;
+      if (settled || page.isClosed()) return;
       await sleep(2000);
-      if (settled) return;
+      if (settled || page.isClosed()) return;
 
       const sendSelectors = [
         ".message-input-right-button-send .send-button",
@@ -1757,7 +1777,7 @@ export async function captureQwenHeaders(
 
       let clicked = false;
       for (const selector of sendSelectors) {
-        if (settled) return;
+        if (settled || page.isClosed()) return;
         try {
           const btn = await page.$(selector);
           if (btn && (await btn.isVisible())) {
@@ -1768,7 +1788,7 @@ export async function captureQwenHeaders(
                 element.click();
               }
             }, selector);
-            if (!settled) {
+            if (!settled && !page.isClosed()) {
               await btn.click({ force: true, delay: 50 }).catch(() => {});
             }
             clicked = true;
@@ -1779,7 +1799,7 @@ export async function captureQwenHeaders(
         }
       }
 
-      if (!clicked && !settled) {
+      if (!clicked && !settled && !page.isClosed()) {
         await page.keyboard.press("Enter");
       }
 
@@ -2030,6 +2050,7 @@ export async function withAccountPage<T>(
   fn: (page: Page) => Promise<T>,
   timeoutMs = ACCOUNT_PAGE_OPERATION_TIMEOUT_MS,
   mutexTimeoutMs = PLAYWRIGHT_MUTEX_WAIT_MS,
+  recoverOnTimeout = true,
 ): Promise<T> {
   const page = accountPages.get(accountId);
   if (!page || page.isClosed()) {
@@ -2039,6 +2060,7 @@ export async function withAccountPage<T>(
     accountId,
     `page:${accountId.substring(0, 12)}`,
     Math.max(1_000, mutexTimeoutMs),
+    recoverOnTimeout,
   );
   try {
     touchAccountActivity(accountId);
@@ -2083,15 +2105,54 @@ function isPlaywrightProfileCorruptedError(error: unknown): boolean {
 async function resetPlaywrightProfileLocked(accountId: string): Promise<void> {
   await closePlaywrightForAccountLocked(accountId);
   const profilePath = path.resolve("data", "qwen_profiles", accountId);
+  removePlaywrightProfile(profilePath);
+}
+
+/**
+ * Best-effort removal of a Playwright profile directory.
+ *
+ * On Windows, `fs.rmSync` can fail with EPERM/EBUSY/Permission denied because
+ * the browser process still holds a file lock on the directory. Instead of
+ * letting that failure abort the profile-reset/re-init cycle (which used to
+ * cascade into a 45s re-init timeout + 300s account cooldown), the locked
+ * directory is renamed to a `.stale-*` sibling so a fresh profile can be
+ * created on the next init. Never throws.
+ *
+ * @param rmSyncOverride test hook: replaces `fs.rmSync` to simulate a lock.
+ */
+export function removePlaywrightProfile(
+  profilePath: string,
+  rmSyncOverride?: (path: string, opts: { recursive: boolean; force: boolean }) => void,
+): void {
+  const doRemove =
+    rmSyncOverride ??
+    ((p: string, opts: { recursive: boolean; force: boolean }) =>
+      fs.rmSync(p, opts));
   try {
-    fs.rmSync(profilePath, { recursive: true, force: true });
+    doRemove(profilePath, { recursive: true, force: true });
   } catch (error) {
-    if (!isPlaywrightProfileCorruptedError(error)) {
-      console.warn(
-        `[Playwright] Failed to delete profile for ${accountId}:`,
-        getErrorMessage(error),
-      );
+    if (isPlaywrightProfileCorruptedError(error)) return;
+    // EPERM / EBUSY: the OS still holds a file lock (Windows). Rename the
+    // locked directory out of the way so re-init can create a fresh profile.
+    const message =
+      error instanceof Error ? error.message : String(error ?? "");
+    if (
+      message.includes("EPERM") ||
+      message.includes("EBUSY") ||
+      message.includes("Permission denied")
+    ) {
+      try {
+        const stalePath = `${profilePath}.stale-${Date.now()}`;
+        fs.renameSync(profilePath, stalePath);
+      } catch {
+        // Best effort: re-init will either reuse or fail cleanly.
+      }
+      return;
     }
+    console.warn(
+      `[Playwright] Failed to delete profile at ${profilePath}:`,
+      getErrorMessage(error),
+    );
   }
 }
 
@@ -2363,6 +2424,10 @@ function cleanupPlaywrightAccountState(accountId: string): void {
   lastAccountActivity.delete(accountId);
   lastKeepAliveNavigation.delete(accountId);
   clearFingerprintCache(accountId);
+  // The account's context died/closed — its captured headers are stale or the
+  // page is gone, so it must not be selected by the rotation gate until a
+  // fresh capture succeeds again.
+  unmarkAccountHeadersReady(accountId);
 }
 
 async function closePlaywrightContextBestEffort(

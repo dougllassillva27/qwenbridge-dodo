@@ -7,23 +7,19 @@ import {
 } from "./auth-playwright.ts";
 import { v4 as uuidv4 } from "uuid";
 import {
-  QwenProxyError,
   UpstreamRateLimit,
-  UpstreamError,
-  AuthError,
   ClientAbortedError,
 } from "../core/errors.ts";
 import { buildQwenRequestHeaders } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
-import { config } from "../core/config.ts";
-import { logger, isToolcallDebugEnabled } from "../core/logger.ts";
+import { config, type ChatMode } from "../core/config.ts";
+import { logger } from "../core/logger.ts";
 import { estimateTokenCount } from "../utils/context-truncation.ts";
 import type {
   PersonalizationEstimationInfo,
   TokenEstimationContext,
 } from "./token-estimation-metrics.ts";
 import { getDatabase } from "../core/database.ts";
-import { markAccountRateLimited } from "../core/account-manager.ts";
 import { mapClientModelToQwen } from "../core/model-alias.ts";
 import {
   MAX_PAYLOAD_SIZE,
@@ -36,6 +32,56 @@ import { assertAntiBotHeaders } from "./playwright.ts";
 import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
 import { isAccountBusy } from "../core/account-concurrency.ts";
+
+// Re-exported from extracted modules for backward compatibility
+export {
+  isRetryableFetchErrorMessage,
+  RetryableQwenStreamError,
+  PersonalizationSyncError,
+  QwenUpstreamError,
+  QwenSessionExpiredError,
+  QwenUpstreamUnavailableError,
+  QwenNetworkError,
+  getQwenErrorCode,
+} from "./qwen-errors.ts";
+export {
+  setToolCapNotice,
+  consumeToolCapNotice,
+  flushLogicalThreadState,
+  getLogicalThreadState,
+  updateLogicalThreadState,
+  updateLogicalThreadParent,
+  updateSessionParent,
+  invalidateLogicalThreadParent,
+  clearAllSessionsForAccount,
+  getSessionParent,
+} from "./qwen-thread-state.ts";
+export type { LogicalThreadEntry } from "./qwen-thread-state.ts";
+export {
+  buildChatNewBody,
+  isReusableUnusedChatTitle,
+  releaseWarmChat,
+  acquireNewQwenChatSession,
+  warmQwenChatPool,
+} from "./qwen-chat-pool.ts";
+
+import {
+  isRetryableFetchErrorMessage,
+  RetryableQwenStreamError,
+  QwenUpstreamError,
+  QwenSessionExpiredError,
+  QwenUpstreamUnavailableError,
+  QwenNetworkError,
+} from "./qwen-errors.ts";
+import {
+  clearAllSessionsForAccount,
+  getSessionParent,
+  updateSessionParent,
+} from "./qwen-thread-state.ts";
+import {
+  acquireNewQwenChatSession,
+  releaseWarmChat,
+} from "./qwen-chat-pool.ts";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -157,6 +203,34 @@ async function waitForBrowserStreamMetadata(
   );
 }
 
+/**
+ * Idle timeout for an upstream stream, derived from model type, payload size
+ * and whether the stream is an auxiliary parallel-escape request.
+ *
+ * Base: REASONING_MODEL_TIMEOUT when thinking, IDLE_STREAM_TIMEOUT otherwise;
+ * +30s per MB of payload.
+ *
+ * Auxiliary (parallel-escape) streams serve a small request (e.g. a chat
+ * title) that generates in seconds; a SHORT cap frees the account slot fast
+ * when the upstream never sends the SSE terminal. The tight cap must ONLY
+ * apply to NON-thinking models: thinking streams legitimately pause >15s
+ * between reasoning chunks, and a 15s cap killed a 564KB full-replay in
+ * production (log 2026-08-21, etimedout idle after 15000ms on qwen3.8-max).
+ */
+export function computeDynamicIdleTimeout(opts: {
+  enableThinking: boolean;
+  parallelEscape?: boolean;
+  baseTimeoutMs: number;
+  payloadSize: number;
+}): number {
+  const payloadMB = opts.payloadSize / (1024 * 1024);
+  const dynamic = opts.baseTimeoutMs + Math.ceil(payloadMB * 30_000);
+  if (opts.parallelEscape && !opts.enableThinking) {
+    return Math.min(15_000, dynamic);
+  }
+  return dynamic;
+}
+
 function addIdleTimeoutToStream(
   stream: ReadableStream<Uint8Array>,
   controller: AbortController,
@@ -251,491 +325,6 @@ function addIdleTimeoutToStream(
       return reader ? reader.cancel(reason) : stream.cancel(reason);
     },
   });
-}
-
-/**
- * Messages from the completion fetch that indicate a transient network or
- * first-byte stall. These must be treated as retryable so tryCreateStreamWithRetry
- * rotates to another account instead of failing with a terminal 500 that the
- * client has to retry manually (which looks like an infinite hang).
- */
-export function isRetryableFetchErrorMessage(message: string): boolean {
-  return (
-    message.includes("fetch failed") ||
-    message.includes("ECONNREFUSED") ||
-    message.includes("ETIMEDOUT") ||
-    message.includes("etimedout") ||
-    message.includes("ENOTFOUND") ||
-    message.includes("network") ||
-    message.includes("timed out waiting for response headers")
-  );
-}
-
-export class RetryableQwenStreamError extends UpstreamRateLimit {
-  readonly retryAfterMs: number;
-  /** Original upstream category; avoids exposing the inherited rate-limit code. */
-  upstreamCode?: string;
-
-  constructor(message: string, retryAfterMs: number) {
-    super(message);
-    this.name = "RetryableQwenStreamError";
-    this.retryAfterMs = retryAfterMs;
-  }
-}
-
-/**
- * The account-level personalization sync could not be confirmed. Agent
- * instructions ride ONLY the personalization channel (never inline in the
- * prompt), so an unconfirmed sync must fail the attempt — the retry policy
- * rotates to another account — instead of sending a request the model would
- * answer without any instructions or tools. Surfaces as 503 (service
- * degraded) if every account fails to sync.
- */
-export class PersonalizationSyncError extends QwenProxyError {
-  readonly statusCode = 503;
-  readonly type = "service_unavailable";
-  readonly code = "personalization_unavailable";
-
-  constructor(message: string) {
-    super(message);
-    this.name = "PersonalizationSyncError";
-  }
-}
-
-export class QwenUpstreamError extends UpstreamError {
-  readonly upstreamCode: string;
-  readonly upstreamStatus: number;
-
-  constructor(message: string, upstreamCode: string, upstreamStatus: number) {
-    super(message);
-    this.name = "QwenUpstreamError";
-    this.upstreamCode = upstreamCode;
-    this.upstreamStatus = upstreamStatus;
-  }
-}
-
-export class QwenSessionExpiredError extends AuthError {
-  readonly accountId: string;
-
-  constructor(message: string, accountId: string) {
-    super(message);
-    this.name = "QwenSessionExpiredError";
-    this.accountId = accountId;
-  }
-}
-
-export class QwenUpstreamUnavailableError extends RetryableQwenStreamError {
-  readonly httpStatusCode: number;
-
-  constructor(message: string, httpStatusCode: number) {
-    super(message, 5000);
-    this.name = "QwenUpstreamUnavailableError";
-    this.upstreamCode = "upstream_unavailable";
-    this.httpStatusCode = httpStatusCode;
-  }
-}
-
-export class QwenNetworkError extends RetryableQwenStreamError {
-  constructor(message: string) {
-    super(message, 3000);
-    this.name = "QwenNetworkError";
-    this.upstreamCode = "network_error";
-  }
-}
-
-/**
- * Return the meaningful upstream category for logs and OpenAI error payloads.
- * RetryableQwenStreamError inherits the rate-limit base class for legacy retry
- * handling, so its inherited `code` must not be used as the actual category.
- */
-export function getQwenErrorCode(error: unknown): string | undefined {
-  if (!error || typeof error !== "object") return undefined;
-
-  const typed = error as {
-    upstreamCode?: unknown;
-    code?: unknown;
-    message?: unknown;
-  };
-  if (typeof typed.upstreamCode === "string" && typed.upstreamCode) {
-    return typed.upstreamCode;
-  }
-
-  if (error instanceof QwenNetworkError) return "network_error";
-  if (error instanceof QwenUpstreamUnavailableError) {
-    return "upstream_unavailable";
-  }
-
-  if (error instanceof RetryableQwenStreamError) {
-    const message = typeof typed.message === "string" ? typed.message.toLowerCase() : "";
-    if (message.includes("chat is in progress")) return "chat_in_progress";
-    if (message.includes("not exist") || message.includes("does not exist")) {
-      return "chat_not_exist";
-    }
-    if (message.includes("anti-bot") || message.includes("captcha")) {
-      return "waf_challenge";
-    }
-    return "upstream_retryable";
-  }
-
-  return typeof typed.code === "string" && typed.code ? typed.code : undefined;
-}
-
-interface SessionEntry {
-  accountId: string;
-  parentId: string | null;
-  timestamp: number;
-}
-
-export interface LogicalThreadEntry {
-  accountId: string;
-  chatSessionId: string;
-  parentId: string | null;
-  instructionsSent: boolean;
-  timestamp: number;
-}
-
-const sessionStates: Map<string, SessionEntry> =
-  (globalThis as any)._sessionStates || new Map();
-(globalThis as any)._sessionStates = sessionStates;
-
-// In-memory cache for logical thread states (backed by SQLite)
-const logicalThreadStates: Map<string, LogicalThreadEntry> =
-  (globalThis as any)._logicalThreadStates || new Map();
-(globalThis as any)._logicalThreadStates = logicalThreadStates;
-
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
-
-/**
- * Debounce window before dirty logical thread states are upserted to SQLite in
- * a single transaction. The tool-call loop calls updateLogicalThreadState on
- * every turn (~30+ synchronous writes per conversation otherwise). The
- * in-memory cache stays the authoritative source within the process, so reads
- * never observe the delay; flushLogicalThreadState() runs on shutdown.
- */
-const LOGICAL_THREAD_FLUSH_DELAY_MS = 300;
-
-const logicalThreadDirty: Set<string> =
-  (globalThis as any)._logicalThreadDirty || new Set();
-(globalThis as any)._logicalThreadDirty = logicalThreadDirty;
-
-let logicalThreadFlushTimer: NodeJS.Timeout | null = null;
-
-function scheduleLogicalThreadFlush(): void {
-  if (logicalThreadFlushTimer) return;
-  logicalThreadFlushTimer = setTimeout(() => {
-    logicalThreadFlushTimer = null;
-    flushLogicalThreadState();
-  }, LOGICAL_THREAD_FLUSH_DELAY_MS);
-  logicalThreadFlushTimer.unref?.();
-}
-
-/**
- * Persist every dirty logical thread state to SQLite in one transaction.
- * Exported so the shutdown path can flush before closeDatabase().
- */
-export function flushLogicalThreadState(): void {
-  if (logicalThreadFlushTimer) {
-    clearTimeout(logicalThreadFlushTimer);
-    logicalThreadFlushTimer = null;
-  }
-  if (isAuthMockEnabled()) return;
-  if (logicalThreadDirty.size === 0) return;
-
-  try {
-    const db = getDatabase();
-    const upsert = db.prepare(
-      `INSERT INTO logical_thread_states (session_id, account_id, chat_session_id, parent_id, instructions_sent, updated_at)
-       VALUES (?, ?, ?, ?, ?, datetime('now'))
-       ON CONFLICT(session_id) DO UPDATE SET
-         account_id = excluded.account_id,
-         chat_session_id = excluded.chat_session_id,
-         parent_id = excluded.parent_id,
-         instructions_sent = excluded.instructions_sent,
-         updated_at = datetime('now')`,
-    );
-    const flush = db.transaction(
-      (entries: Array<{
-        sessionId: string;
-        accountId: string;
-        chatSessionId: string;
-        parentId: string | null;
-        instructionsSent: number;
-      }>) => {
-        for (const e of entries) {
-          upsert.run(
-            e.sessionId,
-            e.accountId,
-            e.chatSessionId,
-            e.parentId,
-            e.instructionsSent,
-          );
-        }
-      },
-    );
-
-    const entries: Array<{
-      sessionId: string;
-      accountId: string;
-      chatSessionId: string;
-      parentId: string | null;
-      instructionsSent: number;
-    }> = [];
-    for (const sessionId of logicalThreadDirty) {
-      const entry = logicalThreadStates.get(sessionId);
-      // Entries evicted from the cache (clearAllSessionsForAccount / TTL) must
-      // NOT be resurrected — the deletion already happened in the cache.
-      if (!entry || !entry.chatSessionId) continue;
-      entries.push({
-        sessionId,
-        accountId: entry.accountId,
-        chatSessionId: entry.chatSessionId,
-        parentId: entry.parentId ?? null,
-        instructionsSent: entry.instructionsSent ? 1 : 0,
-      });
-    }
-
-    if (entries.length > 0) flush(entries);
-    logicalThreadDirty.clear();
-  } catch (err) {
-    logger.warn(
-      "[Qwen] Failed to batch-persist logical thread states to SQLite",
-      {
-        count: logicalThreadDirty.size,
-        error: err instanceof Error ? err.message : String(err),
-      },
-    );
-    logicalThreadDirty.clear();
-  }
-}
-
-function cleanupStaleSessions() {
-  const now = Date.now();
-  for (const [key, entry] of sessionStates.entries()) {
-    if (now - entry.timestamp > SESSION_TTL_MS) {
-      sessionStates.delete(key);
-    }
-  }
-  // Cleanup stale entries from SQLite
-  try {
-    const db = getDatabase();
-    const cutoff = new Date(now - SESSION_TTL_MS).toISOString();
-    db.prepare("DELETE FROM logical_thread_states WHERE updated_at < ?").run(
-      cutoff,
-    );
-  } catch (error) {
-    logger.warn("Failed to clean up stale logical thread states", { error });
-  }
-  for (const [key, entry] of logicalThreadStates.entries()) {
-    if (now - entry.timestamp > SESSION_TTL_MS) {
-      logicalThreadStates.delete(key);
-      logicalThreadDirty.delete(key);
-    }
-  }
-}
-
-export function getLogicalThreadState(
-  logicalSessionId: string | null | undefined,
-): LogicalThreadEntry | null {
-  if (!logicalSessionId) return null;
-
-  // Check in-memory cache first
-  const cached = logicalThreadStates.get(logicalSessionId);
-  if (cached && Date.now() - cached.timestamp <= SESSION_TTL_MS) {
-    return cached;
-  }
-  if (cached) {
-    logicalThreadStates.delete(logicalSessionId);
-  }
-
-  if (isAuthMockEnabled()) return null;
-
-  // Fallback to SQLite
-  try {
-    const db = getDatabase();
-    const row = db
-      .prepare(
-        "SELECT session_id, account_id, chat_session_id, parent_id, instructions_sent, updated_at FROM logical_thread_states WHERE session_id = ?",
-      )
-      .get(logicalSessionId) as
-      | {
-          session_id: string;
-          account_id: string;
-          chat_session_id: string;
-          parent_id: string | null;
-          instructions_sent: number;
-          updated_at: string;
-        }
-      | undefined;
-
-    if (!row) return null;
-
-    const timestamp = new Date(row.updated_at).getTime();
-    if (Date.now() - timestamp > SESSION_TTL_MS) {
-      db.prepare("DELETE FROM logical_thread_states WHERE session_id = ?").run(
-        logicalSessionId,
-      );
-      return null;
-    }
-
-    const entry: LogicalThreadEntry = {
-      accountId: row.account_id,
-      chatSessionId: row.chat_session_id,
-      parentId: row.parent_id,
-      instructionsSent: row.instructions_sent === 1,
-      timestamp,
-    };
-
-    // Populate in-memory cache
-    logicalThreadStates.set(logicalSessionId, entry);
-    return entry;
-  } catch (err) {
-    logger.warn("[Qwen] Failed to read logical thread from SQLite", {
-      sessionId: logicalSessionId,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
-  }
-}
-
-export function updateLogicalThreadState(
-  logicalSessionId: string,
-  entry: Omit<LogicalThreadEntry, "timestamp" | "instructionsSent"> & {
-    instructionsSent?: boolean;
-  },
-): void {
-  if (
-    !logicalSessionId ||
-    entry.chatSessionId === undefined ||
-    entry.chatSessionId === null
-  )
-    return;
-  if (logicalThreadStates.size > 10000) cleanupStaleSessions();
-  const existing = logicalThreadStates.get(logicalSessionId);
-  const merged = {
-    ...entry,
-    instructionsSent:
-      entry.instructionsSent ?? existing?.instructionsSent ?? false,
-    timestamp: Date.now(),
-  };
-
-  // Update in-memory cache
-  logicalThreadStates.set(logicalSessionId, merged);
-
-  if (isAuthMockEnabled()) return;
-
-  // Persist to SQLite with a short debounce: turns in the tool-call loop
-  // update this on every stream creation, and coalescing them into one
-  // transaction removes ~30+ synchronous writes per conversation. Reads stay
-  // cache-first, so runtime behavior is unchanged; the flush runs on shutdown.
-  logicalThreadDirty.add(logicalSessionId);
-  scheduleLogicalThreadFlush();
-}
-
-export function updateLogicalThreadParent(
-  logicalSessionId: string | null | undefined,
-  parentId: string | null,
-  accountId: string,
-  chatSessionId: string,
-): void {
-  if (!logicalSessionId || !chatSessionId) return;
-  updateLogicalThreadState(logicalSessionId, {
-    accountId,
-    chatSessionId,
-    parentId,
-    instructionsSent: true,
-  });
-}
-
-export function updateSessionParent(
-  sessionId: string,
-  parentId: string | null,
-  accountId?: string,
-) {
-  if (!sessionId) return;
-
-  if (sessionStates.size > 10000) {
-    cleanupStaleSessions();
-  }
-
-  const existing = sessionStates.get(sessionId);
-  sessionStates.set(sessionId, {
-    accountId: accountId || existing?.accountId || "global",
-    parentId,
-    timestamp: Date.now(),
-  });
-}
-
-/**
- * Invalidate the stored parent for a logical thread without forgetting the
- * upstream chat binding. The next request will see a missing parent and must
- * rebuild the upstream chat with full context instead of appending to a
- * possibly corrupted parent chain.
- */
-export function invalidateLogicalThreadParent(
-  logicalSessionId: string | null | undefined,
-): void {
-  if (!logicalSessionId) return;
-
-  const existing = getLogicalThreadState(logicalSessionId);
-  if (!existing) return;
-
-  updateSessionParent(existing.chatSessionId, null, existing.accountId);
-  updateLogicalThreadState(logicalSessionId, {
-    accountId: existing.accountId,
-    chatSessionId: existing.chatSessionId,
-    parentId: null,
-    instructionsSent: existing.instructionsSent,
-  });
-}
-
-export function clearAllSessionsForAccount(accountId: string): void {
-  let removed = 0;
-
-  for (const [key, entry] of sessionStates.entries()) {
-    if (entry.accountId === accountId) {
-      sessionStates.delete(key);
-      removed++;
-    }
-  }
-
-  for (const [key, entry] of logicalThreadStates.entries()) {
-    if (entry.accountId === accountId) {
-      logicalThreadStates.delete(key);
-      // Drop pending writes too, so a later debounce flush cannot resurrect
-      // the just-deleted row.
-      logicalThreadDirty.delete(key);
-      removed++;
-    }
-  }
-
-  // Also clear from SQLite
-  try {
-    const db = getDatabase();
-    const result = db
-      .prepare("DELETE FROM logical_thread_states WHERE account_id = ?")
-      .run(accountId);
-    removed += result.changes;
-  } catch {}
-
-  console.log(
-    `🧹 [Qwen] Cleared ${removed} session(s) for account ${accountId}`,
-  );
-}
-
-function getSessionParent(
-  sessionId: string,
-  accountId?: string,
-): string | null | undefined {
-  const entry = sessionStates.get(sessionId);
-  if (!entry) return undefined;
-  if (Date.now() - entry.timestamp > SESSION_TTL_MS) {
-    sessionStates.delete(sessionId);
-    return undefined;
-  }
-  if (accountId && entry.accountId !== accountId) {
-    return undefined;
-  }
-  return entry.parentId;
 }
 
 export interface QwenMessage {
@@ -916,7 +505,7 @@ function getActivePersonalizationInfo(
   return activePersonalizationByAccount.get(accountId) ?? null;
 }
 
-function buildCapturedQwenHeaders(
+export function buildCapturedQwenHeaders(
   headers: Record<string, string>,
   options: {
     chatSessionId?: string | null;
@@ -1079,12 +668,28 @@ export function buildQwenSettingsUpdatePayload(
   };
 }
 
-async function readJsonTextResponse(
+export async function readJsonTextResponse(
   response: Response,
   options: { strict?: boolean } = {},
 ): Promise<{ raw: string; json: any }> {
   const raw = await response.text();
   if (!raw) {
+    return { raw, json: null };
+  }
+
+  // Pre-check HTTP status: upstream gateways (like Alibaba GA) returning 502/503/504
+  // with an HTML body (e.g. <html><head><title>502 Bad Gateway</title>...) will fail JSON.parse.
+  // In strict mode on a non-ok response with non-JSON/HTML, throw an upfront descriptive upstream error
+  // rather than a cryptic SyntaxError ("Unexpected token '<'").
+  if (!response.ok && (raw.trimStart().startsWith("<") || response.status >= 500)) {
+    if (options.strict) {
+      const { QwenUpstreamError } = await import("./qwen-errors.ts");
+      throw new QwenUpstreamError(
+        `Upstream gateway error ${response.status} ${response.statusText}: ${raw.substring(0, 200)}`,
+        "UpstreamGatewayError",
+        response.status >= 500 ? 502 : response.status,
+      );
+    }
     return { raw, json: null };
   }
 
@@ -1103,6 +708,7 @@ async function withQwenBrowserPage<T>(
   fn: (page: Page) => Promise<T>,
   targetPath?: string,
   operationTimeoutMs = config.timeouts.page,
+  recoverOnTimeout = true,
 ): Promise<T> {
   // Keep the account page on the chat UI for normal browser operations. The
   // personalization helper passes /settings/personalization explicitly; an
@@ -1140,6 +746,7 @@ async function withQwenBrowserPage<T>(
     },
     operationTimeoutMs,
     Math.min(config.timeouts.page, 5_000),
+    recoverOnTimeout,
   );
 }
 
@@ -1147,6 +754,7 @@ async function withQwenPersonalizationPage<T>(
   accountId: string,
   fn: (page: Page) => Promise<T>,
   operationTimeoutMs = config.timeouts.page,
+  recoverOnTimeout = true,
 ): Promise<T> {
   return withQwenBrowserPage(
     accountId,
@@ -1177,6 +785,7 @@ async function withQwenPersonalizationPage<T>(
     },
     "/settings/personalization",
     operationTimeoutMs,
+    recoverOnTimeout,
   );
 }
 
@@ -1224,6 +833,13 @@ export async function requestQwenTextInBrowser(
     settingsPage?: boolean;
     referrer?: string;
     timeoutMs?: number;
+    /**
+     * Best-effort operations (e.g. the post-disconnect stop) must not trigger
+     * the aggressive stuck-mutex recovery: the mutex is legitimately held by the
+     * NEW request that superseded this one, and closing the context / resetting
+     * the profile would kill the account for a healthy in-flight generation.
+     */
+    noMutexRecovery?: boolean;
   } = {},
 ): Promise<Response> {
   const url = qwenUrl(path);
@@ -1281,17 +897,20 @@ export async function requestQwenTextInBrowser(
         referrer: options.referrer,
       },
     );
+  const recoverOnTimeout = !options.noMutexRecovery;
   const response = options.settingsPage
     ? await withQwenPersonalizationPage<BrowserTextResponse>(
         accountId,
         evaluateRequest,
         options.timeoutMs,
+        recoverOnTimeout,
       )
     : await withQwenBrowserPage<BrowserTextResponse>(
         accountId,
         evaluateRequest,
         undefined,
         options.timeoutMs,
+        recoverOnTimeout,
       );
 
   return new Response(response.raw, {
@@ -2349,42 +1968,6 @@ export async function deleteAllQwenChats(accountId?: string): Promise<boolean> {
   return true;
 }
 
-export async function deleteQwenChat(
-  chatId: string,
-  accountId?: string,
-): Promise<boolean> {
-  if (!chatId) return false;
-  const { headers } = await getQwenHeaders(false, accountId);
-  const response = await requestQwenTextInBrowser(
-    accountId,
-    "DELETE",
-    `/api/v2/chats/${encodeURIComponent(chatId)}`,
-    buildCapturedQwenHeaders(headers, {
-      referer: qwenUrl("/settings/chats"),
-    }),
-    undefined,
-    { referrer: qwenUrl("/settings/chats") },
-  );
-
-  const { raw, json: parsed } = await readJsonTextResponse(response, {
-    strict: true,
-  });
-  if (!response.ok) {
-    throw new Error(
-      `Failed to delete Qwen chat ${chatId}: ${response.status} ${raw.substring(0, 200)}`,
-    );
-  }
-
-  const success = parsed?.success === true && parsed?.data?.status === true;
-  if (!success) {
-    throw new Error(
-      `Qwen delete chat returned unexpected payload: ${raw.substring(0, 200)}`,
-    );
-  }
-
-  return true;
-}
-
 export async function fetchQwenModels(
   accountId?: string,
 ): Promise<PublicQwenModel[]> {
@@ -2516,328 +2099,6 @@ export interface QwenFileEntry {
   [key: string]: any;
 }
 
-async function createQwenChatSession(
-  headers: Record<string, string>,
-  model: string,
-  accountId?: string,
-): Promise<string> {
-  if (isAuthMockEnabled()) {
-    return process.env.TEST_SESSION_ID || "mock-session";
-  }
-
-  const response = await requestQwenTextInBrowser(
-    accountId,
-    "POST",
-    "/api/v2/chats/new",
-    buildCapturedQwenHeaders(headers, {
-      referer: qwenUrl("/"),
-    }),
-    JSON.stringify(buildChatNewBody(model)),
-    { referrer: qwenUrl("/") },
-  );
-
-  const { raw, json } = await readJsonTextResponse(response, {
-    strict: true,
-  });
-  if (!response.ok) {
-    throw new QwenUpstreamError(
-      `Qwen create chat failed: ${response.status} ${response.statusText} - ${raw.substring(0, 300)}`,
-      "CreateChatFailed",
-      response.status >= 500 ? 502 : response.status,
-    );
-  }
-
-  const chatId =
-    json?.chat_id ||
-    json?.id ||
-    json?.data?.chat_id ||
-    json?.data?.id ||
-    json?.data?.chat?.id;
-
-  if (!chatId || typeof chatId !== "string") {
-    throw new QwenUpstreamError(
-      `Qwen create chat returned unexpected payload: ${raw.substring(0, 300)}`,
-      "CreateChatInvalidResponse",
-      502,
-    );
-  }
-
-  return chatId;
-}
-
-/**
- * Body for POST /api/v2/chats/new, matching the real web client exactly
- * (verified in HAR): chatId:"" instead of a title. The API then defaults the
- * list title to "New chat", which isReusableUnusedChatTitle accepts so the
- * warm pool can still find and recycle the chat.
- */
-export function buildChatNewBody(model: string): Record<string, unknown> {
-  return {
-    chatId: "",
-    models: [model],
-    project_id: "",
-    timestamp: Date.now(),
-    chat_type: "t2t",
-    chat_mode: "normal",
-  };
-}
-
-/**
- * True when a chat is an API-default-titled, never-messaged chat that the
- * warm pool may recycle. Both defaults exist in practice: chats created by
- * this project (title:"Nova Conversa") and chats created by the web client
- * without a title (API default "New chat").
- */
-export function isReusableUnusedChatTitle(
-  title: unknown,
-): title is string {
-  return title === "Nova Conversa" || title === "New chat";
-}
-
-/**
- * Fetch existing unused chats from the Qwen API.
- * Unused chats keep their API-default title ("Nova Conversa" or "New chat")
- * and created_at === updated_at.
- */
-async function fetchUnusedChats(
-  headers: Record<string, string>,
-  accountId?: string,
-): Promise<string[]> {
-  try {
-    const response = await requestQwenTextInBrowser(
-      accountId,
-      "GET",
-      "/api/v2/chats/?page=1&exclude_project=true",
-      buildCapturedQwenHeaders(headers, {
-        extra: {
-          accept: "application/json, text/plain, */*",
-          "x-request-id": crypto.randomUUID(),
-          source: "web",
-        },
-      }),
-      undefined,
-      { referrer: qwenUrl("/settings/chats") },
-    );
-
-    if (!response.ok) return [];
-
-    const json: any = await response.json().catch(() => null);
-    if (!json?.success || !Array.isArray(json.data)) return [];
-
-    const unused: string[] = [];
-    for (const chat of json.data) {
-      if (
-        isReusableUnusedChatTitle(chat.title) &&
-        chat.created_at === chat.updated_at
-      ) {
-        unused.push(chat.id);
-      }
-    }
-    return unused;
-  } catch {
-    return [];
-  }
-}
-
-const precreatedChatSessions = new Map<string, string[]>();
-const precreatingChatSessions = new Set<string>();
-const inFlightWarmChats = new Set<string>();
-const WARM_POOL_LOW_WATER = 3;
-
-function warmChatKey(
-  accountId: string | undefined,
-  model: string,
-  chatId: string,
-) {
-  return `${accountId || "global"}:${model}:${chatId}`;
-}
-
-function markWarmChatInFlight(
-  accountId: string | undefined,
-  model: string,
-  chatId: string,
-): void {
-  inFlightWarmChats.add(warmChatKey(accountId, model, chatId));
-}
-
-function releaseWarmChat(
-  accountId: string | undefined,
-  model: string,
-  chatId: string,
-): void {
-  inFlightWarmChats.delete(warmChatKey(accountId, model, chatId));
-}
-
-function isWarmChatInFlight(
-  accountId: string | undefined,
-  model: string,
-  chatId: string,
-): boolean {
-  return inFlightWarmChats.has(warmChatKey(accountId, model, chatId));
-}
-
-function chatPoolKey(accountId: string | undefined, model: string): string {
-  return `${accountId || "global"}:${model}`;
-}
-
-function isQwenChatPoolEnabled(): boolean {
-  return (
-    config.qwen.chatPoolSize > 0 &&
-    !isAuthMockEnabled() &&
-    !config.qwen.personalizationFromRequest
-  );
-}
-
-async function acquireNewQwenChatSession(
-  headers: Record<string, string>,
-  model: string,
-  accountId?: string,
-): Promise<{ chatId: string; leasedFromPool: boolean }> {
-  if (isQwenChatPoolEnabled()) {
-    const key = chatPoolKey(accountId, model);
-    const pooled = precreatedChatSessions.get(key);
-    const chatId = pooled?.shift();
-
-    if (chatId) {
-      logger.debug("[Qwen] using pooled chat", {
-        accountId: accountId || "global",
-        model,
-        chatId,
-      });
-
-      // Proactive refill when pool drops below low-water mark
-      markWarmChatInFlight(accountId, model, chatId);
-
-      if (
-        (pooled?.length ?? 0) < WARM_POOL_LOW_WATER &&
-        !precreatingChatSessions.has(key)
-      ) {
-        void refillQwenChatPool(headers, model, accountId);
-      } else {
-        void scheduleQwenChatPoolRefill(headers, model, accountId);
-      }
-      return { chatId, leasedFromPool: true };
-    }
-  }
-
-  const created = await createQwenChatSession(headers, model, accountId);
-  logger.debug("[Qwen] created fresh chat", {
-    accountId: accountId || "global",
-    model,
-    chatId: created,
-  });
-  if (isQwenChatPoolEnabled()) {
-    void scheduleQwenChatPoolRefill(headers, model, accountId);
-  }
-  return { chatId: created, leasedFromPool: false };
-}
-
-async function refillQwenChatPool(
-  headers: Record<string, string>,
-  model: string,
-  accountId?: string,
-): Promise<void> {
-  if (!isQwenChatPoolEnabled()) return;
-  const targetSize = config.qwen.chatPoolSize;
-
-  const key = chatPoolKey(accountId, model);
-  const pooled = precreatedChatSessions.get(key) ?? [];
-  if (pooled.length >= targetSize || precreatingChatSessions.has(key)) return;
-
-  precreatingChatSessions.add(key);
-  try {
-    // Reuse existing unused chats before creating new ones
-    const existingIds = new Set(precreatedChatSessions.get(key) ?? []);
-    let reused = 0;
-    try {
-      const unusedChats = await fetchUnusedChats(headers, accountId);
-      for (const chatId of unusedChats) {
-        if ((precreatedChatSessions.get(key)?.length ?? 0) >= targetSize) break;
-        if (existingIds.has(chatId)) continue;
-        if (isWarmChatInFlight(accountId, model, chatId)) continue;
-        const current = precreatedChatSessions.get(key) ?? [];
-        current.push(chatId);
-        precreatedChatSessions.set(key, current);
-        existingIds.add(chatId);
-        reused++;
-      }
-      if (reused > 0) {
-        console.log(
-          `[WarmPool] Reused ${reused} existing unused chats for ${accountId || "global"}`,
-        );
-      }
-    } catch (err: any) {
-      console.warn(
-        `[WarmPool] Failed to fetch unused chats for ${accountId || "global"}:`,
-        err.message,
-      );
-    }
-
-    // Create remaining chats needed
-    let isFirst = true;
-    while ((precreatedChatSessions.get(key)?.length ?? 0) < targetSize) {
-      if (!isFirst) {
-        // Reduced delay for faster warm pool filling (upstream: 3806cf6)
-        await sleep(300 + Math.floor(Math.random() * 700));
-      }
-      isFirst = false;
-      const chatId = await createQwenChatSession(headers, model, accountId);
-      const current = precreatedChatSessions.get(key) ?? [];
-      current.push(chatId);
-      precreatedChatSessions.set(key, current);
-    }
-  } catch (err: any) {
-    // Mark account as rate-limited if chat creation fails with RateLimited error
-    if (err instanceof QwenUpstreamError) {
-      if (err.upstreamCode === "RateLimited" || err.upstreamStatus === 429) {
-        const hourHint = err.message?.match(/Wait about (\d+) hour/);
-        const cooldownMs = hourHint
-          ? parseInt(hourHint[1]) * 60 * 60 * 1000
-          : undefined;
-        markAccountRateLimited(
-          accountId || "global",
-          cooldownMs,
-          "RateLimited",
-        );
-        console.warn(
-          `[WarmPool] Account ${accountId || "global"} rate-limited during chat creation. Marked for cooldown.`,
-        );
-      }
-    }
-    if (isToolcallDebugEnabled()) {
-      logger.debug("[Qwen] Failed to refill chat pool", {
-        accountId: accountId || "global",
-        model,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  } finally {
-    precreatingChatSessions.delete(key);
-  }
-}
-
-function scheduleQwenChatPoolRefill(
-  headers: Record<string, string>,
-  model: string,
-  accountId?: string,
-): void {
-  setTimeout(() => {
-    void refillQwenChatPool(headers, model, accountId);
-  }, 250);
-}
-
-export async function warmQwenChatPool(
-  accountId: string | undefined,
-  modelId: string,
-): Promise<void> {
-  if (!isQwenChatPoolEnabled()) return;
-  const { headers } = await getQwenHeaders(false, accountId);
-  await refillQwenChatPool(
-    headers,
-    mapClientModelToQwen(modelId),
-    accountId,
-  );
-}
 
 function isQwenChatNotExistMessage(details: string): boolean {
   return (
@@ -3097,6 +2358,8 @@ export async function createQwenStream(
     reasoningMode?: "auto" | "thinking" | "fast";
     /** Auxiliary stream (title on its own chat): short idle cap. */
     parallelEscape?: boolean;
+    /** "thread" (chat_mode:"normal") or "temp" (chat_mode:"local"). */
+    chatMode?: ChatMode;
   },
   signal?: AbortSignal,
 ): Promise<{
@@ -3169,6 +2432,8 @@ async function createQwenStreamInternal(
     reasoningMode?: "auto" | "thinking" | "fast";
     /** Auxiliary stream (title on its own chat): short idle cap. */
     parallelEscape?: boolean;
+    /** "thread" (chat_mode:"normal") or "temp" (chat_mode:"local"). */
+    chatMode?: ChatMode;
   } | undefined,
   signal: AbortSignal | undefined,
   releaseStreamLock: () => void,
@@ -3224,6 +2489,7 @@ async function createQwenStreamInternal(
         headers,
         model,
         accountId,
+        options?.chatMode ?? "thread",
       );
       chatSessionId = acquired.chatId;
       leasedWarmChat = acquired.leasedFromPool;
@@ -3238,6 +2504,7 @@ async function createQwenStreamInternal(
         headers,
         model,
         accountId,
+        options?.chatMode ?? "thread",
       );
       chatSessionId = acquired.chatId;
       leasedWarmChat = acquired.leasedFromPool;
@@ -3294,20 +2561,19 @@ async function createQwenStreamInternal(
     }
 
     // Dynamic idle timeout based on model type and payload size
-    // Reasoning models (thinking enabled): use REASONING_MODEL_TIMEOUT as base (600s default)
-    // Non-reasoning models: use IDLE_STREAM_TIMEOUT as base (60s default)
-    // Both add 30s per MB of payload
+    // Reasoning models (thinking enabled): use REASONING_MODEL_TIMEOUT as base
+    // Non-reasoning models: use IDLE_STREAM_TIMEOUT as base
+    // Both add 30s per MB of payload. Parallel-escape streams get a tight cap
+    // ONLY when non-thinking (see computeDynamicIdleTimeout).
     const baseTimeoutMs = enableThinking
       ? config.timeouts.reasoningModelTimeout
       : config.timeouts.idleStreamTimeout;
-    const payloadMB = payloadSize / (1024 * 1024);
-    // Auxiliary (parallel-escape) streams serve a small request (e.g. a chat
-    // title) that generates in seconds. The upstream sometimes never sends the
-    // SSE terminal event for these; a SHORT idle cap frees the account slot in
-    // ~15s instead of holding it for minutes (observed: 183s → block).
-    const dynamicIdleTimeoutMs = options?.parallelEscape
-      ? Math.min(15_000, baseTimeoutMs + Math.ceil(payloadMB * 30_000))
-      : baseTimeoutMs + Math.ceil(payloadMB * 30_000);
+    const dynamicIdleTimeoutMs = computeDynamicIdleTimeout({
+      enableThinking,
+      parallelEscape: options?.parallelEscape,
+      baseTimeoutMs,
+      payloadSize,
+    });
 
     logger.debug("[Qwen] dynamic idle timeout", {
       chatId: chatSessionId || "new",
@@ -3373,7 +2639,7 @@ async function createQwenStreamInternal(
     chatId: chatSessionId || null,
     parentId: actualParentId ?? "",
     chat_id: chatSessionId || null,
-    chat_mode: "normal",
+    chat_mode: options?.chatMode === "temp" ? "local" : "normal",
     model: model,
     parent_id: actualParentId,
     messages: [

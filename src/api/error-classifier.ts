@@ -6,6 +6,8 @@ import {
   ValidationError,
   UpstreamRateLimit,
   UpstreamError,
+  UpstreamTimeout,
+  ServiceUnavailable,
   ClientAbortedError,
 } from "../core/errors.js";
 import {
@@ -90,6 +92,49 @@ export function classifyError(err: unknown): QwenProxyError {
     (err as Error & { code?: string }).code === "account_busy"
   ) {
     return new UpstreamRateLimit(err.message);
+  }
+
+  // Some call sites attach an explicit hint on a plain Error (e.g.
+  // acquireUpstreamStream sets upstreamStatus=429 when the whole pool is in
+  // cooldown). Respect it instead of falling through to a misleading 500.
+  const rawError = err as Error | null | undefined;
+
+  // A mutex acquire timeout (chat lock / personalization lock / playwright
+  // page lock) means the resource is BUSY, not broken — the holder is a
+  // legitimate long generation or a stuck-but-recoverable page op. Mapping it
+  // to 500 made every concurrent request on a long chat turn fail hard with
+  // internal_server_error (2026-08-22 production log). Surface as retryable
+  // 503 so the client (or the retry policy) can wait and re-request.
+  if (
+    rawError instanceof Error &&
+    rawError.message.startsWith("Mutex[") &&
+    rawError.message.includes("acquire timeout")
+  ) {
+    return new ServiceUnavailable(
+      `Resource busy (${rawError.message.substring(0, 200)}). Retry shortly.`,
+    );
+  }
+
+  const statusHint = (err as Error & { upstreamStatus?: number })?.upstreamStatus;
+  if (typeof statusHint === "number") {
+    const message =
+      rawError instanceof Error
+        ? rawError.message
+        : typeof err === "string"
+          ? err
+          : "Unknown upstream error";
+    switch (statusHint) {
+      case 429:
+        return new UpstreamRateLimit(message);
+      case 502:
+        return new UpstreamError(message);
+      case 503:
+        return new ServiceUnavailable(message);
+      case 504:
+        return new UpstreamTimeout(message);
+      default:
+        break; // unknown hint: fall through to the normal mapping
+    }
   }
 
   if (err instanceof ZodError) {
