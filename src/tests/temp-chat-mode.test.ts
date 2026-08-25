@@ -83,7 +83,7 @@ function installCompletionCapture() {
         start(controller) {
           controller.enqueue(
             encoder.encode(
-              'data: {"choices": [{"delta": {"phase": "answer", "content": "ok"}}]}\n\n',
+              'data: {"choices": [{"delta": {"phase": "answer", "content": "Hello from temp mode!"}}]}\n\n',
             ),
           );
           controller.enqueue(
