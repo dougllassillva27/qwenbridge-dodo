@@ -23,7 +23,7 @@ import {
   handleChatCompletionsError,
   type AssistantCompleteEvent,
 } from "./streaming.ts";
-import { config } from "../../core/config.ts";
+import { config, type ChatMode } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
 import { getContextMeterHeaders, type ContextMeterMode } from "../../services/context-meter.ts";
 import {
@@ -33,7 +33,6 @@ import {
 } from "../../services/qwen.ts";
 import {
   classifyRetryAction,
-  shouldRetryChatInProgressOnSameAccount,
   shouldRetryInvalidInputOnSameAccount,
 } from "./retry-policy.ts";
 import { classifyMediaModel } from "../../services/media-generation.ts";
@@ -47,6 +46,16 @@ function formatTimingHeader(timings: Record<string, number>): string {
   return Object.entries(timings)
     .map(([key, value]) => `${key}=${Math.max(0, Math.round(value))}`)
     .join(";");
+}
+
+/**
+ * Per-request chat-mode override (X-QwenProxy-Chat-Mode) falls back to the
+ * QWEN_CHAT_MODE env default. Only the two known modes are accepted; anything
+ * else silently uses the configured default.
+ */
+function resolveChatMode(headerValue: string | undefined): ChatMode {
+  if (headerValue === "thread" || headerValue === "temp") return headerValue;
+  return config.qwen.chatMode;
 }
 
 export async function chatCompletions(c: Context) {
@@ -110,6 +119,7 @@ export async function chatCompletions(c: Context) {
     }
 
     stepStartedAt = Date.now();
+    const chatMode = resolveChatMode(c.req.header("x-qwenproxy-chat-mode"));
     const ctx = await buildFinalContext({
       messages,
       systemPrompt,
@@ -120,6 +130,7 @@ export async function chatCompletions(c: Context) {
       enableThinking,
       conversationKey,
       hasExplicitConversationKey: parsed.hasExplicitConversationKey,
+      chatMode,
     });
     mark("context", stepStartedAt);
 
@@ -234,6 +245,7 @@ export async function chatCompletions(c: Context) {
       requestSignal: c.req.raw.signal,
       messages,
       parallelEscape,
+      chatMode,
     });
 
 
@@ -303,6 +315,7 @@ export async function chatCompletions(c: Context) {
           ? false
           : ctx.updateLogicalThread,
         parallelEscape,
+        chatMode,
         allowThreadReuse: ctx.allowThreadReuse,
         messageCount: msgCount,
         fullMessageCount: parsed.messageCount,
@@ -326,7 +339,6 @@ export async function chatCompletions(c: Context) {
     // Retry loop for mid-stream/create-stream failures (generic policy)
         let streamProcessingRetries = Math.max(0, config.retry.maxAttempts - 1);
         let invalidInputSameAccountRetries = 0;
-        let chatInProgressSameAccountRetries = 0;
         let currentStreamResult = streamResult;
         let currentParams = params;
 
@@ -351,6 +363,16 @@ export async function chatCompletions(c: Context) {
 
             if (policy.reason === "corrupted_chat_history") {
               invalidateLogicalThreadParent(ctx.sessionId);
+            }
+
+            if (policy.reason === "chat_in_progress") {
+              // The same-chat settle budget AND the single bounded escalation
+              // (fresh chat + full replay) were already spent at the create path
+              // before this error surfaced. A request-level retry would restart
+              // that whole budget and replay the full context again. Surface the
+              // error; the inner loop already cleared the origin binding, so the
+              // client's own retry starts a fresh chat.
+              throw streamErr;
             }
 
             // Prefer explicit RetryableQwenStreamError OR generic retryable policy
@@ -388,18 +410,8 @@ export async function chatCompletions(c: Context) {
             if (retryInvalidInputOnSameAccount) {
               invalidInputSameAccountRetries++;
             }
-            const retryChatInProgressOnSameAccount =
-              shouldRetryChatInProgressOnSameAccount(
-                policy.reason,
-                chatInProgressSameAccountRetries,
-              );
-            if (retryChatInProgressOnSameAccount) {
-              chatInProgressSameAccountRetries++;
-            }
             const switchAccount =
-              (policy.switchAccount && !retryInvalidInputOnSameAccount) ||
-              (policy.reason === "chat_in_progress" &&
-                !retryChatInProgressOnSameAccount);
+              policy.switchAccount && !retryInvalidInputOnSameAccount;
             const forceRetryNewChat = policy.forceNewChat;
             const retryWithFullPrompt = policy.retryWithFullPrompt;
             const retryFiles = policy.dropFiles ? [] : files;
@@ -513,6 +525,7 @@ export async function chatCompletions(c: Context) {
               requestSignal: c.req.raw.signal,
               messages,
               parallelEscape: retryParallelEscape,
+              chatMode,
             });
 
             if ("error" in newStreamResult) {
@@ -563,6 +576,7 @@ export async function chatCompletions(c: Context) {
                   ? false
                   : ctx.updateLogicalThread,
                 parallelEscape: retryParallelEscape,
+                chatMode,
                 allowThreadReuse: ctx.allowThreadReuse,
                 messageCount: retryMessageCount,
                 fullMessageCount: parsed.messageCount,

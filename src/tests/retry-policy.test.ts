@@ -7,7 +7,6 @@ delete process.env.API_KEY;
 import {
   classifyRetryAction,
   isTerminalLocalError,
-  parseSseErrorFromBuffer,
   shouldRetryChatInProgressOnSameAccount,
   shouldRetryInvalidInputOnSameAccount,
   throwFromSseUpstreamError,
@@ -137,7 +136,7 @@ test("invalid_input retries a clean chat once before account rotation", () => {
   );
 });
 
-test("chat_in_progress allows three same-account retries before rotating", () => {
+test("chat_in_progress allows three same-account recovery retries, then gives up (no escalation)", () => {
   assert.equal(
     shouldRetryChatInProgressOnSameAccount("chat_in_progress", 0),
     true,
@@ -430,24 +429,6 @@ test("toRetryableStreamError merges policy defaults with options", () => {
   assert.equal(err.forceNewChat, true);
   assert.equal(err.switchAccount, true);
   assert.equal(err.retryAfterMs, 2000);
-});
-
-test("parseSseErrorFromBuffer extracts first data error chunk", () => {
-  const parsed = parseSseErrorFromBuffer(
-    'data: {"error":{"code":"quota_limit","details":"alta demanda"}}\n\n',
-  );
-  assert.deepEqual(parsed, {
-    code: "quota_limit",
-    details: "alta demanda",
-  });
-
-  assert.equal(parseSseErrorFromBuffer("data: [DONE]\n\n"), null);
-  assert.equal(
-    parseSseErrorFromBuffer(
-      'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n',
-    ),
-    null,
-  );
 });
 
 test("classifyRetryAction: content moderation (data_inspection_failed) is not retryable", () => {

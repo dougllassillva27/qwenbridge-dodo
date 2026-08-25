@@ -6,6 +6,7 @@
  */
 
 import { config } from "../../core/config.ts";
+import { computeQuotaCooldownMs } from "../../core/account-manager.ts";
 import { logger } from "../../core/logger.ts";
 import {
   PersonalizationSyncError,
@@ -286,7 +287,6 @@ function classifyQuotaCooldown(message: string): {
   accountCooldownReason: string;
 } {
   const lower = message.toLowerCase();
-  const hourHint = message.match(/Wait about (\d+) hour/i);
   const temporary =
     lower.includes("rate increased too quickly") ||
     lower.includes("request rate increased too quickly") ||
@@ -295,19 +295,35 @@ function classifyQuotaCooldown(message: string): {
     lower.includes("tente novamente mais tarde") ||
     lower.includes("try again later");
 
+  if (temporary) {
+    return {
+      accountCooldownMs: 2 * 60 * 1000,
+      accountCooldownReason: "RateLimitTemporary",
+    };
+  }
+
+  // REAL daily quota: the Qwen resets the account at the next UTC midnight
+  // (verified against 2026-08-21 production log: every proxy `until` matched
+  // the next 00:00 UTC exactly). The upstream "Wait about N hour(s)" hint is
+  // ONLY accurate when the error lands mid-day; near midnight it rounds UP to
+  // N≈24 while the real reset is minutes away (mzgns errored 23:37, hint
+  // "23h", but the account was usable 23 minutes later). Trust the daily
+  // reset, never the literal hint, never a blind 24h.
   return {
-    accountCooldownMs: hourHint
-      ? parseInt(hourHint[1], 10) * 60 * 60 * 1000
-      : temporary
-        ? 2 * 60 * 1000
-        : undefined,
-    accountCooldownReason: temporary
-      ? "RateLimitTemporary"
-      : hourHint
-        ? "RateLimited"
-        : "QuotaExceeded",
+    accountCooldownMs: computeQuotaCooldownMs(Date.now()),
+    accountCooldownReason: "RateLimited",
   };
 }
+
+/**
+ * Milliseconds until the next UTC midnight plus a small safety margin. The
+ * Qwen daily quota resets at 00:00 UTC, so this is the correct "when is this
+ * account usable again" for a quota exhaust — regardless of what the upstream
+ * "Wait about N hour(s)" hint guessed.
+ */
+// Implemented in core/account-manager.ts (shared with the @[] fallback); kept
+// re-exporting here for callers that already import from retry-policy.
+export { computeQuotaCooldownMs } from "../../core/account-manager.ts";
 
 export function isChatNotExistError(err: unknown): boolean {
   const message = errMessage(err).toLowerCase();
@@ -378,6 +394,27 @@ export function isCorruptedChatHistoryError(err: unknown): boolean {
 }
 
 /**
+ * Build a RetryAction with sane defaults so each classification branch only
+ * spells out the fields it actually changes. Defaults: retryable, no account
+ * switch, same chat, delta replay, no delay. Branch ordering below is
+ * load-bearing (specific recoveries must win over broad substring matches).
+ */
+function makeRetryAction(
+  reason: string,
+  overrides: Partial<Omit<RetryAction, "reason">> = {},
+): RetryAction {
+  return {
+    retryable: true,
+    switchAccount: false,
+    forceNewChat: false,
+    retryWithFullPrompt: false,
+    retryAfterMs: 0,
+    ...overrides,
+    reason,
+  };
+}
+
+/**
  * Generic recovery policy for create-stream + mid-stream failures.
  * Unknown upstream errors are retryable by default when enabled in config.
  */
@@ -399,40 +436,22 @@ export function classifyRetryAction(
       options?.requestAborted === true,
     )
   ) {
-    return {
-      retryable: false,
-      switchAccount: false,
-      forceNewChat: false,
-      retryWithFullPrompt: false,
-      retryAfterMs: 0,
-      reason: "client_abort",
-    };
+    return makeRetryAction("client_abort", { retryable: false });
   }
 
   if (isTerminalLocalError(err)) {
-    return {
-      retryable: false,
-      switchAccount: false,
-      forceNewChat: false,
-      retryWithFullPrompt: false,
-      retryAfterMs: 0,
-      reason: "terminal_local",
-    };
+    return makeRetryAction("terminal_local", { retryable: false });
   }
 
   const message = errMessage(err).toLowerCase();
   const code = errCode(err).toLowerCase();
   if (isAccountInitializationError(err)) {
-    return {
-      retryable: true,
+    return makeRetryAction("account_initialization_failed", {
       switchAccount: true,
-      forceNewChat: false,
-      retryWithFullPrompt: false,
       retryAfterMs: Math.min(baseDelayMs, 1_000),
       accountCooldownMs: config.concurrency.initFailureCooldownMs,
       accountCooldownReason: "AuthInitFailed",
-      reason: "account_initialization_failed",
-    };
+    });
   }
 
   if (
@@ -440,28 +459,21 @@ export function classifyRetryAction(
     message.includes("waiting for a free slot") ||
     message.includes("busy: timed out")
   ) {
-    return {
-      retryable: true,
+    return makeRetryAction("account_busy", {
       switchAccount: true,
-      forceNewChat: false,
-      retryWithFullPrompt: false,
       retryAfterMs: Math.min(baseDelayMs, 1_000),
-      reason: "account_busy",
-    };
+    });
   }
 
   // Agent instructions ride ONLY the account-level personalization. An
   // unconfirmed sync means this account cannot serve the request as-is —
   // rotate to another account (each attempt re-syncs on its own account).
   if (err instanceof PersonalizationSyncError) {
-    return {
-      retryable: true,
+    return makeRetryAction("personalization_sync_failed", {
       switchAccount: true,
       forceNewChat: true,
-      retryWithFullPrompt: false,
       retryAfterMs: baseDelayMs,
-      reason: "personalization_sync_failed",
-    };
+    });
   }
 
   // Specialized recoveries first (even if wrapped as RetryableQwenStreamError)
@@ -469,106 +481,75 @@ export function classifyRetryAction(
     // Try a fresh chat on the SAME account first — the corruption is in the
     // upstream parent chain, not the account. Only rotate if the rebuild fails.
     if (isCorruptedChatHistoryError(err)) {
-      return {
-        retryable: true,
-        switchAccount: false,
+      return makeRetryAction("corrupted_chat_history", {
         forceNewChat: true,
         retryWithFullPrompt: true,
-        retryAfterMs: 0,
-        reason: "corrupted_chat_history",
-      };
+      });
     }
 
     // Chat missing must win over broad "invalid input" substring matches.
     if (isChatNotExistError(err) || isChatInProgressError(err)) {
       const typed = err as RetryableStreamError;
       const inProgress = isChatInProgressError(err);
-      return {
-        retryable: true,
-        // chat_in_progress: do NOT switch immediately — the account is just
-        // temporarily busy. Escalation to switch happens in tryCreateStreamWithRetry
-        // after repeated failures on the same account.
-        switchAccount: inProgress ? false : false,
-        forceNewChat: !inProgress, // chat_not_exist needs a new chat; in_progress retries same first
+      // chat_in_progress: do NOT switch immediately — the account is just
+      // temporarily busy (escalation happens in tryCreateStreamWithRetry after
+      // repeated failures). chat_not_exist needs a new chat + full replay;
+      // in_progress retries the same chat first.
+      return makeRetryAction(inProgress ? "chat_in_progress" : "chat_not_exist", {
+        forceNewChat: !inProgress,
         retryWithFullPrompt: !inProgress,
         retryAfterMs: inProgress
           ? (typed.retryAfterMs ?? config.retry.chatInProgressDelayMs)
           : (typed.retryAfterMs ?? 0),
-        reason: inProgress ? "chat_in_progress" : "chat_not_exist",
-      };
+      });
     }
 
     if (isInvalidInputError(err)) {
       const typed = err as RetryableStreamError;
-      return {
-        retryable: true,
+      return makeRetryAction("invalid_input", {
         switchAccount: typed.switchAccount !== false,
         forceNewChat: true,
         retryWithFullPrompt: true,
         retryAfterMs: typed.retryAfterMs ?? baseDelayMs,
-        reason: "invalid_input",
         dropFiles: typed.dropFiles,
-      };
+      });
     }
 
     // Content moderation rejections are deterministic — retrying on any
     // account with the same content produces the same rejection. Fail fast
     // instead of burning through accounts, personalization syncs and captchas.
     if (isContentModerationError(err)) {
-      return {
-        retryable: false,
-        switchAccount: false,
-        forceNewChat: false,
-        retryWithFullPrompt: false,
-        retryAfterMs: 0,
-        reason: "content_moderation",
-      };
+      return makeRetryAction("content_moderation", { retryable: false });
     }
 
     // Model not found is equally deterministic (the account cannot serve the
     // requested model). Fail fast with a clear error instead of retrying the
     // same doomed request and cooldown-marking accounts for ~5 hours.
     if (isModelNotFoundError(err)) {
-      return {
-        retryable: false,
-        switchAccount: false,
-        forceNewChat: false,
-        retryWithFullPrompt: false,
-        retryAfterMs: 0,
-        reason: "model_not_found",
-      };
+      return makeRetryAction("model_not_found", { retryable: false });
     }
 
     if (isAntiBotError(err)) {
       // WAF/captcha is only identified here. Retry the same request on the
       // same account immediately; recovery, cooldown and account rotation are
       // intentionally left out so the failure path stays observable.
-      return {
-        retryable: true,
-        switchAccount: false,
-        forceNewChat: false,
-        retryWithFullPrompt: false,
-        retryAfterMs: 0,
-        reason: "anti_bot",
-      };
+      return makeRetryAction("anti_bot");
     }
 
     if (isQuotaLikeError(err)) {
       const typed = err as RetryableStreamError;
       const quota = classifyQuotaCooldown(errMessage(err));
       const isTemporary = quota.accountCooldownReason === "RateLimitTemporary";
-      return {
-        retryable: true,
-        // Temporary load shedding: retry same account first, only switch on
-        // repeated failure. Real quota exhaustion: switch immediately.
+      // Temporary load shedding: retry same account first, only switch on
+      // repeated failure. Real quota exhaustion: switch immediately.
+      return makeRetryAction("quota_or_rate_limit", {
         switchAccount: isTemporary ? false : typed.switchAccount !== false,
         forceNewChat: typed.forceNewChat === true,
         retryWithFullPrompt: typed.retryWithFullPrompt === true,
         retryAfterMs: typed.retryAfterMs ?? (isTemporary ? 3_000 : baseDelayMs),
         accountCooldownMs: quota.accountCooldownMs,
         accountCooldownReason: quota.accountCooldownReason,
-        reason: "quota_or_rate_limit",
-      };
+      });
     }
 
     if (
@@ -578,63 +559,51 @@ export function classifyRetryAction(
         isAbortError(err)
       ) {
         const typed = err as RetryableStreamError;
-        return {
-          retryable: true,
-          switchAccount: typed.switchAccount !== false,
-          forceNewChat: true,
-          retryWithFullPrompt: typed.retryWithFullPrompt === true,
-          retryAfterMs:
-            typed.retryAfterMs ??
-            (isNetworkLikeError(err)
-              ? 3000
-              : err instanceof QwenUpstreamUnavailableError
-                ? 2000
-                : Math.min(baseDelayMs * 2, 3000)),
-          reason:
-            isNetworkLikeError(err)
-              ? "network"
-              : err instanceof QwenUpstreamUnavailableError
-                ? "upstream_unavailable"
-                : isAbortError(err)
-                  ? "stream_aborted"
-                  : "upstream_error",
-        };
+        return makeRetryAction(
+          isNetworkLikeError(err)
+            ? "network"
+            : err instanceof QwenUpstreamUnavailableError
+              ? "upstream_unavailable"
+              : isAbortError(err)
+                ? "stream_aborted"
+                : "upstream_error",
+          {
+            switchAccount: typed.switchAccount !== false,
+            forceNewChat: true,
+            retryWithFullPrompt: typed.retryWithFullPrompt === true,
+            retryAfterMs:
+              typed.retryAfterMs ??
+              (isNetworkLikeError(err)
+                ? 3000
+                : err instanceof QwenUpstreamUnavailableError
+                  ? 2000
+                  : Math.min(baseDelayMs * 2, 3000)),
+          },
+        );
       }
 
     // Preserve explicit RetryableQwenStreamError flags for remaining cases
     if (err instanceof RetryableQwenStreamError) {
       const typed = err as RetryableStreamError;
-      return {
-        retryable: true,
-        // Default switch unless caller explicitly set switchAccount=false
+      // Default switch unless caller explicitly set switchAccount=false
+      return makeRetryAction("explicit_retryable", {
         switchAccount: typed.switchAccount !== false,
         forceNewChat: typed.forceNewChat === true,
         retryWithFullPrompt: typed.retryWithFullPrompt === true,
         retryAfterMs: typed.retryAfterMs ?? baseDelayMs,
-        reason: "explicit_retryable",
-      };
+      });
     }
 
   // Default for unknown failures: retry when policy enabled
   if (unknownEnabled) {
-    return {
-      retryable: true,
+    return makeRetryAction("unknown_upstream_default_retry", {
       switchAccount: true,
       forceNewChat: true,
-      retryWithFullPrompt: false,
       retryAfterMs: baseDelayMs,
-      reason: "unknown_upstream_default_retry",
-    };
+    });
   }
 
-  return {
-    retryable: false,
-    switchAccount: false,
-    forceNewChat: false,
-    retryWithFullPrompt: false,
-    retryAfterMs: 0,
-    reason: "unknown_not_retryable",
-  };
+  return makeRetryAction("unknown_not_retryable", { retryable: false });
 }
 
 /** Build a RetryableQwenStreamError for SSE/mid-stream failures with policy flags. */
@@ -782,31 +751,4 @@ export function throwFromSseUpstreamError(
   }
 
   throw toRetryableStreamError(normalizedErrCode, errDetails);
-}
-
-export function parseSseErrorFromBuffer(
-  buffer: string,
-): { code: string; details: string } | null {
-  const lines = buffer.split("\n");
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("data:")) continue;
-    const dataStr = trimmed.slice(5).trimStart();
-    if (!dataStr || dataStr === "[DONE]") continue;
-    try {
-      const chunk = JSON.parse(dataStr);
-      if (chunk?.error) {
-        return {
-          code: chunk.error.code || "upstream_error",
-          details:
-            chunk.error.details ||
-            chunk.error.message ||
-            JSON.stringify(chunk.error),
-        };
-      }
-    } catch {
-      // ignore non-JSON SSE lines
-    }
-  }
-  return null;
 }
