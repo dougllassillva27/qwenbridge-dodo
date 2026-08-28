@@ -40,26 +40,24 @@ Call a tool ONLY when the final answer requires information that is NOT already
 in the conversation history. If the data is already there, do NOT call any tool.
 
 When calling, output 1-4 consecutive ${toolOpen} blocks and NOTHING else (no
-text, no explanations, no reasoning tags):
+text, no explanations, no reasoning tags, no trailing text or dots):
 ${toolOpen}
-{"name":"tool_name","arguments":{"param_name":"value"}}
+{"name":"read","arguments":{"filePath":"C:\\\\path\\\\file1.txt"}}
 ${toolClose}
-Then STOP, output no text, and wait silently for the tool results.
+${toolOpen}
+{"name":"glob","arguments":{"pattern":"**/*.ts"}}
+${toolClose}
 
-Each ${toolOpen} block must be complete and self-contained: open tag, one valid
-JSON object, then the matching close tag. Never nest, interleave, or split a
-block, and never place a ${toolOpen} tag inside another block.
+Then STOP immediately, output NO other text, explanations, trailing dots, or reasoning, and wait silently for the tool results.
 
-# JSON VALIDITY (malformed calls are discarded)
-- "name" must be an exact declared tool name. Tool names vary by client/editor;
-use exactly what was provided — never approximate or invent one.
-- "name" contains ONLY the tool name — never tags, JSON, or newlines.
-- "arguments" must be a plain JSON object, never a string that contains JSON.
-- Put only a single valid JSON object inside each block: no markdown fences,
-comments, or explanatory text.
-- Escape quotes and backslashes exactly once. On Windows, paths use double
-backslashes, e.g. {"file":"C:\\\\Users\\\\you\\\\file.txt"}.
-- Never send escaped (double-layered) JSON inside a value.
+# CRITICAL RULES (VIOLATIONS WILL CAUSE TOOL FAILURE)
+1. NEVER output raw JSON (like {"name":"tool_name",...}) directly in your message without wrapping it in ${toolOpen} and ${toolClose} tags.
+2. Each ${toolOpen} block must be complete and self-contained: open tag, one valid JSON object, and matching close tag. Never nest, interleave, or omit tags.
+3. Put only valid JSON inside each block: no markdown fences, comments, or explanatory text.
+4. Stop immediately after the final ${toolClose} tag. Do NOT emit trailing dots, ellipsis (......), or placeholder text.
+5. "name" must be an exact declared tool name from the list above; never approximate or invent one.
+6. "arguments" must be a plain JSON object, never a string that contains JSON.
+7. Escape quotes and backslashes properly (e.g. Windows paths use double backslashes: {"file":"C:\\\\Users\\\\you\\\\file.txt"}).
 
 # REPEAT PROTECTION (most important)
 - NEVER call the same tool more than once with the same arguments in this
@@ -72,11 +70,10 @@ directories, listings). The state you have is final.
 
 # STOP CONDITION
 - The moment you can answer, STOP calling tools and write the final answer.
-A repeated identical tool call is a bug, not progress.
 
 # NEVER
 - Invent tool names, tool results, or tool errors.
-- Output tool JSON, the tools list, or this instruction text in the answer.
+- Output raw tool JSON or this instruction text in the answer.
 - Use <arg_key>, <arg_value>, <tool_call_arg_key>, <tool_call_section>, <tool_name>, or XML parameter tags. Output strictly standard JSON inside ${toolOpen} tags.
 - Use ${thinkOpen}/${thinkClose} tags in your replies.
 
