@@ -50,6 +50,7 @@ const envSchema = z
     PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("2"),
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
+    CAPTCHA_RESOLVER_URL: z.string().default("http://127.0.0.1:50006"),
     CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
     CAPTCHA_SOLVER_TIMEOUT_MS: z.string().default("15000"),
     CAPTCHA_SOLVER_RETRY_DELAY_MS: z.string().default("1000"),
@@ -198,6 +199,7 @@ export const config = {
   },
   captcha: {
     enabled: env.CAPTCHA_SOLVER_ENABLED === "true",
+    resolverUrl: env.CAPTCHA_RESOLVER_URL,
     maxAttempts: Math.max(1, Math.min(5, parseInt(env.CAPTCHA_SOLVER_MAX_ATTEMPTS))),
     timeoutMs: Math.max(0, parseInt(env.CAPTCHA_SOLVER_TIMEOUT_MS)),
     retryDelayMs: Math.max(0, parseInt(env.CAPTCHA_SOLVER_RETRY_DELAY_MS)),
