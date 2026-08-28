@@ -21,6 +21,10 @@ ensure_writable_dir /app/data/db
 ensure_writable_dir /app/data/qwen_profiles
 ensure_writable_dir /tmp/playwright
 
+mkdir -p /tmp/.X11-unix
+chmod 1777 /tmp/.X11-unix
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
+
 # Clean stale Chromium locks across all persistent profiles
 find /app/data/qwen_profiles -name "Singleton*" -delete 2>/dev/null || true
 
@@ -28,8 +32,9 @@ find /app/data/qwen_profiles -name "Singleton*" -delete 2>/dev/null || true
 # This provides a real 1920x1080 visual rendering surface so Chromium runs in headed mode,
 # completely bypassing Alibaba headless anti-bot detection while remaining invisible.
 export DISPLAY=:99
-Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -nolisten unix >/dev/null 2>&1 &
+Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -ac +extension GLX +render -noreset >/dev/null 2>&1 &
 XVFB_PID=$!
+sleep 1
 
 cleanup() {
   kill -9 "$XVFB_PID" 2>/dev/null || true
