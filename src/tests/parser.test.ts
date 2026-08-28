@@ -740,3 +740,239 @@ test("StreamingToolParser: drops duplicate incremental tool calls before emittin
   const nameDeltas = deltas.filter((delta) => delta.function?.name);
   assert.strictEqual(nameDeltas.length, 1, "duplicate call deltas must not be emitted");
 });
+
+test("StreamingToolParser: parses Qwen pseudo-XML <tool_call_arg_key> format", () => {
+  const CLARIFY_TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "clarify",
+        description: "Ask clarifying questions",
+        parameters: {
+          type: "object",
+          properties: {
+            questions: { type: "array" },
+            question: { type: "string" },
+          },
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(CLARIFY_TOOLS);
+  const rawInput =
+    'Claro! Posso te ajudar.\n\n' +
+    '<tool_call_arg_key>name</arg_key> <arg_value>clarify</arg_value> ' +
+    '<arg_key name="questions">[{"id": "tipo_tarefa", "question": "Que tipo de tarefa?"}]</arg_value> ' +
+    '<arg_key name="question">Vamos configurar suas tarefas.</arg_value>';
+
+  const result = parser.feed(rawInput);
+  const flushed = parser.flush();
+
+  const toolCalls = [...result.toolCalls, ...flushed.toolCalls];
+  assert.strictEqual(toolCalls.length, 1);
+  assert.strictEqual(toolCalls[0].name, "clarify");
+  assert.deepStrictEqual((toolCalls[0].arguments as any).questions, [
+    { id: "tipo_tarefa", question: "Que tipo de tarefa?" },
+  ]);
+  assert.strictEqual(
+    (toolCalls[0].arguments as any).question,
+    "Vamos configurar suas tarefas.",
+  );
+  assert.strictEqual(result.text + flushed.text, "");
+});
+
+test("StreamingToolParser: parses <tool_call_section> <tool_name>memory</tool_name> view </tool_call_section>", () => {
+  const MEMORY_TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "memory",
+        description: "Memory tool",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string" },
+          },
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(MEMORY_TOOLS);
+  const rawInput =
+    "<tool_call_section> <tool_name>memory</tool_name> view </tool_call_section>";
+
+  const result = parser.feed(rawInput);
+  const flushed = parser.flush();
+
+  const toolCalls = [...result.toolCalls, ...flushed.toolCalls];
+  assert.strictEqual(toolCalls.length, 1);
+  assert.strictEqual(toolCalls[0].name, "memory");
+  assert.strictEqual((toolCalls[0].arguments as any).action, "view");
+});
+
+test("StreamingToolParser: parses <tool_call_> and multi-calls with trailing tags", () => {
+  const TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "session_search",
+        description: "Search session",
+        parameters: {
+          type: "object",
+          properties: {
+            query: { type: "string" },
+            limit: { type: "number" },
+          },
+        },
+      },
+    },
+    {
+      type: "function" as const,
+      function: {
+        name: "memory",
+        description: "Memory tool",
+        parameters: {
+          type: "object",
+          properties: {
+            action: { type: "string" },
+            target: { type: "string" },
+          },
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(TOOLS);
+  const rawInput =
+    '<tool_call_> {"name": "session_search", "arguments": {"query": "Sol nome", "limit": 5}} </tool_call_> ' +
+    '<tool_call_> {"name": "session_search", "arguments": {"query": "nome deveria ser Sol", "limit": 5}} </tool_call_> ' +
+    '<tool_call_> {"name": "memory", "arguments": {"action": "check", "target": "user"}} </tool_call_> ' +
+    '<tool_call_> {"name": "memory", "arguments": {"action": "check", "target": "memory"}} </tool_call_> </tool_call_>';
+
+  const result = parser.feed(rawInput);
+  const flushed = parser.flush();
+
+  const toolCalls = [...result.toolCalls, ...flushed.toolCalls];
+  assert.strictEqual(toolCalls.length, 4);
+  assert.strictEqual(toolCalls[0].name, "session_search");
+  assert.strictEqual((toolCalls[0].arguments as any).query, "Sol nome");
+  assert.strictEqual(toolCalls[1].name, "session_search");
+  assert.strictEqual((toolCalls[1].arguments as any).query, "nome deveria ser Sol");
+  assert.strictEqual(toolCalls[2].name, "memory");
+  assert.strictEqual((toolCalls[2].arguments as any).target, "user");
+  assert.strictEqual(toolCalls[3].name, "memory");
+  assert.strictEqual((toolCalls[3].arguments as any).target, "memory");
+});
+
+test("StreamingToolParser: parses HTML-escaped tool calls (<tool_call&gt; and &lt;tool_call&gt;)", () => {
+  const TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "cron_create",
+        description: "Create cron schedule",
+        parameters: {
+          type: "object",
+          properties: {
+            schedule: { type: "string" },
+            task: { type: "string" },
+          },
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(TOOLS);
+  const rawInput =
+    '<tool_call&gt; {"name": "cron_create", "arguments": {"schedule": "0 8 * * *", "task": "check_email"}} </tool_call&gt;';
+
+  const result = parser.feed(rawInput);
+  const flushed = parser.flush();
+
+  const toolCalls = [...result.toolCalls, ...flushed.toolCalls];
+  assert.strictEqual(toolCalls.length, 1);
+  assert.strictEqual(toolCalls[0].name, "cron_create");
+  assert.strictEqual((toolCalls[0].arguments as any).schedule, "0 8 * * *");
+  assert.strictEqual((toolCalls[0].arguments as any).task, "check_email");
+});
+
+test("StreamingToolParser: parses deformed <tool_call= with unclosed </tool_call tag", () => {
+  const TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "vision_analyze",
+        description: "Analyze image",
+        parameters: {
+          type: "object",
+          properties: {
+            image_url: { type: "string" },
+            question: { type: "string" },
+          },
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(TOOLS);
+  const rawInput =
+    '<tool_call=\n' +
+    '{"name":"vision_analyze","arguments":{"image_url":"C:\\\\Users\\\\Admin\\\\captcha2.png","question":"Qual é o texto exato?"}}\n' +
+    '</tool_call';
+
+  const result = parser.feed(rawInput);
+  const flushed = parser.flush();
+
+  const toolCalls = [...result.toolCalls, ...flushed.toolCalls];
+  assert.strictEqual(toolCalls.length, 1);
+  assert.strictEqual(toolCalls[0].name, "vision_analyze");
+  assert.strictEqual(
+    (toolCalls[0].arguments as any).image_url,
+    "C:\\Users\\Admin\\captcha2.png",
+  );
+  assert.strictEqual(
+    (toolCalls[0].arguments as any).question,
+    "Qual é o texto exato?",
+  );
+});
+
+test("StreamingToolParser: parses deformed <tool_call= streamed in chunks", () => {
+  const TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "vision_analyze",
+        description: "Analyze image",
+        parameters: {
+          type: "object",
+          properties: {
+            image_url: { type: "string" },
+            question: { type: "string" },
+          },
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(TOOLS);
+  const chunk1 = "Texto anterior antes do tool call.\n<tool_call=\n";
+  const chunk2 = '{"name":"vision_analyze","arguments":{"image_url":"C:\\\\path.png","question":"texto"}}\n';
+  const chunk3 = "</tool_call";
+
+  const res1 = parser.feed(chunk1);
+  const res2 = parser.feed(chunk2);
+  const res3 = parser.feed(chunk3);
+  const flushed = parser.flush();
+
+  const toolCalls = [
+    ...res1.toolCalls,
+    ...res2.toolCalls,
+    ...res3.toolCalls,
+    ...flushed.toolCalls,
+  ];
+  assert.strictEqual(toolCalls.length, 1);
+  assert.strictEqual(toolCalls[0].name, "vision_analyze");
+  assert.strictEqual((toolCalls[0].arguments as any).image_url, "C:\\path.png");
+});

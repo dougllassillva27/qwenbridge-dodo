@@ -52,6 +52,7 @@ import {
 import { logBuffer } from '../core/log-buffer.ts';
 import { getTopUsers, getModelUsage } from '../core/usage-tracker.ts';
 import { getModelContextWindow } from '../core/model-registry.ts';
+import { loadModelsWithVariants } from './models.ts';
 
 export const adminApp = new Hono();
 
@@ -109,13 +110,21 @@ function resetAllSessions(): void {
 }
 
 async function fetchFullModelCatalog(): Promise<any[]> {
+  try {
+    const { models } = await loadModelsWithVariants();
+    if (models && models.length > 0) {
+      return models;
+    }
+  } catch {}
   return [
-    { id: 'qwen3.6-plus', name: 'Qwen 3.6 Plus', context_window: 1000000, owned_by: 'qwen' },
-    { id: 'qwen3.6-plus-fast', name: 'Qwen 3.6 Plus (Fast)', context_window: 1000000, owned_by: 'qwen' },
     { id: 'qwen3.7-plus', name: 'Qwen 3.7 Plus', context_window: 1000000, owned_by: 'qwen' },
     { id: 'qwen3.7-plus-fast', name: 'Qwen 3.7 Plus (Fast)', context_window: 1000000, owned_by: 'qwen' },
-    { id: 'qwen-vl-max', name: 'Qwen VL Max', context_window: 32000, owned_by: 'qwen' },
-    { id: 'qwen-vl-plus', name: 'Qwen VL Plus', context_window: 32000, owned_by: 'qwen' },
+    { id: 'qwen3.7-plus-thinking', name: 'Qwen 3.7 Plus (Thinking)', context_window: 1000000, owned_by: 'qwen' },
+    { id: 'qwen3.7-max', name: 'Qwen 3.7 Max', context_window: 1000000, owned_by: 'qwen' },
+    { id: 'qwen3.7-max-fast', name: 'Qwen 3.7 Max (Fast)', context_window: 1000000, owned_by: 'qwen' },
+    { id: 'qwen3.8-max', name: 'Qwen 3.8 Max', context_window: 1000000, owned_by: 'qwen' },
+    { id: 'qwen3.8-max-fast', name: 'Qwen 3.8 Max (Fast)', context_window: 1000000, owned_by: 'qwen' },
+    { id: 'qwen3.8-max-thinking', name: 'Qwen 3.8 Max (Thinking)', context_window: 1000000, owned_by: 'qwen' },
   ];
 }
 

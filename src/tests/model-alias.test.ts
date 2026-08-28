@@ -5,10 +5,13 @@ import {
   stripThinkingSuffix,
 } from "../core/model-alias.ts";
 
-test("mapClientModelToQwen keeps qwen ids (stripping reasoning suffix)", () => {
+test("mapClientModelToQwen keeps qwen ids (stripping reasoning suffix and context brackets)", () => {
   assert.equal(mapClientModelToQwen("qwen3.7-plus"), "qwen3.7-plus");
   assert.equal(mapClientModelToQwen("qwen3.7-plus-fast"), "qwen3.7-plus");
   assert.equal(mapClientModelToQwen("qwen3.7-plus-thinking"), "qwen3.7-plus");
+  assert.equal(mapClientModelToQwen("qwen3.7-plus[1M]"), "qwen3.7-plus");
+  assert.equal(mapClientModelToQwen("qwen3.7-plus-thinking[1M]"), "qwen3.7-plus");
+  assert.equal(mapClientModelToQwen("qwen3.7-plus-fast[1M]"), "qwen3.7-plus");
   assert.equal(mapClientModelToQwen("qwen3.8-max"), "qwen3.8-max");
 });
 

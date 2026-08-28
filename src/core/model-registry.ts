@@ -71,13 +71,11 @@ function accountKey(accountId?: string): string {
 }
 
 export function getBaseModelId(modelId: string): string {
-  // `-fast` is the only public variant. Keep legacy suffixes normalized for
-  // account metadata lookups and old clients, without publishing them.
-  // Check `-no-thinking` before `-thinking` (the former ends with the latter).
-  if (modelId.endsWith("-no-thinking")) return modelId.slice(0, -12);
-  if (modelId.endsWith("-thinking")) return modelId.slice(0, -9);
-  if (modelId.endsWith("-fast")) return modelId.slice(0, -5);
-  return modelId;
+  let normalized = modelId.replace(/\[[^\]]+\]$/, "").trim();
+  if (normalized.endsWith("-no-thinking")) return normalized.slice(0, -12);
+  if (normalized.endsWith("-thinking")) return normalized.slice(0, -9);
+  if (normalized.endsWith("-fast")) return normalized.slice(0, -5);
+  return normalized;
 }
 
 function getAccountRegistry(accountId?: string): Map<string, RegistryEntry> {

@@ -43,4 +43,6 @@ resumo-de-trabalho.md
 _contexto-ia/
 docs/
 *.bat
+*.ps1
+manager.ps1
 message*.txt

@@ -235,6 +235,8 @@ app.use("/v1/*", async (c, next) => {
 });
 
 // Routes
+app.get("/version", (c) => c.json({ version: "1.0.0", name: "QwenBridge" }));
+app.get("/v1/version", (c) => c.json({ version: "1.0.0", name: "QwenBridge" }));
 app.route("", modelsApp);
 app.post("/v1/chat/completions", chatCompletions);
 app.post("/v1/chat/completions/stop", chatCompletionsStop);
@@ -269,9 +271,30 @@ for (const [from, to] of LEGACY_REDIRECTS) {
   app.all(from, (c) => c.redirect(to, 308));
 }
 
-// Compatibility probe routes (Continue.dev, Ollama client probes, etc.)
+// Compatibility probe routes (Continue.dev, Ollama, Hermes, llama.cpp client probes, etc.)
 app.all("/api/hello", (c) => c.text("QwenBridge is running", 200));
 app.all("/api/version", (c) => c.json({ version: "1.0.0" }, 200));
+
+const handleProps = (c: Context) => {
+  return c.json({
+    version: "1.0.0",
+    chat_template: "chatml",
+    total_slots: 1,
+    default_generation_settings: {
+      n_ctx: 1048576,
+      n_predict: 16384,
+      model: "qwen3.7-plus",
+      params: {
+        temperature: 0.7,
+        top_p: 0.8
+      }
+    }
+  });
+};
+app.get("/props", handleProps);
+app.get("/v1/props", handleProps);
+app.get("/api/props", handleProps);
+app.get("/api/v1/props", handleProps);
 
 app.get("/health", async (c) => {
   const status = await watchdog?.getStatus();

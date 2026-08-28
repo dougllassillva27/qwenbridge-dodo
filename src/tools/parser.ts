@@ -45,7 +45,15 @@ interface ActiveIncrementalToolCall {
 // ─── XML Helpers ───────────────────────────────────────────────────────────────
 
 const TOOL_END = "</" + "tool_call>";
-const TOOL_END_ALIASES = ["</" + "tool_calls>", TOOL_END];
+const TOOL_END_ALIASES = [
+  "</" + "tool_calls>",
+  TOOL_END,
+  "</" + "tool_call_>",
+  "</" + "tool_call_section>",
+  "</" + "function_call>",
+  "</" + "function_calls>",
+  "</" + "function_call_>",
+];
 
 interface ToolEndMatch {
   index: number;
@@ -67,18 +75,6 @@ function findToolEndOutsideJsonString(buffer: string): ToolEndMatch | null {
 
   if (main && closeTagContentIsParseable(buffer, main.index)) return main;
 
-  // The escape-aware scan can exit a string early when the quote count is
-  // unbalanced (logs2 02:21:02 grep payload had 11 quotes), exposing a
-  // literal `</tool_call>` quoted in an argument value as a "real" close
-  // (logs 02:06:35 edit_file old_text contained such an example). The real
-  // close tag is terminal, so prefer the LAST parseable occurrence: a literal
-  // marker is always followed by more content, so its prefix never validates.
-  // Iterate from the end so a stray extra close tag (e.g. a duplicated
-  // `</tool_call>` after the last payload) does not shadow earlier valid
-  // payload boundaries — each candidate's prefix is checked for a parseable
-  // tool payload, and the first hit from the end wins (multiple consecutive
-  // missing-open payloads, each with their own close tag, are recovered one at
-  // a time by the caller's loop).
   const occurrences = findCloseTagOccurrences(lower);
   for (let i = occurrences.length - 1; i >= 0; i--) {
     if (closeTagContentIsParseable(buffer, occurrences[i].index)) {
@@ -86,11 +82,6 @@ function findToolEndOutsideJsonString(buffer: string): ToolEndMatch | null {
     }
   }
 
-  // No candidate holds a plausible payload: do NOT close here. Closing on an
-  // unparseable marker mid-stream truncates the payload at the literal tag
-  // (the 342-char log drop). Deferring lets the stream continue — when the
-  // real close tag arrives the scan succeeds, and at flush the unclosed-tool
-  // recovery chain (robustParseJSON, brace matching) handles the remainder.
   return null;
 }
 
@@ -154,10 +145,8 @@ function scanCloseTagOutsideStringsAndFences(lower: string): ToolEndMatch | null
       }
     }
 
-    const tag = TOOL_END_ALIASES.find((candidate) =>
-      lower.startsWith(candidate, i),
-    );
-    if (tag) return { index: i, tag };
+    const match = lower.substring(i).match(/^(?:<\/(?:tool_call[a-z0-9_-]*|function_call[a-z0-9_-]*)|&lt;\/(?:tool_call[a-z0-9_-]*|function_call[a-z0-9_-]*))(?:>|&gt;?|(?=[\s\r\n<$]))/i);
+    if (match) return { index: i, tag: match[0] };
   }
 
   return null;
@@ -174,14 +163,11 @@ function startsWithEnvironmentDetails(buffer: string): boolean {
 /** All occurrences of either closing marker, in ascending index order. */
 function findCloseTagOccurrences(lower: string): ToolEndMatch[] {
   const occurrences: ToolEndMatch[] = [];
-  for (const tag of TOOL_END_ALIASES) {
-    let from = 0;
-    for (;;) {
-      const index = lower.indexOf(tag, from);
-      if (index === -1) break;
-      occurrences.push({ index, tag });
-      from = index + tag.length;
-    }
+  const re = /(?:<\/(?:tool_call[a-z0-9_-]*|function_call[a-z0-9_-]*)|&lt;\/(?:tool_call[a-z0-9_-]*|function_call[a-z0-9_-]*))(?:>|&gt;?|(?=[\s\r\n<$]))/gi;
+  let match: RegExpExecArray | null = re.exec(lower);
+  while (match !== null) {
+    occurrences.push({ index: match.index, tag: match[0] });
+    match = re.exec(lower);
   }
   return occurrences.sort((a, b) => a.index - b.index);
 }
@@ -200,6 +186,15 @@ function findCloseTagOccurrences(lower: string): ToolEndMatch[] {
 function closeTagContentIsParseable(buffer: string, endIdx: number): boolean {
   const content = buffer.substring(0, endIdx).trim();
   if (!content) return true;
+  if (
+    content.includes("<parameter") ||
+    content.includes("<name>") ||
+    content.includes("<tool_name>") ||
+    content.includes("<tool_call_arg_key") ||
+    content.includes("<arg_key")
+  ) {
+    return true;
+  }
   return tryParseJsonToolPayload(content);
 }
 
@@ -393,7 +388,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
     if (delimiterLength === 0) {
       const match = buffer
         .substring(i)
-        .match(/^<tool_call(?:s)?\b[^>]*>/i);
+        .match(/^(?:<|&lt;)(?:tool_call[a-zA-Z0-9_-]*|function_call[a-zA-Z0-9_-]*)(?:[=:\s]+[^\r\n>]*?)?(?:>|&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
       if (match && !isPrecededByBacktick(buffer, i)) {
         return { index: i, openTag: match[0] };
       }
@@ -445,7 +440,9 @@ function findToolOpenOutsideJsonString(
 
     if (codeFenceLength > 0) continue;
 
-    const match = buffer.substring(i).match(/^<tool_call(?:s)?\b[^>]*>/i);
+    const match = buffer
+      .substring(i)
+      .match(/^(?:<|&lt;)(?:tool_call[a-zA-Z0-9_-]*|function_call[a-zA-Z0-9_-]*)(?:[=:\s]+[^\r\n>]*?)?(?:>|&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
     if (match && !isPrecededByBacktick(buffer, i)) {
       return { index: i, openTag: match[0] };
     }
@@ -480,7 +477,12 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
 
     if (delimiterLength === 0 && buffer[i] === "<") {
       const tailLower = buffer.substring(i).toLowerCase();
-      if (tailLower.startsWith("<tool_call") && tailLower.indexOf(">") === -1) {
+      if (
+        (tailLower.startsWith("<tool_call") ||
+          tailLower.startsWith("<tool_call_section") ||
+          tailLower.startsWith("<tool_call_arg_key")) &&
+        tailLower.indexOf(">") === -1
+      ) {
         return i;
       }
       if (lowerToolStart.startsWith(tailLower)) {
@@ -511,7 +513,14 @@ function looksLikeToolCallPayload(candidate: string): boolean {
     );
   }
 
-  return trimmed.includes("<parameter") || trimmed.includes("<name>");
+  return (
+    trimmed.includes("<parameter") ||
+    trimmed.includes("<name>") ||
+    trimmed.includes("<tool_name>") ||
+    trimmed.includes("<tool_call_section") ||
+    trimmed.includes("<tool_call_arg_key") ||
+    trimmed.includes("<arg_key")
+  );
 }
 
 function findCandidateStarts(buffer: string): number[] {
@@ -531,6 +540,10 @@ function findCandidateStarts(buffer: string): number[] {
   pushAllMatches("[");
   pushAllMatches("<parameter");
   pushAllMatches("<name>");
+  pushAllMatches("<tool_name>");
+  pushAllMatches("<tool_call_section");
+  pushAllMatches("<tool_call_arg_key");
+  pushAllMatches("<arg_key");
 
   return starts.sort((a, b) => a - b);
 }
@@ -553,7 +566,14 @@ function looksLikePartialToolCallPayload(candidate: string): boolean {
     );
   }
 
-  return trimmed.includes("<parameter") || trimmed.includes("<name>");
+  return (
+    trimmed.includes("<parameter") ||
+    trimmed.includes("<name>") ||
+    trimmed.includes("<tool_name>") ||
+    trimmed.includes("<tool_call_section") ||
+    trimmed.includes("<tool_call_arg_key") ||
+    trimmed.includes("<arg_key")
+  );
 }
 
 function isInsideMarkdownCodeAtIndex(
@@ -694,17 +714,36 @@ function coerceParameterValue(rawValue: string): unknown {
 }
 
 /**
- * Extract tool name from the opening tag attribute or a <name> child element.
+ * Extract tool name from the opening tag attribute, a <name>/<tool_name> child element,
+ * or Qwen pseudo-XML <tool_call_arg_key>name</arg_key><arg_value>tool_name</arg_value>.
  */
 function extractToolName(openTag: string, block: string): string {
   const combined = `${openTag}\n${block}`;
   const attrMatch = combined.match(
-    /<tool_call(?:s)?\b[^>]*\bname\s*=\s*["']([^"']+)["']/i,
+    /<(?:tool_call(?:s)?|function_call)\b[^>]*\bname\s*=\s*["']([^"']+)["']/i,
   );
   if (attrMatch) return attrMatch[1];
 
-  const nameTagMatch = block.match(/<name>([\s\S]*?)<\/name>/i);
+  const directNameMatch = combined.match(
+    /<(?:tool_call(?:s)?|function_call)[:=\s]+([a-zA-Z0-9_-]+)/i,
+  );
+  if (
+    directNameMatch &&
+    directNameMatch[1] !== "section" &&
+    directNameMatch[1] !== "arg_key" &&
+    directNameMatch[1] !== "name"
+  ) {
+    return directNameMatch[1];
+  }
+
+  const nameTagMatch = block.match(/<(?:tool_name|name)>([\s\S]*?)<\/(?:tool_name|name)>/i);
   if (nameTagMatch) return decodeXmlEntities(nameTagMatch[1].trim());
+
+  // Qwen pseudo-XML: <tool_call_arg_key>name</arg_key>\s*<arg_value>tool_name</arg_value>
+  const qwenArgMatch = block.match(
+    /<tool_call_arg_key>name<\/(?:arg_key|tool_call_arg_key)>\s*<arg_value>([\s\S]*?)<\/arg_value>/i,
+  );
+  if (qwenArgMatch) return decodeXmlEntities(qwenArgMatch[1].trim());
 
   return "";
 }
@@ -735,7 +774,7 @@ function inferToolNameFromParameters(
 }
 
 /**
- * Parse Hermes-style XML <parameter name="...">value</parameter> format.
+ * Parse XML-style tool calls (Hermes-style <parameter>, <tool_call_section>, and Qwen <arg_key>/<arg_value>).
  */
 function parseXmlParameterToolCall(
   block: string,
@@ -743,6 +782,8 @@ function parseXmlParameterToolCall(
   tools: ToolDefinitionLike[],
 ): { name: string; arguments: Record<string, unknown> } | null {
   const args: Record<string, unknown> = {};
+
+  // Standard <parameter name="...">value</parameter>
   const parameterRe =
     /<parameter\b[^>]*\bname\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)<\/parameter>/gi;
   let match: RegExpExecArray | null = parameterRe.exec(block);
@@ -751,11 +792,101 @@ function parseXmlParameterToolCall(
     match = parameterRe.exec(block);
   }
 
-  if (Object.keys(args).length === 0) return null;
+  // Qwen <arg_key name="...">value</arg_value> or </arg_key>
+  const argKeyAttrRe =
+    /<arg_key\b[^>]*\bname\s*=\s*["']([^"']+)["'][^>]*>([\s\S]*?)(?:<\/arg_value>|<\/arg_key>)/gi;
+  let argAttrMatch: RegExpExecArray | null = argKeyAttrRe.exec(block);
+  while (argAttrMatch !== null) {
+    args[argAttrMatch[1]] = coerceParameterValue(argAttrMatch[2]);
+    argAttrMatch = argKeyAttrRe.exec(block);
+  }
+
+  // Qwen <arg_key>key</arg_key>\s*<arg_value>value</arg_value>
+  const pairRe =
+    /<arg_key>([^<]+)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/gi;
+  let pairMatch: RegExpExecArray | null = pairRe.exec(block);
+  let explicitToolName = "";
+  while (pairMatch !== null) {
+    const key = pairMatch[1].trim();
+    if (key.toLowerCase() === "name") {
+      explicitToolName = pairMatch[2].trim();
+    } else {
+      args[key] = coerceParameterValue(pairMatch[2]);
+    }
+    pairMatch = pairRe.exec(block);
+  }
+
+  // Generic child XML tags like <action>view</action>, <command>status</command>, etc.
+  const genericTagRe = /<([a-zA-Z0-9_-]+)>([\s\S]*?)<\/\1>/gi;
+  let tagMatch: RegExpExecArray | null = genericTagRe.exec(block);
+  while (tagMatch !== null) {
+    const tagName = tagMatch[1].toLowerCase();
+    if (
+      tagName !== "tool_name" &&
+      tagName !== "name" &&
+      tagName !== "tool_call_section" &&
+      tagName !== "tool_call" &&
+      tagName !== "tool_calls" &&
+      tagName !== "tool_call_arg_key" &&
+      tagName !== "arg_key" &&
+      tagName !== "arg_value" &&
+      tagName !== "parameter"
+    ) {
+      if (args[tagMatch[1]] === undefined) {
+        args[tagMatch[1]] = coerceParameterValue(tagMatch[2]);
+      }
+    }
+    tagMatch = genericTagRe.exec(block);
+  }
 
   const toolName =
-    extractToolName(openTag, block) || inferToolNameFromParameters(args, tools);
+    explicitToolName ||
+    extractToolName(openTag, block) ||
+    inferToolNameFromParameters(args, tools);
   if (!toolName) return null;
+
+  // If args is still empty, check if remaining text has JSON or a single parameter value
+  if (Object.keys(args).length === 0) {
+    const stripped = block
+      .replace(/<(?:tool_name|name|tool_call_section|tool_call|tool_calls)\b[^>]*>[\s\S]*?<\/(?:tool_name|name|tool_call_section|tool_call|tool_calls)>/gi, "")
+      .replace(/<[^>]+>/g, "")
+      .trim();
+
+    if (stripped) {
+      if (stripped.startsWith("{") && stripped.endsWith("}")) {
+        try {
+          const parsedObj = JSON.parse(stripped);
+          if (typeof parsedObj === "object" && parsedObj !== null) {
+            Object.assign(args, parsedObj);
+          }
+        } catch {}
+      } else {
+        const matchedTool = tools?.find((t) => {
+          const name = getToolDefinitionName(t) || "";
+          return name === toolName || (name.length > 0 && normalizeToolNameForMatch(name) === normalizeToolNameForMatch(toolName));
+        });
+        if (matchedTool) {
+          const props = getToolDefinitionProperties(matchedTool);
+          const propKeys = Object.keys(props);
+          if (propKeys.length === 1) {
+            args[propKeys[0]] = coerceParameterValue(stripped);
+          } else if (propKeys.includes("action")) {
+            args["action"] = coerceParameterValue(stripped);
+          } else if (propKeys.includes("command")) {
+            args["command"] = coerceParameterValue(stripped);
+          } else if (propKeys.includes("query")) {
+            args["query"] = coerceParameterValue(stripped);
+          } else if (propKeys.includes("text")) {
+            args["text"] = coerceParameterValue(stripped);
+          } else if (propKeys.length > 0) {
+            args[propKeys[0]] = coerceParameterValue(stripped);
+          }
+        } else {
+          args["action"] = coerceParameterValue(stripped);
+        }
+      }
+    }
+  }
 
   return { name: toolName, arguments: args };
 }
@@ -2038,7 +2169,7 @@ export class StreamingToolParser {
       // argument values (e.g. `{"a": "1</tool_call>"}`). Genuine unclosed
       // streams (cut mid-payload) have no trailing tag, so this is a no-op
       // for them.
-      const trimmed = rawTrimmed.replace(/<\/tool_calls?>$/i, "");
+      const trimmed = rawTrimmed.replace(/<\/(?:tool_calls?|function_calls?|tool_call_[a-z0-9_-]*)>?$/i, "");
       if (trimmed.length > 0) {
         if (isToolcallDebugEnabled()) {
           logger.debug(
@@ -2203,7 +2334,10 @@ export class StreamingToolParser {
   // ─── Internal Methods ──────────────────────────────────────────────────────
 
   private processToolContent(content: string, result: ParserResult): void {
-    const t = content.trim();
+    let t = content.trim();
+    if (t.includes("&quot;") || t.includes("&lt;") || t.includes("&gt;") || t.includes("&amp;")) {
+      t = decodeXmlEntities(t).trim();
+    }
     if (!t) {
       // Empty tool call - malformed. Restore lead-in if possible.
       logger.warn("[parser] Dropping empty tool call block");

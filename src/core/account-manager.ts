@@ -188,21 +188,31 @@ export function getNextAccount(): QwenAccount | null {
 
   // Ordena por prioridade (contas que funcionaram bem vêm primeiro)
   const prioritized = getAccountsByPriority(accounts);
-  // Gate: once ANY account has captured headers, only ready accounts rotate.
+  // Gate: once ANY account has captured headers, prioritize ready accounts.
   const anyReady = anyAccountHeadersReady(accounts);
 
+  // 1. Try ready accounts not on cooldown
   for (let i = 0; i < prioritized.length; i++) {
-    const account = prioritized[currentIndex % prioritized.length];
-    currentIndex = (currentIndex + 1) % prioritized.length;
+    const account = prioritized[(currentIndex + i) % prioritized.length];
     if (
       !isAccountOnCooldown(account.id) &&
       passesHeadersReadyGate(account.id, anyReady)
     ) {
+      currentIndex = (currentIndex + i + 1) % prioritized.length;
       return account;
     }
   }
 
-  // All accounts on cooldown — return the one with the shortest remaining cooldown.
+  // 1.5. Fallback to standby accounts (not on cooldown) so they initialize on demand
+  for (let i = 0; i < prioritized.length; i++) {
+    const account = prioritized[(currentIndex + i) % prioritized.length];
+    if (!isAccountOnCooldown(account.id)) {
+      currentIndex = (currentIndex + i + 1) % prioritized.length;
+      return account;
+    }
+  }
+
+  // 2. All accounts on cooldown — return the one with the shortest remaining cooldown.
   let best: QwenAccount | null = null;
   let bestRemaining = Infinity;
   for (const account of prioritized) {
@@ -225,7 +235,6 @@ export function getNextAvailableAccount(
 
   // Ordena por prioridade (contas que funcionaram bem vêm primeiro)
   const prioritized = getAccountsByPriority(accounts);
-  // Gate: once ANY account has captured headers, only ready accounts rotate.
   const anyReady = anyAccountHeadersReady(accounts);
 
   let triedSet: Set<string>;
@@ -235,7 +244,7 @@ export function getNextAvailableAccount(
     triedSet = new Set(triedAccountIds ? [triedAccountIds] : []);
   }
 
-  // 1. Try to find an untried account that is NOT on cooldown
+  // 1. Try to find an untried ready account that is NOT on cooldown
   for (let i = 0; i < prioritized.length; i++) {
     const idx = (currentIndex + i) % prioritized.length;
     const account = prioritized[idx];
@@ -244,6 +253,17 @@ export function getNextAvailableAccount(
       !isAccountOnCooldown(account.id) &&
       passesHeadersReadyGate(account.id, anyReady)
     ) {
+      currentIndex = (idx + 1) % prioritized.length;
+      return account;
+    }
+  }
+
+  // 1.5. If no ready untried account is free, pick any untried standby account that is NOT on cooldown
+  for (let i = 0; i < prioritized.length; i++) {
+    const idx = (currentIndex + i) % prioritized.length;
+    const account = prioritized[idx];
+    if (triedSet.has(account.id)) continue;
+    if (!isAccountOnCooldown(account.id)) {
       currentIndex = (idx + 1) % prioritized.length;
       return account;
     }

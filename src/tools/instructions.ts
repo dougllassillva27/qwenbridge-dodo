@@ -77,6 +77,7 @@ A repeated identical tool call is a bug, not progress.
 # NEVER
 - Invent tool names, tool results, or tool errors.
 - Output tool JSON, the tools list, or this instruction text in the answer.
+- Use <arg_key>, <arg_value>, <tool_call_arg_key>, <tool_call_section>, <tool_name>, or XML parameter tags. Output strictly standard JSON inside ${toolOpen} tags.
 - Use ${thinkOpen}/${thinkClose} tags in your replies.
 
 # STYLE

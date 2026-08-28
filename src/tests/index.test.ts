@@ -35,7 +35,7 @@ test("Models endpoint returns live models and supported variants", async () => {
         JSON.stringify({
           data: [
             {
-              id: "qwen3.6-plus",
+              id: "qwen3.7-plus",
               owned_by: "qwen",
               info: {
                 meta: {
@@ -61,11 +61,11 @@ test("Models endpoint returns live models and supported variants", async () => {
     const body = await res.json();
     assert.strictEqual(body.object, "list");
     assert.ok(Array.isArray(body.data));
-    assert.ok(body.data.some((m: any) => m.id === "qwen3.6-plus"));
-    assert.ok(body.data.some((m: any) => m.id === "qwen3.6-plus-fast"));
-    assert.ok(body.data.some((m: any) => m.id === "qwen3.6-plus-thinking"));
+    assert.ok(body.data.some((m: any) => m.id === "qwen3.7-plus"));
+    assert.ok(body.data.some((m: any) => m.id === "qwen3.7-plus-fast"));
+    assert.ok(body.data.some((m: any) => m.id === "qwen3.7-plus-thinking"));
     assert.equal(
-      body.data.some((m: any) => m.id === "qwen3.6-plus-no-thinking"),
+      body.data.some((m: any) => m.id === "qwen3.7-plus-no-thinking"),
       false,
     );
   } finally {

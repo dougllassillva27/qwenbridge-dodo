@@ -58,6 +58,34 @@ function baseModelId(modelId: string): string {
 }
 
 /**
+ * Verifica se o modelo pertence à geração 3.7 ou superior (ex: qwen3.7, qwen3.8, qwen4, etc.).
+ * Modelos anteriores (3.6, 2.5, 2, 1.5, legacy não-versionados como qwen-plus/max/turbo, wan2.x) são filtrados.
+ */
+export function isModel37OrAbove(modelId: string): boolean {
+  if (!modelId || typeof modelId !== "string") return false;
+
+  const normalized = modelId
+    .replace(/\[[^\]]+\]$/g, "")
+    .replace(/-(?:fast|no-thinking|thinking)$/, "")
+    .trim()
+    .toLowerCase();
+
+  // Procura padrão de versão numérica como:
+  // qwen3.7, qwen-3.7, qwen3.8, qwen4, qwen-4.5, wan3.7, claude-3.7, claude-3-7, etc.
+  const match = normalized.match(/(?:^|[a-z_-])(\d{1,2}(?:[\.-]\d+)?)(?:[a-z_-]|$)/);
+  if (!match || !match[1]) {
+    return false;
+  }
+
+  const versionStr = match[1].replace("-", ".");
+  const versionNum = parseFloat(versionStr);
+
+  if (isNaN(versionNum)) return false;
+
+  return versionNum >= 3.7 && versionNum < 100;
+}
+
+/**
  * Expand the public reasoning variants from the selected account's live
  * catalog. The upstream list is normalized first, so this function is the
  * sole owner of synthetic variants and cannot create nested/duplicate
@@ -80,6 +108,7 @@ export function expandModelVariants(
   for (const model of models) {
     if (!model?.id) continue;
     const baseId = baseModelId(model.id);
+    if (!isModel37OrAbove(baseId)) continue;
     if (!baseModels.has(baseId)) {
       baseModels.set(baseId, {
         ...model,
@@ -116,7 +145,7 @@ export function expandModelVariants(
   return [...variants.values()];
 }
 
-async function loadModelsWithVariants(): Promise<{
+export async function loadModelsWithVariants(): Promise<{
   models: PublicModel[];
   accountId?: string;
 }> {
@@ -127,7 +156,9 @@ async function loadModelsWithVariants(): Promise<{
   // Advertise media generation models so clients can discover them via
   // /v1/models, including their supported generation modalities. Annotate a
   // live model in place when Qwen already returned the same ID.
-  const mediaDefinitions = listMediaGenerationModels();
+  const mediaDefinitions = listMediaGenerationModels().filter((definition) =>
+    isModel37OrAbove(definition.id),
+  );
   const mediaById = new Map(mediaDefinitions.map((definition) => [definition.id, definition]));
   const expandedWithMedia = expanded.map((model) => {
     const definition = mediaById.get(model.id);
@@ -156,8 +187,12 @@ async function loadModelsWithVariants(): Promise<{
       ),
     }));
 
+  const allFilteredModels = [...expandedWithMedia, ...mediaModels].filter((model) =>
+    isModel37OrAbove(model.id),
+  );
+
   return {
-    models: [...expandedWithMedia, ...mediaModels],
+    models: allFilteredModels,
     accountId,
   };
 }
@@ -172,7 +207,7 @@ function findModel(
   return models.find((entry) => entry.id === modelId);
 }
 
-app.get("/v1/models", async (c) => {
+const handleGetModels = async (c: any) => {
   try {
     const { models: allModels } = await loadModelsWithVariants();
 
@@ -193,9 +228,38 @@ app.get("/v1/models", async (c) => {
     console.error("❌ [Models] Error fetching models:", error);
     return sendOpenAIError(c, error);
   }
+};
+
+app.get("/v1/models", handleGetModels);
+app.get("/api/v1/models", handleGetModels);
+app.get("/api/models", handleGetModels);
+
+app.get("/api/tags", async (c) => {
+  try {
+    const { models: allModels } = await loadModelsWithVariants();
+    return c.json({
+      models: allModels.map((m) => ({
+        name: m.id,
+        model: m.id,
+        modified_at: new Date(1735689600000).toISOString(),
+        size: 0,
+        digest: "sha256:qwenbridge",
+        details: {
+          parent_model: "",
+          format: "gguf",
+          family: "qwen",
+          families: ["qwen"],
+          parameter_size: "32B",
+          quantization_level: "Q4_K_M"
+        }
+      }))
+    });
+  } catch (error) {
+    return c.json({ models: [] });
+  }
 });
 
-app.get("/v1/models/:model", async (c) => {
+const handleGetSingleModel = async (c: any) => {
   try {
     const modelId = c.req.param("model");
     const { models: allModels } = await loadModelsWithVariants();
@@ -210,6 +274,10 @@ app.get("/v1/models/:model", async (c) => {
     console.error("❌ [Models] Error fetching model:", error);
     return sendOpenAIError(c, error);
   }
-});
+};
+
+app.get("/v1/models/:model", handleGetSingleModel);
+app.get("/api/v1/models/:model", handleGetSingleModel);
+app.get("/api/models/:model", handleGetSingleModel);
 
 export { app };

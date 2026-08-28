@@ -8,7 +8,7 @@ import { app } from "../api/server.ts";
 const modelsPayload = {
   data: [
     {
-      id: "qwen-test-model",
+      id: "qwen3.7-test-model",
       owned_by: "qwen",
       info: {
         created_at: 123,
@@ -25,7 +25,7 @@ const modelsPayload = {
       },
     },
     {
-      id: "qwen-text-only-model",
+      id: "qwen3.8-text-only-model",
       owned_by: "qwen",
       info: {
         created_at: 124,
@@ -36,6 +36,16 @@ const modelsPayload = {
           capabilities: { thinking: true },
           modality: ["text"],
           chat_type: ["t2t", "t2i", "t2v"],
+        },
+      },
+    },
+    {
+      id: "qwen3.5-legacy-model",
+      owned_by: "qwen",
+      info: {
+        created_at: 125,
+        meta: {
+          max_context_length: 4096,
         },
       },
     },
@@ -57,7 +67,7 @@ function installModelsFetchMock(): typeof globalThis.fetch {
   return originalFetch;
 }
 
-test("models endpoint returns ETag and supports 304", async () => {
+test("models endpoint returns ETag and supports 304, only listing 3.7+ models", async () => {
   const originalFetch = installModelsFetchMock();
   try {
     const first = await app.fetch(new Request("http://localhost/v1/models"));
@@ -67,30 +77,35 @@ test("models endpoint returns ETag and supports 304", async () => {
 
     const body = (await first.json()) as any;
     assert.equal(body.object, "list");
-    assert.ok(body.data.some((model: any) => model.id === "qwen-test-model"));
+    assert.ok(body.data.some((model: any) => model.id === "qwen3.7-test-model"));
     assert.ok(
-      body.data.some((m: any) => m.id === "qwen-test-model-fast"),
+      body.data.some((m: any) => m.id === "qwen3.7-test-model-fast"),
       "models should expose the public Fast variant",
     );
     assert.ok(
-      body.data.some((m: any) => m.id === "qwen-test-model-thinking"),
+      body.data.some((m: any) => m.id === "qwen3.7-test-model-thinking"),
       "models should expose the public Thinking variant",
     );
     assert.equal(
-      body.data.some((m: any) => m.id === "qwen-test-model-no-thinking"),
+      body.data.some((m: any) => m.id === "qwen3.7-test-model-no-thinking"),
       false,
       "legacy no-thinking variants must not be published",
     );
     assert.ok(
-      body.data.some((m: any) => m.id === "qwen-text-only-model-fast"),
+      body.data.some((m: any) => m.id === "qwen3.8-text-only-model-fast"),
       "Fast must be available even without think_skip metadata",
     );
     assert.equal(
-      body.data.filter((model: any) => model.id === "qwen-test-model").length,
+      body.data.some((m: any) => m.id === "qwen3.5-legacy-model"),
+      false,
+      "models below 3.7 must be filtered out",
+    );
+    assert.equal(
+      body.data.filter((model: any) => model.id === "qwen3.7-test-model").length,
       1,
     );
     const liveMetadata = body.data.find(
-      (model: any) => model.id === "qwen-test-model",
+      (model: any) => model.id === "qwen3.7-test-model",
     );
     assert.equal(liveMetadata.info.meta.max_summary_generation_length, 2048);
     assert.deepEqual(liveMetadata.modality, ["text", "image"]);
@@ -110,11 +125,11 @@ test("models endpoint returns a single model and 404 for missing model", async (
   const originalFetch = installModelsFetchMock();
   try {
     const found = await app.fetch(
-      new Request("http://localhost/v1/models/qwen-test-model"),
+      new Request("http://localhost/v1/models/qwen3.7-test-model"),
     );
     assert.equal(found.status, 200);
     const model = (await found.json()) as any;
-    assert.equal(model.id, "qwen-test-model");
+    assert.equal(model.id, "qwen3.7-test-model");
 
     const missing = await app.fetch(
       new Request("http://localhost/v1/models/not-a-model"),

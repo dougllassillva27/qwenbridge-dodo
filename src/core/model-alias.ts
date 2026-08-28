@@ -20,7 +20,10 @@ export function stripThinkingSuffix(model: string): {
   enableThinking: boolean;
   reasoningMode: ReasoningMode;
 } {
-  const normalizedModel = model.trim();
+  let normalizedModel = model.trim();
+
+  // Remove sufixos de tamanho de contexto como [1M], [128k], etc.
+  normalizedModel = normalizedModel.replace(/\[[^\]]+\]$/, "").trim();
 
   if (normalizedModel.endsWith("-fast")) {
     return {
@@ -52,11 +55,8 @@ export function stripThinkingSuffix(model: string): {
 
 /**
  * Mapeia o id de modelo para o Qwen upstream.
- * Ids `qwen*` passam direto (após remover o sufixo de raciocínio); ids de
- * outros provedores (gpt-*, grok-*, etc.) também passam “as-is” — o Codex/Custom
- * provider envia o id Qwen correto, e qualquer id desconhecido deve chegar ao
- * upstream para que este responda um erro claro de modelo, em vez de ser
- * silenciosamente roteado para um tier qualquer.
+ * Ids `qwen*` passam direto (após remover o sufixo de raciocínio);
+ * Mapeia aliases hipotéticos/futuros (ex: qwen3.8) para o flagship upstream atual (qwen3.7-plus).
  */
 export function mapClientModelToQwen(model: string): string {
   if (!model) return model;

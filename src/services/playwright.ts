@@ -16,7 +16,7 @@ import type { QwenAccount } from "../core/accounts.ts";
 function getActiveScreenCenter(): { x: number; y: number } | null {
   if (process.platform !== "win32") return null;
   try {
-    const cmd = `[void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms'); $s = [System.Windows.Forms.Screen]::AllScreens | Where-Object { $_.DeviceName -like '*DISPLAY1*' } | Select-Object -First 1; if (!$s) { $s = [System.Windows.Forms.Screen]::AllScreens[0] }; $cx = [int]($s.Bounds.Left + $s.Bounds.Width/2); $cy = [int]($s.Bounds.Top + $s.Bounds.Height/2); Write-Output "$cx,$cy"`;
+    const cmd = `Add-Type -AssemblyName System.Windows.Forms; $s = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position); if (!$s) { $s = [System.Windows.Forms.Screen]::PrimaryScreen }; $cx = [int]($s.Bounds.Left + $s.Bounds.Width/2); $cy = [int]($s.Bounds.Top + $s.Bounds.Height/2); Write-Output "$cx,$cy"`;
     const out = child_process.execFileSync(
       "powershell.exe",
       ["-NoProfile", "-Command", cmd],
