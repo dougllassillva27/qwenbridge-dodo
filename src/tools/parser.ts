@@ -725,12 +725,13 @@ function extractToolName(openTag: string, block: string): string {
   if (attrMatch) return attrMatch[1];
 
   const directNameMatch = combined.match(
-    /<(?:tool_call(?:s)?|function_call)[:=\s]+([a-zA-Z0-9_-]+)/i,
+    /<(?:tool_call(?:s)?|function_call)[_:\s=-]+([a-zA-Z0-9_-]+)/i,
   );
   if (
     directNameMatch &&
     directNameMatch[1] !== "section" &&
     directNameMatch[1] !== "arg_key" &&
+    directNameMatch[1] !== "arg_value" &&
     directNameMatch[1] !== "name"
   ) {
     return directNameMatch[1];

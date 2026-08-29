@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert";
 
 process.env.TEST_MOCK_QWEN_AUTH = "true";
+process.env.API_KEY = "";
+delete process.env.API_KEY;
 
 import { app } from "../api/server.js";
 

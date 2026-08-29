@@ -2681,11 +2681,25 @@ export async function processStreamingResponse(
           {
             malformedCount: malformedCalls.length,
             cappedCount: cappedToolNames.length,
-            cappedToolNames,
-            undeclaredNames,
-            completionId,
           },
         );
+      }
+
+      if (
+        !finalContent &&
+        (!toolParser || toolParser.getEmittedToolCallCount() === 0) &&
+        toolParser &&
+        toolParser.getMalformedToolCalls().length > 0
+      ) {
+        const fallbackMsg = "Não foi possível concluir a execução da ferramenta devido a uma resposta incompleta do modelo. Por favor, repita a solicitação.";
+        finalContent = fallbackMsg;
+        await writeEvent({
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: createdTimestamp,
+          model: body.model,
+          choices: [makeChoice({ content: fallbackMsg })],
+        });
       }
 
       await writeEvent({
