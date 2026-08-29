@@ -1089,3 +1089,54 @@ test("stream: invoke parameter tool call is parsed as structured tool_calls", as
     restore();
   }
 });
+
+test("stream: <tool_call_calls> wrapper is parsed as structured tool_calls", async () => {
+  const content =
+    '<tool_call_calls>\n{"name": "terminal", "arguments": {"command": "ps aux"}}\n</tool_call_calls>';
+  const restore = setupFetchMock(() =>
+    createSseResponse([
+      `data: ${JSON.stringify({
+        choices: [{ delta: { phase: "answer", content } }],
+      })}`,
+    ]),
+  );
+
+  try {
+    const req = new Request("http://localhost/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen3.6-plus",
+        stream: true,
+        tools: [
+          ...TOOLS,
+          {
+            type: "function",
+            function: {
+              name: "terminal",
+              parameters: {
+                type: "object",
+                properties: { command: { type: "string" } },
+              },
+            },
+          },
+        ],
+        messages: [{ role: "user", content: "run ps" }],
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const result = await collectStreamResult(res);
+    assert.strictEqual(result.content, "");
+    assert.strictEqual(result.toolCalls.length, 1);
+    assert.strictEqual(result.toolCalls[0].name, "terminal");
+    assert.deepStrictEqual(JSON.parse(result.toolCalls[0].arguments), {
+      command: "ps aux",
+    });
+    assert.strictEqual(result.finishReason, "tool_calls");
+  } finally {
+    restore();
+  }
+});

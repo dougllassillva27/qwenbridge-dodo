@@ -47,6 +47,7 @@ interface ActiveIncrementalToolCall {
 const TOOL_END = "</" + "tool_call>";
 const TOOL_END_ALIASES = [
   "</" + "tool_calls>",
+  "</" + "tool_call_calls>",
   TOOL_END,
   "</" + "tool_call_>",
   "</" + "tool_calling>",
@@ -738,20 +739,6 @@ function extractToolName(openTag: string, block: string): string {
   );
   if (attrMatch) return attrMatch[1];
 
-  const directNameMatch = combined.match(
-    /<(?:tool_call(?:s)?|function_call|invoke)[_:\s=-]+([a-zA-Z0-9_-]+)/i,
-  );
-  if (
-    directNameMatch &&
-    directNameMatch[1] !== "section" &&
-    directNameMatch[1] !== "arg_key" &&
-    directNameMatch[1] !== "arg_value" &&
-    directNameMatch[1] !== "calling" &&
-    directNameMatch[1] !== "name"
-  ) {
-    return directNameMatch[1];
-  }
-
   const skillTagMatch = combined.match(/<(skill_view|skill_manage)\b/i);
   if (skillTagMatch) return skillTagMatch[1];
 
@@ -763,6 +750,24 @@ function extractToolName(openTag: string, block: string): string {
     /<tool_call_arg_key>name<\/(?:arg_key|tool_call_arg_key)>\s*<arg_value>([\s\S]*?)<\/arg_value>/i,
   );
   if (qwenArgMatch) return decodeXmlEntities(qwenArgMatch[1].trim());
+
+  const jsonNameMatch = block.match(/"name"\s*:\s*"([a-zA-Z0-9_-]+)"/i);
+  if (jsonNameMatch) return jsonNameMatch[1];
+
+  const directNameMatch = openTag.match(
+    /<(?:tool_call(?:s)?|function_call|invoke)[_:\s=-]+([a-zA-Z0-9_-]+)/i,
+  );
+  if (
+    directNameMatch &&
+    directNameMatch[1] !== "section" &&
+    directNameMatch[1] !== "arg_key" &&
+    directNameMatch[1] !== "arg_value" &&
+    directNameMatch[1] !== "calls" &&
+    directNameMatch[1] !== "calling" &&
+    directNameMatch[1] !== "name"
+  ) {
+    return directNameMatch[1];
+  }
 
   return "";
 }
@@ -800,6 +805,19 @@ function parseXmlParameterToolCall(
   openTag: string,
   tools: ToolDefinitionLike[],
 ): { name: string; arguments: Record<string, unknown> } | null {
+  const trimmed = block.trim();
+  if (
+    (trimmed.startsWith("{") || trimmed.startsWith("[")) &&
+    !trimmed.includes("<parameter") &&
+    !trimmed.includes("<arg_key") &&
+    !trimmed.includes("<name>") &&
+    !trimmed.includes("<tool_name>") &&
+    !openTag.includes("invoke") &&
+    !openTag.includes("skill_")
+  ) {
+    return null;
+  }
+
   const args: Record<string, unknown> = {};
 
   // Standard <parameter name="...">value</parameter>
@@ -876,11 +894,17 @@ function parseXmlParameterToolCall(
         try {
           const parsedObj = JSON.parse(stripped);
           if (typeof parsedObj === "object" && parsedObj !== null) {
-            if (typeof parsedObj.arguments === "object" && parsedObj.arguments !== null) {
-              Object.assign(args, parsedObj.arguments);
-            } else {
-              Object.assign(args, parsedObj);
+            let extracted = parsedObj.arguments ?? parsedObj;
+            while (
+              typeof extracted === "object" &&
+              extracted !== null &&
+              "arguments" in extracted &&
+              typeof (extracted as any).arguments === "object" &&
+              (extracted as any).arguments !== null
+            ) {
+              extracted = (extracted as any).arguments;
             }
+            Object.assign(args, extracted);
           }
         } catch {}
       } else {

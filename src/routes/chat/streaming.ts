@@ -1402,43 +1402,45 @@ export async function processStreamingResponse(
           });
         }
 
-        for (const tc of toolCalls) {
-          if (isToolcallDebugEnabled()) {
-            logger.debug("[chat] stream: emitting tool_call chunk", {
-              id: tc.id,
-              name: tc.name,
-              argsKeys: Object.keys(tc.arguments),
-              index:
-                toolParser.getEmittedToolCallCount() -
-                toolCalls.length +
-                toolCalls.indexOf(tc),
+        if (toolCallDeltas.length === 0) {
+          for (const tc of toolCalls) {
+            if (isToolcallDebugEnabled()) {
+              logger.debug("[chat] stream: emitting tool_call chunk", {
+                id: tc.id,
+                name: tc.name,
+                argsKeys: Object.keys(tc.arguments),
+                index:
+                  toolParser.getEmittedToolCallCount() -
+                  toolCalls.length +
+                  toolCalls.indexOf(tc),
+              });
+            }
+
+            await writeEvent({
+              id: completionId,
+              object: "chat.completion.chunk",
+              created: createdTimestamp,
+              model: body.model,
+              choices: [
+                makeChoice({
+                  tool_calls: [
+                    {
+                      index:
+                        toolParser.getEmittedToolCallCount() -
+                        toolCalls.length +
+                        toolCalls.indexOf(tc),
+                      id: tc.id,
+                      type: "function",
+                      function: {
+                        name: tc.name,
+                        arguments: JSON.stringify(tc.arguments),
+                      },
+                    },
+                  ],
+                }),
+              ],
             });
           }
-
-          await writeEvent({
-            id: completionId,
-            object: "chat.completion.chunk",
-            created: createdTimestamp,
-            model: body.model,
-            choices: [
-              makeChoice({
-                tool_calls: [
-                  {
-                    index:
-                      toolParser.getEmittedToolCallCount() -
-                      toolCalls.length +
-                      toolCalls.indexOf(tc),
-                    id: tc.id,
-                    type: "function",
-                    function: {
-                      name: tc.name,
-                      arguments: JSON.stringify(tc.arguments),
-                    },
-                  },
-                ],
-              }),
-            ],
-          });
         }
       };
 
@@ -2450,20 +2452,22 @@ export async function processStreamingResponse(
                 ],
               });
             }
-            for (const tc of retryFlush.toolCalls) {
-              writeDeltaEvent({
-                tool_calls: [
-                  {
-                    index: toolParser.getEmittedToolCallCount() - 1,
-                    id: tc.id,
-                    type: "function",
-                    function: {
-                      name: tc.name,
-                      arguments: JSON.stringify(tc.arguments),
+            if (retryFlush.toolCallDeltas.length === 0) {
+              for (const tc of retryFlush.toolCalls) {
+                writeDeltaEvent({
+                  tool_calls: [
+                    {
+                      index: toolParser.getEmittedToolCallCount() - 1,
+                      id: tc.id,
+                      type: "function",
+                      function: {
+                        name: tc.name,
+                        arguments: JSON.stringify(tc.arguments),
+                      },
                     },
-                  },
-                ],
-              });
+                  ],
+                });
+              }
             }
           }
 
