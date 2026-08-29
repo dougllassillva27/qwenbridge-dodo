@@ -784,7 +784,7 @@ adminApp.get('/assets/*', (c) => {
 });
 
 adminApp.get('*', (c) => {
-  if (c.req.path.startsWith('/api')) return c.notFound();
+  if (c.req.path.startsWith('/api') || c.req.path.startsWith('/admin/api')) return c.notFound();
   if (IS_WEB_DEV) {
     const rel = c.req.path.replace(/^\/admin\/?/, '');
     return c.redirect(`${WEB_DEV_BASE}/admin/${rel}`, 302);
