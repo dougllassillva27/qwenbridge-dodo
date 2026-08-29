@@ -49,6 +49,10 @@ const TOOL_END_ALIASES = [
   "</" + "tool_calls>",
   TOOL_END,
   "</" + "tool_call_>",
+  "</" + "tool_calling>",
+  "</" + "invoke>",
+  "</" + "skill_view>",
+  "</" + "skill_manage>",
   "</" + "tool_call_section>",
   "</" + "function_call>",
   "</" + "function_calls>",
@@ -145,7 +149,7 @@ function scanCloseTagOutsideStringsAndFences(lower: string): ToolEndMatch | null
       }
     }
 
-    const match = lower.substring(i).match(/^(?:<\/(?:tool_call[a-z0-9_-]*|function_call[a-z0-9_-]*)|&lt;\/(?:tool_call[a-z0-9_-]*|function_call[a-z0-9_-]*))(?:>|&gt;?|(?=[\s\r\n<$]))/i);
+    const match = lower.substring(i).match(/^(?:<\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage))(?:>|&gt;?|(?=[\s\r\n<$]))/i);
     if (match) return { index: i, tag: match[0] };
   }
 
@@ -163,7 +167,7 @@ function startsWithEnvironmentDetails(buffer: string): boolean {
 /** All occurrences of either closing marker, in ascending index order. */
 function findCloseTagOccurrences(lower: string): ToolEndMatch[] {
   const occurrences: ToolEndMatch[] = [];
-  const re = /(?:<\/(?:tool_call[a-z0-9_-]*|function_call[a-z0-9_-]*)|&lt;\/(?:tool_call[a-z0-9_-]*|function_call[a-z0-9_-]*))(?:>|&gt;?|(?=[\s\r\n<$]))/gi;
+  const re = /(?:<\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage))(?:>|&gt;?|(?=[\s\r\n<$]))/gi;
   let match: RegExpExecArray | null = re.exec(lower);
   while (match !== null) {
     occurrences.push({ index: match.index, tag: match[0] });
@@ -386,9 +390,14 @@ function findNextToolOpenTagOutsideMarkdownCode(
     }
 
     if (delimiterLength === 0) {
+      const deformedNameMatch = buffer.substring(i).match(/^(?:<|&lt;)(?="?name"?\s*:)/i);
+      if (deformedNameMatch && !isPrecededByBacktick(buffer, i)) {
+        return { index: i, openTag: deformedNameMatch[0] };
+      }
+
       const match = buffer
         .substring(i)
-        .match(/^(?:<|&lt;)(?:tool_call[a-zA-Z0-9_-]*|function_call[a-zA-Z0-9_-]*)(?:[=:\s]+[^\r\n>]*?)?(?:>|&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
+        .match(/^(?:<|&lt;)(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:>|&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
       if (match && !isPrecededByBacktick(buffer, i)) {
         return { index: i, openTag: match[0] };
       }
@@ -440,9 +449,14 @@ function findToolOpenOutsideJsonString(
 
     if (codeFenceLength > 0) continue;
 
+    const deformedNameMatch = buffer.substring(i).match(/^(?:<|&lt;)(?="?name"?\s*:)/i);
+    if (deformedNameMatch && !isPrecededByBacktick(buffer, i)) {
+      return { index: i, openTag: deformedNameMatch[0] };
+    }
+
     const match = buffer
       .substring(i)
-      .match(/^(?:<|&lt;)(?:tool_call[a-zA-Z0-9_-]*|function_call[a-zA-Z0-9_-]*)(?:[=:\s]+[^\r\n>]*?)?(?:>|&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
+      .match(/^(?:<|&lt;)(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:>|&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
     if (match && !isPrecededByBacktick(buffer, i)) {
       return { index: i, openTag: match[0] };
     }
@@ -720,22 +734,26 @@ function coerceParameterValue(rawValue: string): unknown {
 function extractToolName(openTag: string, block: string): string {
   const combined = `${openTag}\n${block}`;
   const attrMatch = combined.match(
-    /<(?:tool_call(?:s)?|function_call)\b[^>]*\bname\s*=\s*["']([^"']+)["']/i,
+    /<(?:tool_call(?:s)?|function_call|invoke)\b[^>]*\bname\s*=\s*["']([^"']+)["']/i,
   );
   if (attrMatch) return attrMatch[1];
 
   const directNameMatch = combined.match(
-    /<(?:tool_call(?:s)?|function_call)[_:\s=-]+([a-zA-Z0-9_-]+)/i,
+    /<(?:tool_call(?:s)?|function_call|invoke)[_:\s=-]+([a-zA-Z0-9_-]+)/i,
   );
   if (
     directNameMatch &&
     directNameMatch[1] !== "section" &&
     directNameMatch[1] !== "arg_key" &&
     directNameMatch[1] !== "arg_value" &&
+    directNameMatch[1] !== "calling" &&
     directNameMatch[1] !== "name"
   ) {
     return directNameMatch[1];
   }
+
+  const skillTagMatch = combined.match(/<(skill_view|skill_manage)\b/i);
+  if (skillTagMatch) return skillTagMatch[1];
 
   const nameTagMatch = block.match(/<(?:tool_name|name)>([\s\S]*?)<\/(?:tool_name|name)>/i);
   if (nameTagMatch) return decodeXmlEntities(nameTagMatch[1].trim());
@@ -858,7 +876,11 @@ function parseXmlParameterToolCall(
         try {
           const parsedObj = JSON.parse(stripped);
           if (typeof parsedObj === "object" && parsedObj !== null) {
-            Object.assign(args, parsedObj);
+            if (typeof parsedObj.arguments === "object" && parsedObj.arguments !== null) {
+              Object.assign(args, parsedObj.arguments);
+            } else {
+              Object.assign(args, parsedObj);
+            }
           }
         } catch {}
       } else {
@@ -1156,7 +1178,16 @@ function inspectIncrementalJsonToolObject(
  * contain arbitrary text.
  */
 function repairCommonMalformedToolJson(content: string): string {
-  const repaired = content
+  let normalized = content.trim();
+  // Normalize leading `<name":` / `<"name":` / `name":` to `{"name":`
+  if (/^[<"]*name"?\s*:/i.test(normalized)) {
+    normalized = '{"' + normalized.replace(/^[<"]*name"?\s*:/i, 'name":');
+    if (!normalized.endsWith("}")) {
+      normalized = normalized + "}";
+    }
+  }
+
+  const repaired = normalized
     .replace(
       /([,{]\s*)"arguments\s*>\s*(?={|\[|")/g,
       '$1"arguments": ',
