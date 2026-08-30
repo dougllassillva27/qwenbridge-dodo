@@ -338,6 +338,59 @@ function isAccountServingStream(accountId: string): boolean {
   return true;
 }
 
+/**
+ * Selective resource blocker: aborts non-essential telemetry, trackers, heavy fonts
+ * and video/audio media to save memory, CPU, and network bandwidth while keeping
+ * HTML, scripts, CSS, APIs, Captcha puzzles, and multimodal images 100% operational.
+ */
+export function isAbortedResource(url: string, resourceType: string): boolean {
+  // Always allow essential web application components
+  if (
+    resourceType === "document" ||
+    resourceType === "script" ||
+    resourceType === "stylesheet" ||
+    resourceType === "xhr" ||
+    resourceType === "fetch" ||
+    resourceType === "image"
+  ) {
+    const lowerUrl = url.toLowerCase();
+    // Only abort if it is explicitly a known third-party tracker / telemetry beacon
+    if (
+      lowerUrl.includes("cnzz.com") ||
+      lowerUrl.includes("log.mmstat.com") ||
+      lowerUrl.includes("arms-retcode.aliyuncs.com") ||
+      lowerUrl.includes("google-analytics.com") ||
+      lowerUrl.includes("googletagmanager.com") ||
+      lowerUrl.includes("/beacon/") ||
+      lowerUrl.includes("track.uc.cn")
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  // Abort heavy non-essential media (videos, audios) and webfonts
+  if (resourceType === "media" || resourceType === "font") {
+    return true;
+  }
+
+  return false;
+}
+
+export async function setupResourceInterception(context: BrowserContext): Promise<void> {
+  await context.route("**/*", (route) => {
+    const request = route.request();
+    const url = request.url();
+    const resourceType = request.resourceType();
+
+    if (isAbortedResource(url, resourceType)) {
+      return route.abort("blockedbyclient").catch(() => {});
+    }
+
+    return route.continue().catch(() => {});
+  });
+}
+
 function getStealthScript(profile: FingerprintProfile): string {
   const profileJson = JSON.stringify(profile).replace(/</g, "\\u003c");
   return `
@@ -1155,6 +1208,7 @@ export async function initPlaywrightForAccount(
     try {
       // Comprehensive stealth scripts for anti-bot evasion
       await acctContext.addInitScript(getStealthScript(fingerprint));
+      await setupResourceInterception(acctContext);
 
       // Persistent contexts may already contain an initial about:blank tab.
       // Reuse it instead of creating a second tab. Prefer a tab already on the
@@ -1364,6 +1418,7 @@ export async function validateAccountLogin(
 
     try {
       await acctContext.addInitScript(getStealthScript(fingerprint));
+      await setupResourceInterception(acctContext);
 
       const existingPages = acctContext.pages().filter((p) => !p.isClosed());
       const acctPage =
