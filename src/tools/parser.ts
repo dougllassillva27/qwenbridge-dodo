@@ -3,6 +3,17 @@ import { robustParseJSON } from "../utils/json.ts";
 import { logger, isToolcallDebugEnabled } from "../core/logger.js";
 import type { ParsedToolCall } from "./types";
 import type { FunctionToolDefinition } from "./types";
+import {
+  TOOL_CALL_OPEN,
+  TOOL_CALL_CLOSE,
+  getOpenNames,
+  getCloseNames,
+  findToolOpen,
+  matchToolCloseAt,
+  openTagName,
+  closeTagFor,
+  sanitizeStrayCloses,
+} from "./toolcall-tags.ts";
 
 export interface ToolCallDelta {
   index: number;
@@ -44,11 +55,13 @@ interface ActiveIncrementalToolCall {
 
 // ─── XML Helpers ───────────────────────────────────────────────────────────────
 
-const TOOL_END = "</" + "tool_call>";
+const TOOL_END = TOOL_CALL_CLOSE;
 const TOOL_END_ALIASES = [
   "</" + "tool_calls>",
   "</" + "tool_call_calls>",
   TOOL_END,
+  "</" + "qpx_call>",
+  "</" + "qpx_calls>",
   "</" + "tool_call_>",
   "</" + "tool_calling>",
   "</" + "invoke>",
@@ -90,9 +103,9 @@ const TOOL_END_ALIASES = [
 //    visible-text emission never belongs to a parsed tool call (a real one
 //    is consumed while insideTool), so every form is stray by definition.
 const STRAY_TOOL_TAG_OPEN_RE =
-  /(?:<|&lt;)\|?(?:tool_calls?|function_calls?|tool_calling)[\s"'-]*[_"'][\s"'_-]*(?:\|?>|&gt;)/gi;
+  /(?:<|&lt;)\|?(?:qpx_calls?|tool_calls?|function_calls?|tool_calling)[\s"'-]*[_"'][\s"'_-]*(?:\|?>|&gt;)/gi;
 const STRAY_TOOL_TAG_CLOSE_RE =
-  /(?:<|&lt;)\|?\/(?:tool_calls?|function_calls?|tool_calling|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke[a-z0-9_-]*|skill_view|skill_manage)\|?(?:>|&gt;?)/gi;
+  /(?:<|&lt;)\|?\/(?:qpx_calls?|tool_calls?|function_calls?|tool_calling|tool_call_[a-z0-9_-]*|qpx_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke[a-z0-9_-]*|skill_view|skill_manage)\|?(?:>|&gt;?)/gi;
 const STRAY_TOOL_TAG_ENTITY_RE =
   /&lt;\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?&gt;/gi;
 // Pipe-wrapped special markers in raw form, e.g. `<|tool_call_end|>`,
@@ -234,6 +247,12 @@ function scanCloseTagOutsideStringsAndFences(lower: string): ToolEndMatch | null
 
     if (codeFenceLength > 0) continue;
 
+    // Whitespace-tolerant close over every accepted tag (custom + legacy).
+    const closeLen = matchToolCloseAt(lower, i);
+    if (closeLen !== null) {
+      return { index: i, tag: lower.substring(i, i + closeLen) };
+    }
+
     // Some editor clients append environment metadata immediately after a model
     // emits a truncated closing tag, producing values like
     // `</tool<environment_details>` or `</<environment_details>`. Treat only
@@ -247,7 +266,7 @@ function scanCloseTagOutsideStringsAndFences(lower: string): ToolEndMatch | null
       }
     }
 
-    const match = lower.substring(i).match(/^(?:<\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|<\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?|&lt;\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?)(?:>|&gt;?|(?=[\s\r\n<$]))/i);
+    const match = lower.substring(i).match(/^(?:<\/(?:qpx_calls?|tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|qpx_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:qpx_calls?|tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|qpx_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|<\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?|&lt;\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?)(?:>|&gt;?|(?=[\s\r\n<$]))/i);
     if (match) return { index: i, tag: match[0] };
   }
 
@@ -262,14 +281,26 @@ function startsWithEnvironmentDetails(buffer: string): boolean {
   return /^\s*(?:<\/(?:tool[a-z_]*)?<?\/?)?\s*<?\/?environment_details\b/i.test(buffer);
 }
 
-/** All occurrences of either closing marker, in ascending index order. */
+/** All occurrences of any closing marker, in ascending index order. */
 function findCloseTagOccurrences(lower: string): ToolEndMatch[] {
   const occurrences: ToolEndMatch[] = [];
-  const re = /(?:<\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|<\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?|&lt;\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?)(?:>|&gt;?|(?=[\s\r\n<$]))/gi;
+  const re = /(?:<\/(?:qpx_calls?|tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|qpx_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:qpx_calls?|tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|qpx_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|<\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?|&lt;\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?)(?:>|&gt;?|(?=[\s\r\n<$]))/gi;
   let match: RegExpExecArray | null = re.exec(lower);
   while (match !== null) {
     occurrences.push({ index: match.index, tag: match[0] });
     match = re.exec(lower);
+  }
+  for (const name of getCloseNames()) {
+    const tag = `</${name.toLowerCase()}>`;
+    let from = 0;
+    for (;;) {
+      const idx = lower.indexOf(tag, from);
+      if (idx === -1) break;
+      if (!occurrences.some((o) => o.index === idx)) {
+        occurrences.push({ index: idx, tag });
+      }
+      from = idx + tag.length;
+    }
   }
   return occurrences.sort((a, b) => a.index - b.index);
 }
@@ -519,7 +550,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
 
       const match = buffer
         .substring(i)
-        .match(/^(?:<|&lt;)\|?(?:tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function_calls?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
+        .match(/^(?:<|&lt;)\|?(?:qpx_calls?|qpx_call_[a-zA-Z0-9_-]+|tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function_calls?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
       if (match && !isPrecededByBacktick(buffer, i)) {
         return { index: i, openTag: match[0] };
       }
@@ -578,7 +609,7 @@ function findToolOpenOutsideJsonString(
 
     const match = buffer
       .substring(i)
-      .match(/^(?:<|&lt;)\|?(?:tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function_calls?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
+      .match(/^(?:<|&lt;)\|?(?:qpx_calls?|qpx_call_[a-zA-Z0-9_-]+|tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function_calls?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
     if (match && !isPrecededByBacktick(buffer, i)) {
       return { index: i, openTag: match[0] };
     }
@@ -593,6 +624,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
 ): number {
   let delimiterLength = initialDelimiterLength;
   const lowerToolStart = TOOL_START_LITERAL.toLowerCase();
+  const openNames = getOpenNames();
 
   for (let i = 0; i < buffer.length;) {
     if (buffer[i] === "`") {
@@ -615,6 +647,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
       const tailLower = buffer.substring(i).toLowerCase();
       if (
         (tailLower.startsWith("<tool_call") ||
+          tailLower.startsWith("<qpx_call") ||
           tailLower.startsWith("<|tool_call") ||
           tailLower.startsWith("<tool_call_section") ||
           tailLower.startsWith("<|tool_calls_section") ||
@@ -623,6 +656,14 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
         tailLower.indexOf(">") === -1
       ) {
         return i;
+      }
+      if (!tailLower.includes(">")) {
+        for (const name of openNames) {
+          const full = `<${name.toLowerCase()}`;
+          if (full.startsWith(tailLower)) {
+            return i;
+          }
+        }
       }
       if (lowerToolStart.startsWith(tailLower)) {
         return i;
@@ -679,6 +720,8 @@ function findCandidateStarts(buffer: string): number[] {
 
   pushAllMatches("{");
   pushAllMatches("[");
+  pushAllMatches("<qpx_call");
+  pushAllMatches("<qpx_calls");
   pushAllMatches("<parameter");
   pushAllMatches("<name>");
   pushAllMatches("<tool_name>");
@@ -1189,7 +1232,7 @@ function parseSpecialTokenToolCall(
 
 // ─── Partial Tag Detection ─────────────────────────────────────────────────────
 
-const TOOL_START_LITERAL = "<" + "tool_call>";
+const TOOL_START_LITERAL = TOOL_CALL_OPEN;
 
 function skipJsonWhitespace(str: string, index: number): number {
   while (index < str.length && /\s/.test(str[index])) {
@@ -2583,9 +2626,9 @@ export class StreamingToolParser {
       // without wrapping them in <tool_call> tags, or left an incomplete `<tool_call` tag at the end.
       let textToProcess = this.buffer;
 
-      // 1. Strip any trailing orphaned `<tool_call` or `<tool_calls` prefix at the end of buffer
+      // 1. Strip any trailing orphaned `<tool_call` or `<qpx_call` prefix at the end of buffer
       // (e.g. model output `... <tool_call` without closing `>`)
-      textToProcess = textToProcess.replace(/<\/?tool_calls?\b[^>]*$/i, "").trimEnd();
+      textToProcess = textToProcess.replace(/<\/?(?:tool_calls?|qpx_call)\b[^>]*$/i, "").trimEnd();
       // Also strip complete stray/degenerate tool-call markers the open-tag
       // regex didn't match (e.g. `<tool_call_>`, `</tool_call_calls>`,
       // `<|tool_call_end|>`) which would otherwise leak as visible text.
@@ -3495,12 +3538,60 @@ export class StreamingToolParser {
     return null;
   }
 
+  private isHallucinatedToolCall(parsed: any): boolean {
+    const args =
+      parsed.arguments ||
+      parsed.function?.arguments ||
+      parsed.args ||
+      parsed.parameters ||
+      parsed.input ||
+      {};
+    const values =
+      typeof args === "string"
+        ? [args]
+        : typeof args === "object" && args !== null
+          ? Object.values(args).filter((v) => typeof v === "string") as string[]
+          : [];
+    for (const val of values) {
+      // Detect vertical hallucination: single chars separated by newlines
+      // e.g. "f\ni\ne\nl\nd\ns" or "a\nc\nf\ng\ne\nt..." (5+ single-char lines)
+      // and zero-width / ornament chars inserted by WAF/bx
+      const lines = val.split("\n");
+      if (lines.length >= 8) {
+        let singleCharLines = 0;
+        for (const line of lines) {
+          const trimmed = line.replace(/[\u200B\uFEFF¨\u00A8]/g, "").trim();
+          if (trimmed.length === 1 && /^[A-Za-z0-9=_\-;()]$/.test(trimmed)) {
+            singleCharLines++;
+          }
+        }
+        if (singleCharLines >= 6 && singleCharLines / lines.length > 0.5) {
+          return true;
+        }
+      }
+      // Also catch the compact form "f\ni\ne..." after JSON parsing already
+      // converted literal newlines to \n -> string contains "\n" per char
+      if (/^([A-Za-z0-9=_\-;()]\n){6,}/.test(val) || /(\w\n){8,}/.test(val)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private parseToolCall(parsed: any): ParsedToolCall | null {
     if (!parsed || typeof parsed !== "object") return null;
 
     const name =
       parsed.name || parsed.function?.name || parsed.tool_name || parsed.tool;
     if (!name || typeof name !== "string" || name.length === 0) return null;
+
+    // Drop hallucinated tool calls where the model split a value vertically
+    // (e.g. "fields" -> "f\ni\ne\nl\nd\ns"). These are valid JSON after
+    // sanitizeAndBalance but semantically broken; treat as malformed so the
+    // [SYSTEM CORRECTION] auto-retry fires instead of delivering garbage.
+    if (this.isHallucinatedToolCall(parsed)) {
+      return null;
+    }
 
     let args =
       parsed.arguments ||
