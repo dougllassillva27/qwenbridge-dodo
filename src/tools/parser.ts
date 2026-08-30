@@ -74,6 +74,89 @@ const TOOL_END_ALIASES = [
   "<tool_call_argument_end>",
 ];
 
+// ─── Stray tool-call marker cleanup ───────────────────────────────────────────
+// Thinking models (e.g. qwen3.8-max-thinking) occasionally emit degenerate
+// tool-call markers as plain content — `<tool_call_>`, `</tool_call_calls>`,
+// `<|tool_call_end|>`, `&lt;tool_call_&gt;` — that the open-tag matcher never
+// recognizes, so they would leak to the client as visible assistant text.
+//
+// Two tiers:
+//  * STRAY_TOOL_TAG_OPEN_RE — opening tags WITHOUT a usable tool name (empty
+//    or made of quotes/underscores/dashes only). Tags carrying a real
+//    alphanumeric name (e.g. `<tool_call_terminal>`) are NOT matched here:
+//    outside code fences the matcher consumes them, inside fences they are
+//    legitimate documentation and must survive.
+//  * STRAY_TOOL_TAG_CLOSE_RE — closing tags. A closing tag that reaches
+//    visible-text emission never belongs to a parsed tool call (a real one
+//    is consumed while insideTool), so every form is stray by definition.
+const STRAY_TOOL_TAG_OPEN_RE =
+  /(?:<|&lt;)\|?(?:tool_calls?|function_calls?|tool_calling)[\s"'-]*[_"'][\s"'_-]*(?:\|?>|&gt;)/gi;
+const STRAY_TOOL_TAG_CLOSE_RE =
+  /(?:<|&lt;)\|?\/(?:tool_calls?|function_calls?|tool_calling|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke[a-z0-9_-]*|skill_view|skill_manage)\|?(?:>|&gt;?)/gi;
+const STRAY_TOOL_TAG_ENTITY_RE =
+  /&lt;\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?&gt;/gi;
+// Pipe-wrapped special markers in raw form, e.g. `<|tool_call_end|>`,
+// `<tool_call_begin>`, `<|tool_calls_section_begin|>`.
+const STRAY_TOOL_TAG_SPECIAL_RE =
+  /(?:<|&lt;)\|?(?:tool_call_begin|tool_call_end|tool_calls_section_(?:begin|end)|tool_call_calls_section_(?:begin|end)|tool_call_argument_(?:begin|end))\|?(?:>|&gt;)/gi;
+
+/**
+ * Remove stray/degenerate tool-call markers from text that is about to be
+ * emitted as user-visible content. Markers inside backtick code spans or
+ * fenced code blocks are documentation and are preserved (existing parser
+ * contract). Returns the cleaned text (may be empty).
+ */
+function stripStrayToolCallMarkers(text: string): string {
+  if (!text) return text;
+
+  // Locate backtick-delimited code spans (inline `code` and ``` fences).
+  // An unclosed span extends to the end of the text (streaming chunks can
+  // cut mid-fence; those fragments are treated as code too).
+  const codeSpans: Array<[number, number]> = [];
+  let fenceLength = 0;
+  let spanStart = -1;
+  for (let i = 0; i < text.length; ) {
+    if (text[i] !== "`") {
+      i++;
+      continue;
+    }
+    let run = 1;
+    while (i + run < text.length && text[i + run] === "`") run++;
+    if (fenceLength === 0) {
+      fenceLength = run;
+      spanStart = i;
+    } else if (run >= fenceLength) {
+      codeSpans.push([spanStart, i + run]);
+      fenceLength = 0;
+    }
+    i += run;
+  }
+  if (fenceLength > 0) codeSpans.push([spanStart, text.length]);
+  const inCode = (idx: number): boolean =>
+    codeSpans.some(([a, b]) => idx >= a && idx < b);
+
+  const combined = new RegExp(
+    [
+      STRAY_TOOL_TAG_OPEN_RE.source,
+      STRAY_TOOL_TAG_CLOSE_RE.source,
+      STRAY_TOOL_TAG_ENTITY_RE.source,
+      STRAY_TOOL_TAG_SPECIAL_RE.source,
+    ]
+      .map((src) => `(?:${src})`)
+      .join("|"),
+    "gi",
+  );
+
+  let stripped = false;
+  const cleaned = text.replace(combined, (match, offset: number) => {
+    if (inCode(offset)) return match;
+    stripped = true;
+    return "";
+  });
+  if (!stripped) return cleaned;
+  return cleaned.replace(/[ \t]*\n{3,}/g, "\n\n");
+}
+
 interface ToolEndMatch {
   index: number;
   tag: string;
@@ -2039,9 +2122,11 @@ export class StreamingToolParser {
 
   private emitVisibleText(result: ParserResult, text: string): void {
     if (!text) return;
-    const cleanText = text
-      .replace(/<\|?(?:tool_calls?_section_begin|tool_call_calls_section_begin|tool_calls?_section_end|tool_call_calls_section_end)\|?>?/gi, "")
-      .replace(/<\|?tool_call_begin\|?>?[\s\S]*?<\|?tool_call_argument_begin\|?>?[\s\S]*?(?:<\|?tool_call_end\|?>?|<\|?tool_call_argument_end\|?>?|$)/gi, "");
+    const cleanText = stripStrayToolCallMarkers(
+      text
+        .replace(/<\|?(?:tool_calls?_section_begin|tool_call_calls_section_begin|tool_calls?_section_end|tool_call_calls_section_end)\|?>?/gi, "")
+        .replace(/<\|?tool_call_begin\|?>?[\s\S]*?<\|?tool_call_argument_begin\|?>?[\s\S]*?(?:<\|?tool_call_end\|?>?|<\|?tool_call_argument_end\|?>?|$)/gi, ""),
+    );
     if (!cleanText) return;
     if (this.emittedToolCallCount === 0) {
       result.text += cleanText;
@@ -2051,8 +2136,9 @@ export class StreamingToolParser {
 
   private holdLeadIn(text: string): void {
     if (!text) return;
-    const cleanText = text
-      .replace(/<\|?(?:tool_calls?_section_begin|tool_call_calls_section_begin|tool_calls?_section_end|tool_call_calls_section_end)\|?>?/gi, "");
+    const cleanText = stripStrayToolCallMarkers(
+      text.replace(/<\|?(?:tool_calls?_section_begin|tool_call_calls_section_begin|tool_calls?_section_end|tool_call_calls_section_end)\|?>?/gi, ""),
+    );
     this.pendingLeadIn += cleanText;
     this.advanceMarkdownState(cleanText);
   }
@@ -2500,6 +2586,10 @@ export class StreamingToolParser {
       // 1. Strip any trailing orphaned `<tool_call` or `<tool_calls` prefix at the end of buffer
       // (e.g. model output `... <tool_call` without closing `>`)
       textToProcess = textToProcess.replace(/<\/?tool_calls?\b[^>]*$/i, "").trimEnd();
+      // Also strip complete stray/degenerate tool-call markers the open-tag
+      // regex didn't match (e.g. `<tool_call_>`, `</tool_call_calls>`,
+      // `<|tool_call_end|>`) which would otherwise leak as visible text.
+      textToProcess = stripStrayToolCallMarkers(textToProcess).trimEnd();
 
       // 2. Extract any unwrapped JSON tool calls from the buffer
       const { toolCalls: unwrappedCalls, remainingText } =
