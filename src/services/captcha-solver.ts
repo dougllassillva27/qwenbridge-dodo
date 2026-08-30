@@ -1,5 +1,6 @@
 import type { Locator, Page } from "playwright";
 import { humanDrag, sleep } from "./human-behavior.ts";
+import { config } from "../core/config.ts";
 
 
 export const BAXIA_DIALOG_SELECTOR = ".baxia-dialog";
@@ -79,11 +80,87 @@ const BAXIA_DOCUMENT_SELECTORS = [
 export const BAXIA_IFRAME_SELECTOR = BAXIA_IFRAME_SELECTORS.join(", ");
 
 const BAXIA_SLIDER_SELECTOR =
-  "#nc_1_n1z, .nc_1_n1z, .btn_slide, .nc_wrapper .btn_slide, ._nc .btn_slide, .nc-container .btn_slide";
+  "#nc_1_n1z, .nc_1_n1z, #nc_2_n1z, .nc_2_n1z, div[id*='_n1z'], span[id*='_n1z'], .btn_slide, .nc_wrapper .btn_slide, ._nc .btn_slide, .nc-container .btn_slide, div[role='slider'], div.slidetounlock, .nc_iconfont, .nc-lang-cnt, .button, span.btn_slide, div.btn_slide";
 const BAXIA_TRACK_SELECTOR =
-  "#nc_1_n1t, .nc_scale, .nc_wrapper .nc_scale, ._nc .nc_scale, .nc-container .nc_scale";
+  "#nc_1_n1t, .nc_scale, #nc_2_n1t, .nc_2_n1t, div[id*='_n1t'], .nc_wrapper .nc_scale, ._nc .nc_scale, .nc-container .nc_scale, .nc_bg, .scale_text, #nc_1__scale_text, #nc_2__scale_text";
+const BAXIA_CONTAINER_SELECTOR =
+  "#nc_1_wrapper, #nc_2_wrapper, .nc-container, #nocaptcha, div[id*='nc_'][id*='_wrapper'], .nc_wrapper, #baxia-dialog-content, .baxia-dialog, #baxia-punish, body";
 const BAXIA_SUCCESS_SELECTOR =
   ".btn_ok, .nc_ok, .nc_success, .nc_result, .nc_wrapper.nc-success, .nc_wrapper.success, [data-nc-lang=\"SUCCESS\"], [data-nc-lang=\"success\"], #nc-loading-circle";
+
+/**
+ * Envia uma captura do captcha para o microserviço captchaResolve (OpenAI/Vision).
+ */
+export async function resolveViaCaptchaService(
+  frame: BaxiaLocatorContext,
+  page: Page,
+  accountId = "default",
+  resolverUrl = config.captcha.resolverUrl,
+): Promise<number | null> {
+  if (!resolverUrl) return null;
+  const baseUrl = resolverUrl.replace(/\/+$/, "");
+  const targetUrl = `${baseUrl}/resolve`;
+
+  try {
+    const container = frame.locator(BAXIA_CONTAINER_SELECTOR).first();
+    let screenshotBuffer: Buffer | null = await (container as any)
+      .screenshot({ timeout: 3000 })
+      .catch(() => null);
+
+    if (!screenshotBuffer && typeof (page as any).screenshot === "function") {
+      screenshotBuffer = await (page as any)
+        .screenshot({ timeout: 3000 })
+        .catch(() => null);
+    }
+
+    if (!screenshotBuffer) {
+      return null;
+    }
+
+    const base64Image = screenshotBuffer.toString("base64");
+    console.log(`📸 [Captcha] Enviando screenshot para captchaResolve (${targetUrl})...`);
+
+    const start = Date.now();
+    const res = await fetch(targetUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image: base64Image,
+        accountId,
+      }),
+      signal: AbortSignal.timeout(15000),
+    }).catch((err) => {
+      console.warn(`⚠️ [Captcha] captchaResolve indisponível (${err.message || String(err)})`);
+      return null;
+    });
+
+    if (!res) return null;
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.warn(`⚠️ [Captcha] captchaResolve HTTP ${res.status}: ${text.slice(0, 100)}`);
+      return null;
+    }
+
+    const data = (await res.json().catch(() => null)) as {
+      success?: boolean;
+      x?: number;
+      error?: string;
+    } | null;
+
+    const duration = Date.now() - start;
+    if (data && data.success && typeof data.x === "number" && !isNaN(data.x)) {
+      console.log(`🤖 [Captcha] captchaResolve (AI Vision) calculou arrasto X = ${data.x}px (${duration}ms)`);
+      return data.x;
+    } else {
+      console.warn(`⚠️ [Captcha] captchaResolve não retornou coordenada: ${data?.error || JSON.stringify(data)}`);
+      return null;
+    }
+  } catch (err: any) {
+    console.warn(`⚠️ [Captcha] Erro no captchaResolve: ${err.message || String(err)}`);
+    return null;
+  }
+}
 
 /**
  * A challenge served to a background fetch never renders anything: the WAF
@@ -137,6 +214,7 @@ export interface BaxiaSolverOptions {
   retryDelayMs?: number;
   settleMs?: number;
   sliderTimeoutMs?: number;
+  accountId?: string;
 }
 
 interface BaxiaLocatorContext {
@@ -361,23 +439,59 @@ export async function solveBaxiaCaptcha(
       const frame: BaxiaLocatorContext = frameSelector
         ? page.frameLocator(frameSelector)
         : page;
-      const slider = frame.locator(BAXIA_SLIDER_SELECTOR);
-      await slider.waitFor({ state: "visible", timeout: sliderTimeoutMs });
+      let slider = frame.locator(BAXIA_SLIDER_SELECTOR).first();
+      try {
+        await slider.waitFor({ state: "visible", timeout: sliderTimeoutMs });
+      } catch (waitError) {
+        // Fallback: se o seletor específico falhar, tenta achar qualquer botão de slider no frame
+        const genericSlider = frame
+          .locator(
+            ".btn_slide, div[role='slider'], div.slidetounlock, .nc_iconfont, span[class*='btn']",
+          )
+          .first();
+        if (await isVisible(genericSlider)) {
+          slider = genericSlider;
+        } else {
+          throw waitError;
+        }
+      }
+
       if (!sliderFoundReported) {
         logBaxiaCaptcha("slider_found");
         sliderFoundReported = true;
       }
 
       stage = "geometry";
-      const sliderBox = await slider.boundingBox();
+      let sliderBox = await slider.boundingBox().catch(() => null);
+      if (!sliderBox) {
+        const genericSlider = frame
+          .locator(
+            ".btn_slide, div[role='slider'], div.slidetounlock, .nc_iconfont, span[class*='btn']",
+          )
+          .first();
+        sliderBox = await genericSlider.boundingBox().catch(() => null);
+      }
+
       if (!sliderBox) {
         lastReason = "bounds_unavailable";
         logBaxiaCaptcha("attempt_bounds_unavailable", { attempt });
       } else {
-        const track = frame.locator(BAXIA_TRACK_SELECTOR);
-        const trackBox = await track.boundingBox();
+        const track = frame.locator(BAXIA_TRACK_SELECTOR).first();
+        const trackBox = await track.boundingBox().catch(() => null);
         const trackWidth = trackBox?.width ?? 300;
-        const dragDistance = Math.max(0, trackWidth - sliderBox.width);
+        let dragDistance = Math.max(0, trackWidth - sliderBox.width);
+
+        // Chama o microserviço captchaResolve (OpenAI/Vision)
+        const accountId = options.accountId || "default";
+        const visionX = await resolveViaCaptchaService(frame, page, accountId);
+        if (visionX !== null && visionX > 0) {
+          dragDistance = visionX;
+        } else {
+          console.log(
+            `📐 [Captcha] Usando cálculo de trilha padrão (${Math.round(dragDistance)}px)`,
+          );
+        }
+
         lastGeometry = {
           track: Math.round(trackWidth),
           slider: Math.round(sliderBox.width),

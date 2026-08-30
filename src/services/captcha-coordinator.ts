@@ -45,11 +45,13 @@ export async function solveChallengeOnPage(
   page: Page,
   challengeUrl: string | null,
   waitForMs = config.captcha.timeoutMs,
+  accountId?: string,
 ): Promise<boolean> {
   const solverOptions = {
     maxAttempts: config.captcha.maxAttempts,
     retryDelayMs: config.captcha.retryDelayMs,
     settleMs: config.captcha.settleMs,
+    accountId,
   };
 
   // Qwen's own Baxia SDK sometimes renders the dialog for the background
@@ -126,7 +128,7 @@ export async function recoverBaxiaCaptcha(
   try {
     const solved = await withAccountPage(
       accountId,
-      (page) => solveChallengeOnPage(page, challengeUrl),
+      (page) => solveChallengeOnPage(page, challengeUrl, undefined, accountId),
       solverOperationTimeoutMs,
       Math.min(config.timeouts.page, 5_000),
     );

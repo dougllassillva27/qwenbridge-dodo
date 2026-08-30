@@ -275,7 +275,7 @@ const HEADER_CAPTURE_TRIGGER_ATTEMPTS = 3;
  * Clearing the challenge first is what keeps that from cooling down a healthy
  * account for five minutes.
  */
-async function clearVisibleChallenge(page: Page): Promise<void> {
+async function clearVisibleChallenge(page: Page, accountId?: string): Promise<void> {
   if (!config.captcha.enabled) return;
   // waitForMs 0: a single detection pass, so the common no-challenge case adds
   // no measurable cost to header capture.
@@ -284,6 +284,7 @@ async function clearVisibleChallenge(page: Page): Promise<void> {
     maxAttempts: config.captcha.maxAttempts,
     retryDelayMs: config.captcha.retryDelayMs,
     settleMs: config.captcha.settleMs,
+    accountId,
   }).catch(() => false);
 }
 
