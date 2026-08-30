@@ -3,6 +3,17 @@ import { robustParseJSON } from "../utils/json.ts";
 import { logger, isToolcallDebugEnabled } from "../core/logger.js";
 import type { ParsedToolCall } from "./types";
 import type { FunctionToolDefinition } from "./types";
+import {
+  TOOL_CALL_OPEN,
+  TOOL_CALL_CLOSE,
+  getOpenNames,
+  getCloseNames,
+  findToolOpen,
+  matchToolCloseAt,
+  openTagName,
+  closeTagFor,
+  sanitizeStrayCloses,
+} from "./toolcall-tags.ts";
 
 export interface ToolCallDelta {
   index: number;
@@ -141,19 +152,21 @@ function scanCloseTagOutsideStringsAndFences(lower: string): ToolEndMatch | null
 
     if (codeFenceLength > 0) continue;
 
-    const tag = TOOL_END_ALIASES.find((candidate) =>
-      lower.startsWith(candidate, i),
-    );
-    if (tag) return { index: i, tag };
+    // Whitespace-tolerant close over every accepted tag (custom + legacy).
+    const closeLen = matchToolCloseAt(lower, i);
+    if (closeLen !== null) {
+      return { index: i, tag: lower.substring(i, i + closeLen) };
+    }
   }
 
   return null;
 }
 
-/** All occurrences of either closing marker, in ascending index order. */
+/** All occurrences of any accepted closing marker, in ascending index order. */
 function findCloseTagOccurrences(lower: string): ToolEndMatch[] {
   const occurrences: ToolEndMatch[] = [];
-  for (const tag of TOOL_END_ALIASES) {
+  for (const name of getCloseNames()) {
+    const tag = `</${name.toLowerCase()}>`;
     let from = 0;
     for (;;) {
       const index = lower.indexOf(tag, from);
@@ -295,12 +308,13 @@ function findNextToolOpenTagOutsideMarkdownCode(
       continue;
     }
 
-    if (delimiterLength === 0) {
-      const match = buffer
-        .substring(i)
-        .match(/^<tool_call(?:s)?\b[^>]*>/i);
-      if (match && !isPrecededByBacktick(buffer, i)) {
-        return { index: i, openTag: match[0] };
+    if (delimiterLength === 0 && buffer[i] === "<") {
+      const sub = buffer.substring(i);
+      for (const name of getOpenNames()) {
+        const match = sub.match(new RegExp(`^<${name}\\b[^>]*>`, "i"));
+        if (match && !isPrecededByBacktick(buffer, i)) {
+          return { index: i, openTag: match[0] };
+        }
       }
     }
 
@@ -315,7 +329,7 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
   initialDelimiterLength = 0,
 ): number {
   let delimiterLength = initialDelimiterLength;
-  const lowerToolStart = TOOL_START_LITERAL.toLowerCase();
+  const openNames = getOpenNames();
 
   for (let i = 0; i < buffer.length;) {
     if (buffer[i] === "`") {
@@ -336,11 +350,13 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
 
     if (delimiterLength === 0 && buffer[i] === "<") {
       const tailLower = buffer.substring(i).toLowerCase();
-      if (tailLower.startsWith("<tool_call") && tailLower.indexOf(">") === -1) {
-        return i;
-      }
-      if (lowerToolStart.startsWith(tailLower)) {
-        return i;
+      if (!tailLower.includes(">")) {
+        for (const name of openNames) {
+          const full = `<${name.toLowerCase()}`;
+          if (full.startsWith(tailLower)) {
+            return i;
+          }
+        }
       }
     }
 
@@ -658,7 +674,7 @@ function parseRecoverableXmlToolCall(
 
 // ─── Partial Tag Detection ─────────────────────────────────────────────────────
 
-const TOOL_START_LITERAL = "<" + "tool_call>";
+const TOOL_START_LITERAL = TOOL_CALL_OPEN;
 
 function skipJsonWhitespace(str: string, index: number): number {
   while (index < str.length && /\s/.test(str[index])) {
@@ -1730,7 +1746,7 @@ export class StreamingToolParser {
             );
             this.processToolContent(missingOpenRecovery.candidate, result);
             this.currentOpenTag = TOOL_START_LITERAL;
-            this.currentCloseTag = TOOL_END;
+            this.currentCloseTag = TOOL_CALL_CLOSE;
             continue;
           }
 
@@ -1788,7 +1804,7 @@ export class StreamingToolParser {
           this.processToolContent(content, result);
           this.insideTool = false;
           this.currentOpenTag = TOOL_START_LITERAL;
-          this.currentCloseTag = TOOL_END;
+          this.currentCloseTag = TOOL_CALL_CLOSE;
           this.clearIncrementalToolCall();
         } else {
           this.emitIncrementalToolCallDeltas(this.buffer);
@@ -1966,9 +1982,9 @@ export class StreamingToolParser {
       // without wrapping them in <tool_call> tags, or left an incomplete `<tool_call` tag at the end.
       let textToProcess = this.buffer;
 
-      // 1. Strip any trailing orphaned `<tool_call` or `<tool_calls` prefix at the end of buffer
+      // 1. Strip any trailing orphaned `<tool_call` or `<qpx_call` prefix at the end of buffer
       // (e.g. model output `... <tool_call` without closing `>`)
-      textToProcess = textToProcess.replace(/<\/?tool_calls?\b[^>]*$/i, "").trimEnd();
+      textToProcess = textToProcess.replace(/<\/?(?:tool_calls?|qpx_call)\b[^>]*$/i, "").trimEnd();
 
       // 2. Extract any unwrapped JSON tool calls from the buffer
       const { toolCalls: unwrappedCalls, remainingText } =
@@ -2789,12 +2805,60 @@ export class StreamingToolParser {
     return null;
   }
 
+  private isHallucinatedToolCall(parsed: any): boolean {
+    const args =
+      parsed.arguments ||
+      parsed.function?.arguments ||
+      parsed.args ||
+      parsed.parameters ||
+      parsed.input ||
+      {};
+    const values =
+      typeof args === "string"
+        ? [args]
+        : typeof args === "object" && args !== null
+          ? Object.values(args).filter((v) => typeof v === "string") as string[]
+          : [];
+    for (const val of values) {
+      // Detect vertical hallucination: single chars separated by newlines
+      // e.g. "f\ni\ne\nl\nd\ns" or "a\nc\nf\ng\ne\nt..." (5+ single-char lines)
+      // and zero-width / ornament chars inserted by WAF/bx
+      const lines = val.split("\n");
+      if (lines.length >= 8) {
+        let singleCharLines = 0;
+        for (const line of lines) {
+          const trimmed = line.replace(/[\u200B\uFEFF¨\u00A8]/g, "").trim();
+          if (trimmed.length === 1 && /^[A-Za-z0-9=_\-;()]$/.test(trimmed)) {
+            singleCharLines++;
+          }
+        }
+        if (singleCharLines >= 6 && singleCharLines / lines.length > 0.5) {
+          return true;
+        }
+      }
+      // Also catch the compact form "f\ni\ne..." after JSON parsing already
+      // converted literal newlines to \n -> string contains "\n" per char
+      if (/^([A-Za-z0-9=_\-;()]\n){6,}/.test(val) || /(\w\n){8,}/.test(val)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   private parseToolCall(parsed: any): ParsedToolCall | null {
     if (!parsed || typeof parsed !== "object") return null;
 
     const name =
       parsed.name || parsed.function?.name || parsed.tool_name || parsed.tool;
     if (!name || typeof name !== "string" || name.length === 0) return null;
+
+    // Drop hallucinated tool calls where the model split a value vertically
+    // (e.g. "fields" -> "f\ni\ne\nl\nd\ns"). These are valid JSON after
+    // sanitizeAndBalance but semantically broken; treat as malformed so the
+    // [SYSTEM CORRECTION] auto-retry fires instead of delivering garbage.
+    if (this.isHallucinatedToolCall(parsed)) {
+      return null;
+    }
 
     let args =
       parsed.arguments ||
