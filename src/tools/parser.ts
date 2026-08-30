@@ -58,6 +58,20 @@ const TOOL_END_ALIASES = [
   "</" + "function_call>",
   "</" + "function_calls>",
   "</" + "function_call_>",
+  "<|tool_call_end|>",
+  "<tool_call_end|>",
+  "<|tool_call_end>",
+  "<tool_call_end>",
+  "<|tool_calls_section_end|>",
+  "<tool_calls_section_end|>",
+  "<tool_call_calls_section_end|>",
+  "<|tool_calls_section_end>",
+  "<tool_calls_section_end>",
+  "<tool_call_calls_section_end>",
+  "<|tool_call_argument_end|>",
+  "<tool_call_argument_end|>",
+  "<|tool_call_argument_end>",
+  "<tool_call_argument_end>",
 ];
 
 interface ToolEndMatch {
@@ -150,7 +164,7 @@ function scanCloseTagOutsideStringsAndFences(lower: string): ToolEndMatch | null
       }
     }
 
-    const match = lower.substring(i).match(/^(?:<\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage))(?:>|&gt;?|(?=[\s\r\n<$]))/i);
+    const match = lower.substring(i).match(/^(?:<\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|<\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?|&lt;\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?)(?:>|&gt;?|(?=[\s\r\n<$]))/i);
     if (match) return { index: i, tag: match[0] };
   }
 
@@ -168,7 +182,7 @@ function startsWithEnvironmentDetails(buffer: string): boolean {
 /** All occurrences of either closing marker, in ascending index order. */
 function findCloseTagOccurrences(lower: string): ToolEndMatch[] {
   const occurrences: ToolEndMatch[] = [];
-  const re = /(?:<\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage))(?:>|&gt;?|(?=[\s\r\n<$]))/gi;
+  const re = /(?:<\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|&lt;\/(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-z0-9_-]*|function_call_[a-z0-9_-]*|invoke\b[a-z0-9_-]*|skill_view|skill_manage)|<\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?|&lt;\|?(?:tool_call_end|tool_calls_section_end|tool_call_calls_section_end|tool_call_argument_end)\|?)(?:>|&gt;?|(?=[\s\r\n<$]))/gi;
   let match: RegExpExecArray | null = re.exec(lower);
   while (match !== null) {
     occurrences.push({ index: match.index, tag: match[0] });
@@ -196,7 +210,9 @@ function closeTagContentIsParseable(buffer: string, endIdx: number): boolean {
     content.includes("<name>") ||
     content.includes("<tool_name>") ||
     content.includes("<tool_call_arg_key") ||
-    content.includes("<arg_key")
+    content.includes("<arg_key") ||
+    content.includes("tool_call_argument_begin") ||
+    content.includes("tool_call_begin")
   ) {
     return true;
   }
@@ -278,13 +294,35 @@ function tryParseJsonToolPayload(content: string): boolean {
   const tryParse = (s: string): boolean => {
     try {
       const parsed = JSON.parse(s);
-      return typeof parsed === "object" && parsed !== null;
+      if (typeof parsed === "object" && parsed !== null) return true;
+      if (typeof parsed === "string") {
+        try {
+          const inner = JSON.parse(parsed);
+          if (typeof inner === "object" && inner !== null) return true;
+        } catch {}
+      }
+      return false;
     } catch {
       return false;
     }
   };
 
   if (tryParse(content)) return true;
+
+  if (content.includes('\\"')) {
+    if (tryParse(content.replace(/\\"/g, '"'))) return true;
+  }
+
+  if (content.includes('"name"') && content.includes("{") && content.includes("}")) {
+    const startIdx = content.indexOf("{");
+    const endIdx = content.lastIndexOf("}");
+    if (startIdx !== -1 && endIdx > startIdx) {
+      const wrapped = content.substring(startIdx, endIdx + 1);
+      if (tryParse(wrapped) || (wrapped.includes('\\"') && tryParse(wrapped.replace(/\\"/g, '"')))) {
+        return true;
+      }
+    }
+  }
 
   const repaired = repairCommonMalformedToolJson(content);
   if (tryParse(repaired)) return true;
@@ -398,7 +436,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
 
       const match = buffer
         .substring(i)
-        .match(/^(?:<|&lt;)(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:>|&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
+        .match(/^(?:<|&lt;)\|?(?:tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function_calls?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
       if (match && !isPrecededByBacktick(buffer, i)) {
         return { index: i, openTag: match[0] };
       }
@@ -457,7 +495,7 @@ function findToolOpenOutsideJsonString(
 
     const match = buffer
       .substring(i)
-      .match(/^(?:<|&lt;)(?:tool_calls?|tool_calling|function_calls?|tool_call_[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:>|&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
+      .match(/^(?:<|&lt;)\|?(?:tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function_calls?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
     if (match && !isPrecededByBacktick(buffer, i)) {
       return { index: i, openTag: match[0] };
     }
@@ -494,7 +532,10 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
       const tailLower = buffer.substring(i).toLowerCase();
       if (
         (tailLower.startsWith("<tool_call") ||
+          tailLower.startsWith("<|tool_call") ||
           tailLower.startsWith("<tool_call_section") ||
+          tailLower.startsWith("<|tool_calls_section") ||
+          tailLower.startsWith("<tool_call_calls_section") ||
           tailLower.startsWith("<tool_call_arg_key")) &&
         tailLower.indexOf(">") === -1
       ) {
@@ -534,7 +575,9 @@ function looksLikeToolCallPayload(candidate: string): boolean {
     trimmed.includes("<tool_name>") ||
     trimmed.includes("<tool_call_section") ||
     trimmed.includes("<tool_call_arg_key") ||
-    trimmed.includes("<arg_key")
+    trimmed.includes("<arg_key") ||
+    trimmed.includes("tool_call_argument_begin") ||
+    trimmed.includes("tool_call_begin")
   );
 }
 
@@ -559,6 +602,10 @@ function findCandidateStarts(buffer: string): number[] {
   pushAllMatches("<tool_call_section");
   pushAllMatches("<tool_call_arg_key");
   pushAllMatches("<arg_key");
+  pushAllMatches("<|tool_call_begin");
+  pushAllMatches("<tool_call_begin");
+  pushAllMatches("<tool_call_calls_section_begin");
+  pushAllMatches("<|tool_calls_section_begin");
 
   return starts.sort((a, b) => a - b);
 }
@@ -806,15 +853,13 @@ function parseXmlParameterToolCall(
   tools: ToolDefinitionLike[],
 ): { name: string; arguments: Record<string, unknown> } | null {
   const trimmed = block.trim();
-  if (
-    (trimmed.startsWith("{") || trimmed.startsWith("[")) &&
-    !trimmed.includes("<parameter") &&
-    !trimmed.includes("<arg_key") &&
-    !trimmed.includes("<name>") &&
-    !trimmed.includes("<tool_name>") &&
-    !openTag.includes("invoke") &&
-    !openTag.includes("skill_")
-  ) {
+  const hasXmlTags =
+    trimmed.includes("<parameter") ||
+    trimmed.includes("<arg_key") ||
+    trimmed.includes("<name>") ||
+    trimmed.includes("<tool_name>") ||
+    trimmed.includes("<tool_call_section");
+  if (!hasXmlTags && !openTag.includes("invoke") && !openTag.includes("skill_")) {
     return null;
   }
 
@@ -976,6 +1021,87 @@ function parseRecoverableXmlToolCall(
   if (!toolName) return null;
 
   return { name: toolName, arguments: args };
+}
+
+/**
+ * Parse ChatML / special-token format tool calls:
+ * <|tool_call_begin|>terminal<|tool_call_argument_begin|>{"command": "..."}<|tool_call_end|>
+ * OR when content contains multiple such calls or section tags.
+ */
+function parseSpecialTokenToolCall(
+  block: string,
+  tools: ToolDefinitionLike[],
+): Array<{ name: string; arguments: Record<string, unknown> }> {
+  const calls: Array<{ name: string; arguments: Record<string, unknown> }> = [];
+
+  // Pattern matching: [open_token] name [arg_token] args [end_token]
+  const pattern =
+    /(?:<\|?(?:tool_call_begin|tool_call)\|?>?|^)([\s\S]*?)<\|?tool_call_argument_begin\|?>?([\s\S]*?)(?:<\|?tool_call_end\|?>?|<\|?tool_call_argument_end\|?>?|(?=<\|?tool_call_begin)|$)/gi;
+
+  let match: RegExpExecArray | null = pattern.exec(block);
+  while (match !== null) {
+    let rawName = match[1].trim();
+    const rawArgs = match[2].trim();
+
+    // Clean section wrapper tags, stray xml, and |> artifacts from rawName
+    rawName = rawName
+      .replace(/<\|?[a-zA-Z0-9_-]+\|?>?/gi, "")
+      .replace(/[a-zA-Z0-9_-]*section_begin\|?>?/gi, "")
+      .replace(/[a-zA-Z0-9_-]*section_end\|?>?/gi, "")
+      .replace(/<[^>]+>/g, "")
+      .replace(/\|>/g, "")
+      .trim();
+
+    if (rawName || rawArgs) {
+      let args: Record<string, unknown> = {};
+      if (rawArgs) {
+        // Clean any end section tag that might have crept into rawArgs
+        const cleanedArgs = rawArgs
+          .replace(/<\|?(?:tool_calls?_section_end|tool_call_calls_section_end|tool_calls?_section_begin|tool_call_calls_section_begin)\|?>?/gi, "")
+          .replace(/[a-zA-Z0-9_-]*section_end\|?>?/gi, "")
+          .trim();
+
+        if (cleanedArgs.startsWith("{") || cleanedArgs.startsWith("[")) {
+          const parsed = robustParseJSON(cleanedArgs);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            args = parsed as Record<string, unknown>;
+          } else if (Array.isArray(parsed)) {
+            args = { items: parsed };
+          }
+        } else if (cleanedArgs) {
+          // If raw text (like a command string or query), map to matching tool prop
+          const toolDef = tools?.find((t) => {
+            const n = getToolDefinitionName(t);
+            return n === rawName || (n && normalizeToolNameForMatch(n) === normalizeToolNameForMatch(rawName));
+          });
+          if (toolDef) {
+            const props = getToolDefinitionProperties(toolDef);
+            const keys = Object.keys(props);
+            if (keys.length === 1) {
+              args[keys[0]] = coerceParameterValue(cleanedArgs);
+            } else if (keys.includes("command")) {
+              args["command"] = coerceParameterValue(cleanedArgs);
+            } else if (keys.includes("action")) {
+              args["action"] = coerceParameterValue(cleanedArgs);
+            } else {
+              args["input"] = coerceParameterValue(cleanedArgs);
+            }
+          } else {
+            args["command"] = coerceParameterValue(cleanedArgs);
+          }
+        }
+      }
+
+      const toolName = rawName || inferToolNameFromParameters(args, tools);
+      if (toolName) {
+        calls.push({ name: toolName, arguments: args });
+      }
+    }
+
+    match = pattern.exec(block);
+  }
+
+  return calls;
 }
 
 // ─── Partial Tag Detection ─────────────────────────────────────────────────────
@@ -1313,7 +1439,7 @@ function isJsonPayloadTruncated(content: string): boolean {
   // balanced, so robustParseJSON silently balances the string and streams a
   // fabricated call (logs1 2829-char write drop).
   const trimmed = content.trimEnd();
-  if (!/[}\]]$/.test(trimmed)) return true;
+  if (!/[}\]][\s"']*$/.test(trimmed)) return true;
   const alt: string[] = [];
   if (content.includes('"name"') || content.includes('name":')) {
     alt.push(`{"${content}`, `{${content}`, `"${content}`);
@@ -1750,7 +1876,9 @@ export class StreamingToolParser {
 
     const incremental = this.activeIncrementalToolCall;
     const matchesIncrementalCall =
-      incremental?.name === tc.name && incremental.startEmitted;
+      this.incrementalToolCalls &&
+      incremental?.name === tc.name &&
+      incremental.startEmitted;
 
     if (incremental && incremental.name === tc.name) {
       tc.id = incremental.id;
@@ -1911,16 +2039,22 @@ export class StreamingToolParser {
 
   private emitVisibleText(result: ParserResult, text: string): void {
     if (!text) return;
+    const cleanText = text
+      .replace(/<\|?(?:tool_calls?_section_begin|tool_call_calls_section_begin|tool_calls?_section_end|tool_call_calls_section_end)\|?>?/gi, "")
+      .replace(/<\|?tool_call_begin\|?>?[\s\S]*?<\|?tool_call_argument_begin\|?>?[\s\S]*?(?:<\|?tool_call_end\|?>?|<\|?tool_call_argument_end\|?>?|$)/gi, "");
+    if (!cleanText) return;
     if (this.emittedToolCallCount === 0) {
-      result.text += text;
+      result.text += cleanText;
     }
-    this.advanceMarkdownState(text);
+    this.advanceMarkdownState(cleanText);
   }
 
   private holdLeadIn(text: string): void {
     if (!text) return;
-    this.pendingLeadIn += text;
-    this.advanceMarkdownState(text);
+    const cleanText = text
+      .replace(/<\|?(?:tool_calls?_section_begin|tool_call_calls_section_begin|tool_calls?_section_end|tool_call_calls_section_end)\|?>?/gi, "");
+    this.pendingLeadIn += cleanText;
+    this.advanceMarkdownState(cleanText);
   }
 
   private isDeclaredToolName(name: string): boolean {
@@ -2030,6 +2164,15 @@ export class StreamingToolParser {
           this.markdownCodeDelimiterLength,
         );
         if (match) {
+          // If it's a section wrapper tag (<tool_call_calls_section_begin|>, <|tool_calls_section_begin|>, <|tool_calls_section_end|>, etc.),
+          // hold lead-in and consume the section tag without setting insideTool = true.
+          if (/section_begin|section_end/i.test(match.openTag)) {
+            const textBefore = this.buffer.substring(0, match.index);
+            if (textBefore) this.holdLeadIn(textBefore);
+            this.buffer = this.buffer.substring(match.index + match.openTag.length);
+            continue;
+          }
+
           // Text before the tool call tag
           const textBefore = this.buffer.substring(0, match.index);
           if (isToolcallDebugEnabled()) {
@@ -2453,6 +2596,56 @@ export class StreamingToolParser {
       });
     }
 
+    // 0) Try ChatML / Special-token format:
+    // <|tool_call_begin|>terminal<|tool_call_argument_begin|>{"command": "..."}<|tool_call_end|>
+    if (
+      t.includes("tool_call_argument_begin") ||
+      t.includes("tool_call_begin") ||
+      this.currentOpenTag.includes("tool_call_begin") ||
+      this.currentOpenTag.includes("section_begin")
+    ) {
+      const specialCalls = parseSpecialTokenToolCall(t, this.tools);
+      if (specialCalls.length > 0) {
+        for (const sc of specialCalls) {
+          const resolvedName = this.resolveDeclaredToolName(sc.name);
+          if (resolvedName) sc.name = resolvedName;
+        }
+        const undeclaredToolNames = specialCalls
+          .map((tc) => tc.name)
+          .filter((name) => !this.isDeclaredToolName(name));
+        if (undeclaredToolNames.length > 0 && this.declaredToolNameSet.size > 0) {
+          this.recordMalformedToolCall(content, {
+            undeclaredNames: undeclaredToolNames,
+            category: "undeclared",
+          });
+          this.preserveLiteralToolCall(
+            content,
+            result,
+            `undeclared tool names in special tokens: ${undeclaredToolNames.join(", ")}`,
+          );
+          return;
+        }
+
+        for (const sc of specialCalls) {
+          if (isToolcallDebugEnabled()) {
+            logger.debug("[parser] processToolContent: special-token tool call parsed", {
+              name: sc.name,
+              arguments: sc.arguments,
+            });
+          }
+          this.finalizeSuccessfulToolCall(
+            {
+              id: `call_${crypto.randomUUID()}`,
+              name: sc.name,
+              arguments: sc.arguments,
+            },
+            result,
+          );
+        }
+        return;
+      }
+    }
+
     // 1) Try Hermes-style XML <parameter> format first
     const xmlParsed = parseXmlParameterToolCall(
       t,
@@ -2742,6 +2935,21 @@ export class StreamingToolParser {
       });
     }
 
+    if (block.includes("tool_call_argument_begin") || block.includes("tool_call_begin")) {
+      const special = parseSpecialTokenToolCall(block, this.tools);
+      if (special.length > 0) {
+        const resolvedName = this.resolveDeclaredToolName(special[0].name);
+        if (resolvedName) special[0].name = resolvedName;
+        if (this.isDeclaredToolName(special[0].name) || this.declaredToolNameSet.size === 0) {
+          return {
+            id: `call_${crypto.randomUUID()}`,
+            name: special[0].name,
+            arguments: special[0].arguments,
+          };
+        }
+      }
+    }
+
     // Try full parse first
     const xmlParsed = parseXmlParameterToolCall(
       block,
@@ -2945,24 +3153,25 @@ export class StreamingToolParser {
     // stream a cut call to the client and skip the auto-retry. Drop it so the
     // malformed tracking fires and the model re-emits cleanly.
     if (isJsonPayloadTruncated(block)) return null;
-    const variants = [block];
+    const variants: string[] = [];
     if (block.includes('\\"')) {
       variants.push(block.replace(/\\"/g, '"'));
     }
+    variants.push(block);
 
     for (const variant of variants) {
       try {
-        const parsed = robustParseJSON(variant);
-        if (parsed && typeof parsed === "object") {
-          const tc = this.parseToolCall(parsed);
+        const extracted = this.extractJsonToolCallByBraceMatching(variant);
+        if (extracted) {
+          const tc = this.parseToolCall(extracted);
           if (tc && this.isDeclaredToolName(tc.name)) return tc;
         }
       } catch {}
 
       try {
-        const extracted = this.extractJsonToolCallByBraceMatching(variant);
-        if (extracted) {
-          const tc = this.parseToolCall(extracted);
+        const parsed = robustParseJSON(variant);
+        if (parsed && typeof parsed === "object") {
+          const tc = this.parseToolCall(parsed);
           if (tc && this.isDeclaredToolName(tc.name)) return tc;
         }
       } catch {}
@@ -3006,7 +3215,12 @@ export class StreamingToolParser {
     if (!isJsonPayloadTruncated(str)) {
       for (const candidate of jsonCandidates) {
         try {
-          const parsed = robustParseJSON(candidate);
+          let parsed = robustParseJSON(candidate);
+          if (typeof parsed === "string") {
+            try {
+              parsed = robustParseJSON(parsed);
+            } catch {}
+          }
           if (parsed && typeof parsed === "object") {
             const tc = this.parseToolCall(parsed);
             if (tc) {
@@ -3093,8 +3307,10 @@ export class StreamingToolParser {
     // payloads. Same truncation gate as the single-JSON parse: a structurally
     // truncated payload must not be robust-recovered (it would stream a cut
     // call and skip the malformed auto-retry).
-    if (calls.length === 0 && str.includes('"name"') && !isJsonPayloadTruncated(str)) {
-      const extracted = this.extractJsonToolCallByBraceMatching(str);
+    if (calls.length === 0 && (str.includes('"name"') || str.includes('\\"name\\"')) && !isJsonPayloadTruncated(str)) {
+      const extracted =
+        this.extractJsonToolCallByBraceMatching(str) ||
+        (str.includes('\\"') ? this.extractJsonToolCallByBraceMatching(str.replace(/\\"/g, '"')) : null);
       if (extracted) {
         const tc = this.parseToolCall(extracted);
         if (
@@ -3252,6 +3468,31 @@ export class StreamingToolParser {
   public extractUnwrappedToolCalls(
     text: string,
   ): { toolCalls: ParsedToolCall[]; remainingText: string } {
+    if (text.includes("tool_call_argument_begin") || text.includes("tool_call_begin")) {
+      const specialCalls = parseSpecialTokenToolCall(text, this.tools);
+      if (specialCalls.length > 0) {
+        const validCalls: ParsedToolCall[] = [];
+        for (const sc of specialCalls) {
+          const resolvedName = this.resolveDeclaredToolName(sc.name);
+          if (resolvedName) sc.name = resolvedName;
+          if (this.isDeclaredToolName(sc.name) || this.declaredToolNameSet.size === 0) {
+            validCalls.push({
+              id: `call_${crypto.randomUUID()}`,
+              name: sc.name,
+              arguments: sc.arguments,
+            });
+          }
+        }
+        if (validCalls.length > 0) {
+          const remainingText = text
+            .replace(/<\|?(?:tool_calls?_section_begin|tool_call_calls_section_begin|tool_calls?_section_end|tool_call_calls_section_end)\|?>?/gi, "")
+            .replace(/<\|?tool_call_begin\|?>?[\s\S]*?<\|?tool_call_argument_begin\|?>?[\s\S]*?(?:<\|?tool_call_end\|?>?|<\|?tool_call_argument_end\|?>?|$)/gi, "")
+            .trim();
+          return { toolCalls: validCalls, remainingText };
+        }
+      }
+    }
+
     const trimmed = text.trim();
     if (!trimmed.includes('"name"') && !trimmed.includes('name":') && !trimmed.includes("'name'")) {
       return { toolCalls: [], remainingText: text };

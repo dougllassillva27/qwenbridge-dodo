@@ -976,3 +976,118 @@ test("StreamingToolParser: parses deformed <tool_call= streamed in chunks", () =
   assert.strictEqual(toolCalls[0].name, "vision_analyze");
   assert.strictEqual((toolCalls[0].arguments as any).image_url, "C:\\path.png");
 });
+
+test("StreamingToolParser: parses ChatML special-token format tool call (<|tool_call_begin|>)", () => {
+  const TERMINAL_TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "terminal",
+        description: "Run a command in terminal",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string" },
+          },
+          required: ["command"],
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(TERMINAL_TOOLS);
+  const input =
+    '<|tool_call_begin|>terminal<|tool_call_argument_begin|>{"command": "ls /root/.hermes/plugins/"}<|tool_call_end|>';
+
+  const res = parser.feed(input);
+  const flushed = parser.flush();
+  const toolCalls = [...res.toolCalls, ...flushed.toolCalls];
+
+  assert.strictEqual(toolCalls.length, 1);
+  assert.strictEqual(toolCalls[0].name, "terminal");
+  assert.strictEqual(
+    (toolCalls[0].arguments as any).command,
+    "ls /root/.hermes/plugins/",
+  );
+  assert.strictEqual(res.text + flushed.text, "");
+});
+
+test("StreamingToolParser: parses multiple tool calls inside <tool_call_calls_section_begin|>", () => {
+  const TERMINAL_TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "terminal",
+        description: "Run a command in terminal",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string" },
+          },
+          required: ["command"],
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(TERMINAL_TOOLS);
+  const cmd1 = 'ls /root/.hermes/plugins/; echo "==="; cat /root/.hermes/plugins/model-providers/* 2>/dev/null | head -30';
+  const cmd2 = 'grep -rn "hook|plugin|filter" /usr/local/lib/hermes-agent/plugins/__init__.py';
+  const input =
+    '<tool_call_calls_section_begin|>\n' +
+    `<|tool_call_begin|>terminal<|tool_call_argument_begin|>${JSON.stringify({ command: cmd1 })}<|tool_call_end|>\n` +
+    `<|tool_call_begin|>terminal<|tool_call_argument_begin|>${JSON.stringify({ command: cmd2 })}<|tool_call_end|>\n` +
+    '<|tool_calls_section_end|>';
+
+  const res = parser.feed(input);
+  const flushed = parser.flush();
+  const toolCalls = [...res.toolCalls, ...flushed.toolCalls];
+
+  assert.strictEqual(toolCalls.length, 2);
+  assert.strictEqual(toolCalls[0].name, "terminal");
+  assert.strictEqual((toolCalls[0].arguments as any).command, cmd1);
+  assert.strictEqual(toolCalls[1].name, "terminal");
+  assert.strictEqual((toolCalls[1].arguments as any).command, cmd2);
+  assert.strictEqual(res.text + flushed.text, "");
+});
+
+test("StreamingToolParser: streams special-token format in chunks with lead-in text", () => {
+  const TERMINAL_TOOLS = [
+    {
+      type: "function" as const,
+      function: {
+        name: "terminal",
+        description: "Run a command in terminal",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string" },
+          },
+          required: ["command"],
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(TERMINAL_TOOLS);
+  const chunk1 = "Vou verificar se existe alguma configuração nativa:\n\n<tool_call_calls_section_begin|>\n";
+  const chunk2 = "<|tool_call_begin|>terminal<|tool_call_argument_begin|>";
+  const chunk3 = '{"command": "ls /root/.hermes/plugins/"}<|tool_call_end|>\n<|tool_calls_section_end|>';
+
+  const res1 = parser.feed(chunk1);
+  const res2 = parser.feed(chunk2);
+  const res3 = parser.feed(chunk3);
+  const flushed = parser.flush();
+
+  const toolCalls = [
+    ...res1.toolCalls,
+    ...res2.toolCalls,
+    ...res3.toolCalls,
+    ...flushed.toolCalls,
+  ];
+
+  assert.strictEqual(toolCalls.length, 1);
+  assert.strictEqual(toolCalls[0].name, "terminal");
+  assert.strictEqual((toolCalls[0].arguments as any).command, "ls /root/.hermes/plugins/");
+});
+
