@@ -138,6 +138,13 @@ function runMigrations(db: Database.Database): void {
 
     CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
 
+    CREATE TABLE IF NOT EXISTS fingerprint_salts (
+      id TEXT PRIMARY KEY,
+      salt INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_fingerprint_salts_id ON fingerprint_salts(id);
+
     -- Cooldown persistence columns (ignore if already exist)
     -- Note: SQLite doesn't support IF NOT EXISTS for ALTER TABLE ADD COLUMN,
     -- so these are wrapped in try-catch at the application level.
@@ -425,4 +432,29 @@ export function deleteSession(sessionKey: string): void {
     .prepare("DELETE FROM sessions WHERE session_key = ?")
     .run(sessionKey);
 }
+
+export function getFingerprintSalt(id: string): number {
+  try {
+    const row = getDatabase()
+      .prepare("SELECT salt FROM fingerprint_salts WHERE id = ?")
+      .get(id) as { salt: number } | undefined;
+    return row?.salt ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+export function setFingerprintSalt(id: string, salt: number): void {
+  try {
+    getDatabase()
+      .prepare(`
+        INSERT INTO fingerprint_salts (id, salt) VALUES (?, ?)
+        ON CONFLICT(id) DO UPDATE SET salt = excluded.salt
+      `)
+      .run(id, salt >>> 0);
+  } catch (err: any) {
+    console.warn(`[Database] Failed to set fingerprint salt for ${id}:`, err?.message);
+  }
+}
+
 

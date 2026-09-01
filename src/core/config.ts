@@ -73,6 +73,9 @@ const envSchema = z
     CAPTCHA_SOLVER_SETTLE_MS: z.string().default("2000"),
     CAPTCHA_ACCOUNT_COOLDOWN_MS: z.string().default("120000"),
     OSS_MULTIPART_THRESHOLD_MB: z.string().default("5"),
+    LARGE_PROMPT_THRESHOLD: z.string().default("524288"),
+    LARGE_PROMPT_UPLOAD_CACHE_TTL_MS: z.string().default("1800000"),
+    LARGE_PROMPT_INLINE: z.string().default("false"),
     CHAT_REQUEST_LOG: z.string().default("false"),
     HTTP_TIMEOUT: z.string().default("15000"),
     CHAT_TIMEOUT: z.string().default("180000"),
@@ -229,6 +232,11 @@ export const config = {
       1 * 1024 * 1024,
       parseInt(env.OSS_MULTIPART_THRESHOLD_MB) * 1024 * 1024,
     ),
+  },
+  largePrompt: {
+    threshold: Math.max(1024, parseInt(env.LARGE_PROMPT_THRESHOLD)),
+    cacheTtlMs: Math.max(0, parseInt(env.LARGE_PROMPT_UPLOAD_CACHE_TTL_MS)),
+    inline: env.LARGE_PROMPT_INLINE === "true",
   },
   timeouts: {
     http: parseInt(env.HTTP_TIMEOUT),

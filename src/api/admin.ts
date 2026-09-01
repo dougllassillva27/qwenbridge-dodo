@@ -385,6 +385,23 @@ adminApp.get('/api/accounts', adminGuard, (c) => {
   });
 });
 
+async function kickoffAccountInitialization(account: { id: string; email: string }): Promise<void> {
+  const { getAccountCredentials } = await import('../core/accounts.ts');
+  const { initPlaywrightForAccount } = await import('../services/playwright.ts');
+  const creds = getAccountCredentials(account.id);
+  if (!creds) return;
+
+  try {
+    await initPlaywrightForAccount(
+      { ...creds, id: account.id, email: account.email },
+      config.browser.headless,
+    );
+    console.log(`[Admin] Browser context initialized for new account ${account.email}`);
+  } catch (err: any) {
+    console.error(`[Admin] Failed to initialize browser context for ${account.email}:`, err.message);
+  }
+}
+
 adminApp.post('/api/accounts', adminGuard, async (c) => {
   const body: any = await c.req.json().catch(() => null);
   const email = String(body?.email || '').trim();
@@ -392,7 +409,10 @@ adminApp.post('/api/accounts', adminGuard, async (c) => {
   if (!email || !password) return c.json({ error: 'email e password são obrigatórios' }, 400);
   try {
     const account = addAccount(email, password);
-    return c.json({ ok: true, account: { ...account, password: '***' } });
+    kickoffAccountInitialization(account).catch((err) => {
+      console.error(`[Admin] Account initialization failed for ${email}:`, err?.message);
+    });
+    return c.json({ ok: true, account: { ...account, password: '***' }, initializing: true });
   } catch (err: any) {
     return c.json({ error: err.message }, 400);
   }

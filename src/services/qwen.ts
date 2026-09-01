@@ -12,6 +12,7 @@ import {
 } from "../core/errors.ts";
 import { buildQwenRequestHeaders } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
+import { uploadLargePromptAsFile } from "../routes/upload.ts";
 import { config, type ChatMode } from "../core/config.ts";
 import { logger } from "../core/logger.ts";
 import { estimateTokenCount } from "../utils/context-truncation.ts";
@@ -2629,6 +2630,30 @@ async function createQwenStreamInternal(
     }
   }
 
+  let finalPrompt = prompt;
+  let finalFiles = files || [];
+
+  if (!config.largePrompt.inline && Buffer.byteLength(prompt, "utf-8") > config.largePrompt.threshold) {
+    try {
+      const uploadedFile = await uploadLargePromptAsFile(
+        prompt,
+        activeHeaders,
+        accountId,
+      );
+      if (uploadedFile) {
+        finalFiles = [...finalFiles, uploadedFile];
+        finalPrompt = `[SYSTEM DIRECTIVE] The uploaded file "${uploadedFile.name}" contains the system prompt, persona, and the user's complete request. Read the attached file in full, internalize its instructions, and answer the user's request completely, in the same language. NEVER reply with only a short acknowledgment such as "Yes", "OK", or "Sim". [/SYSTEM DIRECTIVE]`;
+        console.log(
+          `📦 [Upload] Large prompt converted to OSS attachment ${uploadedFile.name} | sha256 cache enabled`,
+        );
+      }
+    } catch (err: any) {
+      console.warn(
+        `[Upload] Failed to upload large prompt as attachment, falling back to inline: ${err.message}`,
+      );
+    }
+  }
+
   const timestamp = Math.floor(Date.now() / 1000);
   const fid = uuidv4();
   const childId = uuidv4();
@@ -2650,9 +2675,9 @@ async function createQwenStreamInternal(
         parentId: actualParentId,
         childrenIds: [childId],
         role: "user",
-        content: prompt,
+        content: finalPrompt,
         user_action: "chat",
-        files: files || [],
+        files: finalFiles,
         timestamp: timestamp,
         models: [model],
         model: "",

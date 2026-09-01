@@ -48,9 +48,14 @@ import {
   getFingerprintProfile,
   type FingerprintProfile,
 } from "./fingerprint.ts";
+import { setFingerprintRotationListener } from "../core/account-isolation.ts";
 import { subtlePageActivity } from "./human-behavior.ts";
 import { solveBaxiaCaptcha } from "./captcha-solver.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
+
+setFingerprintRotationListener(async (accountId: string) => {
+  await closePlaywrightForAccount(accountId).catch(() => {});
+});
 
 // Try to import playwright-extra and stealth, fallback to regular playwright
 let chromiumWithStealth: typeof chromium | null = null;

@@ -147,13 +147,45 @@ export interface FingerprintProfile {
   outerHeightOffset: number;
 }
 
+import { getFingerprintSalt, setFingerprintSalt } from "../core/database.ts";
+
 const profileCache = new Map<string, FingerprintProfile>();
+const saltCache = new Map<string, number>();
+
+function loadSalt(accountId: string): number {
+  if (saltCache.has(accountId)) return saltCache.get(accountId)!;
+  let salt = 0;
+  try {
+    salt = getFingerprintSalt(accountId);
+  } catch {
+    // DB unavailable
+  }
+  saltCache.set(accountId, salt);
+  return salt;
+}
+
+export function getFingerprintSaltValue(accountId: string): number {
+  return loadSalt(accountId);
+}
+
+export function rotateFingerprintSeed(accountId: string): number {
+  const next = (loadSalt(accountId) + 1) >>> 0;
+  saltCache.set(accountId, next);
+  try {
+    setFingerprintSalt(accountId, next);
+  } catch {
+    // DB unavailable
+  }
+  profileCache.delete(accountId);
+  return next;
+}
 
 export function getFingerprintProfile(accountId: string): FingerprintProfile {
   const cached = profileCache.get(accountId);
   if (cached) return cached;
 
-  const seed = seedFromString(accountId);
+  const salt = loadSalt(accountId);
+  const seed = (seedFromString(accountId) ^ salt) >>> 0;
   const rng = mulberry32(seed);
   const viewport = pick(rng, VIEWPORTS);
   const webgl = pick(rng, WEBGL_PROFILES);
@@ -218,6 +250,11 @@ export function getFingerprintProfile(accountId: string): FingerprintProfile {
 }
 
 export function clearFingerprintCache(accountId?: string): void {
-  if (accountId) profileCache.delete(accountId);
-  else profileCache.clear();
+  if (accountId) {
+    profileCache.delete(accountId);
+    saltCache.delete(accountId);
+  } else {
+    profileCache.clear();
+    saltCache.clear();
+  }
 }

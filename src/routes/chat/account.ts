@@ -8,6 +8,7 @@ import {
 	syncCooldownsFromDb,
 } from "../../core/account-manager.ts";
 import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from "../../core/account-priority.ts";
+import { recordAccountBlock, noteAccountRecovery } from "../../core/account-isolation.ts";
 import { loadAccounts, type QwenAccount } from "../../core/accounts.ts";
 import { config, type ChatMode } from "../../core/config.ts";
 import { ClientAbortedError, UpstreamRateLimit } from "../../core/errors.ts";
@@ -718,10 +719,11 @@ export async function acquireUpstreamStream(
 		// challenged in turn and multiply the solver budget by the pool size.
 		if (isAntiBotError(lastError)) {
 			if (config.captcha.accountCooldownMs > 0) {
-				markAccountRateLimited(
+				recordAccountBlock(
 					accountId,
-					config.captcha.accountCooldownMs,
+					"captcha",
 					"WafChallenge",
+					{ cooldownMs: config.captcha.accountCooldownMs },
 				);
 			}
 
@@ -1394,6 +1396,7 @@ async function tryCreateStreamWithRetry(
 			}
 
 			markAccountSuccessful(currentAccountId);
+			noteAccountRecovery(currentAccountId);
 			if (accountLease) {
 				markLeaseCompletion(
 					currentAccountId,

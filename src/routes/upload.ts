@@ -9,6 +9,8 @@ import { ValidationError, ServiceUnavailable } from "../core/errors.js";
 import { sendOpenAIError } from "../api/error-helpers.js";
 import { buildQwenRequestHeaders } from "../services/qwen-headers.ts";
 import { qwenUrl } from "../services/qwen-url.ts";
+import crypto from "crypto";
+import { cache } from "../cache/memory-cache.ts";
 import { config } from "../core/config.ts";
 
 // Cache the heavy ali-oss module so we import it once, not on every upload.
@@ -753,3 +755,71 @@ export async function processImagesForQwen(
   const combinedText = [...docTexts, ...textParts].join("\n\n");
   return { text: combinedText, files, docText: docTexts.join("\n\n") };
 }
+
+export async function uploadLargePromptAsFile(
+  promptText: string,
+  headers: Record<string, string>,
+  accountId?: string,
+): Promise<QwenFileEntry | null> {
+  const byteLength = Buffer.byteLength(promptText, "utf-8");
+  if (byteLength <= config.largePrompt.threshold) return null;
+
+  const cacheTtlMs = config.largePrompt.cacheTtlMs;
+  const hash = crypto.createHash("sha256").update(promptText, "utf-8").digest("hex");
+  const cacheKey = `prompt:upload:${accountId || "global"}:${hash}` as const;
+
+  if (cacheTtlMs > 0) {
+    const cached = await cache.get<QwenFileEntry>(cacheKey);
+    if (cached) {
+      console.log(`[Upload] Large prompt cache hit (${hash.slice(0, 12)}…), reusing ${cached.name}`);
+      return { ...cached, itemId: uuidv4(), uploadTaskId: uuidv4() };
+    }
+  }
+
+  const filename = `prompt_${Date.now()}.md`;
+  const buffer = Buffer.from(promptText, "utf-8");
+
+  const stsData = await getSTSToken(filename, buffer.length, "file", headers);
+  const fileUrl = await uploadToOSS(buffer.buffer, stsData, filename);
+
+  const entry: QwenFileEntry = {
+    type: "file",
+    file: {
+      created_at: Date.now(),
+      data: {},
+      filename,
+      hash: null,
+      id: stsData.file_id,
+      user_id: "proxy-user",
+      meta: { name: filename, size: buffer.length, content_type: "text/markdown" },
+      update_at: Date.now(),
+      lastModified: Date.now(),
+      name: filename,
+      webkitRelativePath: "",
+      size: buffer.length,
+      type: "text/markdown",
+    },
+    id: stsData.file_id,
+    url: fileUrl,
+    name: filename,
+    collection_name: "",
+    progress: 100,
+    status: "uploaded",
+    greenNet: "success",
+    size: buffer.length,
+    error: "",
+    itemId: uuidv4(),
+    file_type: "text/markdown",
+    showType: "file",
+    file_class: "file",
+    uploadTaskId: uuidv4(),
+  };
+
+  if (cacheTtlMs > 0) {
+    await cache.set(cacheKey, entry, Math.ceil(cacheTtlMs / 1000));
+    console.log(`[Upload] Large prompt uploaded and cached (${hash.slice(0, 12)}…, TTL ${cacheTtlMs}ms)`);
+  }
+
+  return entry;
+}
+

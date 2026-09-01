@@ -33,3 +33,14 @@ test("fingerprint profile varies across accounts without changing invariants", (
   assert.ok(second.hardwareConcurrency >= 4);
   assert.ok(second.deviceMemory >= 4);
 });
+
+test("rotateFingerprintSeed changes fingerprint profile on rotation", async () => {
+  const { rotateFingerprintSeed } = await import("../services/fingerprint.ts");
+  clearFingerprintCache();
+  const before = getFingerprintProfile("account-rot");
+  rotateFingerprintSeed("account-rot");
+  const after = getFingerprintProfile("account-rot");
+
+  assert.notEqual(after.seed, before.seed);
+  assert.notEqual(after.userAgent, before.userAgent);
+});
