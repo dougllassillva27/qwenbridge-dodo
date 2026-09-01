@@ -25,6 +25,7 @@ function locator(options: LocatorOptions = {}): Locator {
     isVisible: options.isVisible ?? (async () => false),
     waitFor: options.waitFor ?? (async () => undefined),
     boundingBox: options.boundingBox ?? (async () => null),
+    screenshot: async () => Buffer.from("fake-image"),
   };
   return value as unknown as Locator;
 }
@@ -554,4 +555,74 @@ test("resolveViaCaptchaService falls back to secondary endpoint when primary fai
     globalThis.fetch = originalFetch;
   }
 });
+
+test("solveBaxiaCaptcha tries native code twice first and falls back to captchaResolve on attempt 3", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCallCount = 0;
+  let attemptCount = 0;
+  let challengeVisible = true;
+
+  globalThis.fetch = (async () => {
+    fetchCallCount++;
+    return new Response(JSON.stringify({ success: true, x: 190 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const slider = locator({
+    waitFor: async () => undefined,
+    boundingBox: async () => ({ x: 10, y: 20, width: 40, height: 40 }),
+  });
+  const track = locator({
+    boundingBox: async () => ({ x: 10, y: 20, width: 300, height: 40 }),
+  });
+
+  const frame = baxiaFrame(slider, track);
+  (frame.locator as any) = (selector: string) => {
+    if (selector.includes("nc_1_n1z") || selector.includes(".btn_slide")) return slider;
+    if (selector.includes("nc_1_n1t") || selector.includes(".nc_scale")) return track;
+    const base = locator();
+    (base as any).screenshot = async () => Buffer.from("test");
+    return base;
+  };
+
+  const page = pageWithLocators(
+    {
+      "#nocaptcha": locator({ isVisible: () => Promise.resolve(challengeVisible) }),
+      "#baxia-punish": locator({ isVisible: () => Promise.resolve(challengeVisible) }),
+      "#nc_1_n1z": slider,
+      "#nc_1_n1t": track,
+    },
+    frame,
+    {
+      move: async () => undefined,
+      down: async () => undefined,
+      up: async () => {
+        attemptCount++;
+        // Attempts 1 and 2 fail (challenge remains visible)
+        // Attempt 3 succeeds (challenge disappears)
+        if (attemptCount >= 3) {
+          challengeVisible = false;
+        }
+      },
+    } as unknown as Page["mouse"],
+  );
+
+  try {
+    const solved = await solveBaxiaCaptcha(page, {
+      maxAttempts: 3,
+      retryDelayMs: 0,
+      settleMs: 0,
+    });
+
+    assert.equal(solved, true);
+    assert.equal(attemptCount, 3);
+    // On attempts 1 and 2, fetch is not called (0 calls). On attempt 3, fetch is called once (1 call).
+    assert.equal(fetchCallCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 

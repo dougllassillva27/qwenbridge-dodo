@@ -260,7 +260,7 @@ interface BaxiaChallengeTarget {
   locator: Locator;
 }
 
-const DEFAULT_MAX_ATTEMPTS = 3;
+const DEFAULT_MAX_ATTEMPTS = 4;
 const DEFAULT_RETRY_DELAY_MS = 1_000;
 const DEFAULT_SETTLE_MS = 2_000;
 const DEFAULT_SLIDER_TIMEOUT_MS = 5_000;
@@ -514,15 +514,25 @@ export async function solveBaxiaCaptcha(
         const trackWidth = trackBox?.width ?? 300;
         let dragDistance = Math.max(0, trackWidth - sliderBox.width);
 
-        // Chama o microserviço captchaResolve (OpenAI/Vision)
-        const accountId = options.accountId || "default";
-        const visionX = await resolveViaCaptchaService(frame, page, accountId);
-        if (visionX !== null && visionX > 0) {
-          dragDistance = visionX;
-        } else {
+        if (attempt <= 2) {
+          // Tentativas 1 e 2: SEMPRE tenta primeiramente pelo código local nativo (2x forçado localmente sem acionar a API)
           console.log(
-            `📐 [Captcha] Usando cálculo de trilha padrão (${Math.round(dragDistance)}px)`,
+            `📐 [Captcha] Tentativa ${attempt}/2 (Local): tentando resolução nativa por código (trilha padrão: ${Math.round(dragDistance)}px)...`,
           );
+        } else {
+          // Tentativas 3+: Se as 2 tentativas do código nativo falharem, recorre ao captchaResolve (Vision/OpenAI)
+          console.log(
+            `🤖 [Captcha] Tentativa ${attempt}: 2 tentativas locais falharam. Recorrendo ao captchaResolve (AI Vision)...`,
+          );
+          const accountId = options.accountId || "default";
+          const visionX = await resolveViaCaptchaService(frame, page, accountId);
+          if (visionX !== null && visionX > 0) {
+            dragDistance = visionX;
+          } else {
+            console.log(
+              `📐 [Captcha] captchaResolve indisponível/sem retorno. Usando cálculo de trilha padrão (${Math.round(dragDistance)}px)`,
+            );
+          }
         }
 
         lastGeometry = {

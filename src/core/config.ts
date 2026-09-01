@@ -67,7 +67,7 @@ const envSchema = z
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
     CAPTCHA_RESOLVER_URL: z.string().default("http://127.0.0.1:50006"),
     CAPTCHA_RESOLVER_URLS: z.string().optional(),
-    CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
+    CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("4"),
     CAPTCHA_SOLVER_TIMEOUT_MS: z.string().default("15000"),
     CAPTCHA_SOLVER_RETRY_DELAY_MS: z.string().default("1000"),
     CAPTCHA_SOLVER_SETTLE_MS: z.string().default("2000"),
