@@ -1,6 +1,6 @@
 import type { Locator, Page } from "playwright";
 import { humanDrag, sleep } from "./human-behavior.ts";
-import { config } from "../core/config.ts";
+import { config, parseResolverUrls } from "../core/config.ts";
 
 
 export const BAXIA_DIALOG_SELECTOR = ".baxia-dialog";
@@ -90,16 +90,18 @@ const BAXIA_SUCCESS_SELECTOR =
 
 /**
  * Envia uma captura do captcha para o microserviço captchaResolve (OpenAI/Vision).
+ * Suporta múltiplos endpoints/IPs (ex: local e VPS) com failover automático.
  */
 export async function resolveViaCaptchaService(
   frame: BaxiaLocatorContext,
   page: Page,
   accountId = "default",
-  resolverUrl = config.captcha.resolverUrl,
+  resolverUrl: string | string[] = config.captcha.resolverUrls.length > 0
+    ? config.captcha.resolverUrls
+    : config.captcha.resolverUrl,
 ): Promise<number | null> {
-  if (!resolverUrl) return null;
-  const baseUrl = resolverUrl.replace(/\/+$/, "");
-  const targetUrl = `${baseUrl}/resolve`;
+  const candidateUrls = parseResolverUrls(resolverUrl);
+  if (candidateUrls.length === 0) return null;
 
   try {
     const container = frame.locator(BAXIA_CONTAINER_SELECTOR).first();
@@ -118,44 +120,75 @@ export async function resolveViaCaptchaService(
     }
 
     const base64Image = screenshotBuffer.toString("base64");
-    console.log(`📸 [Captcha] Enviando screenshot para captchaResolve (${targetUrl})...`);
 
-    const start = Date.now();
-    const res = await fetch(targetUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        image: base64Image,
-        accountId,
-      }),
-      signal: AbortSignal.timeout(15000),
-    }).catch((err) => {
-      console.warn(`⚠️ [Captcha] captchaResolve indisponível (${err.message || String(err)})`);
-      return null;
-    });
+    for (let i = 0; i < candidateUrls.length; i++) {
+      const baseUrl = candidateUrls[i];
+      const targetUrl = `${baseUrl}/resolve`;
+      const isLast = i === candidateUrls.length - 1;
 
-    if (!res) return null;
+      console.log(`📸 [Captcha] Enviando screenshot para captchaResolve (${targetUrl})...`);
+      const start = Date.now();
 
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      console.warn(`⚠️ [Captcha] captchaResolve HTTP ${res.status}: ${text.slice(0, 100)}`);
-      return null;
+      try {
+        const res = await fetch(targetUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            image: base64Image,
+            accountId,
+          }),
+          signal: AbortSignal.timeout(8000),
+        }).catch((err) => {
+          const errMsg = err?.name === "TimeoutError" ? "timeout de 8s excedido" : (err.message || String(err));
+          if (!isLast) {
+            console.warn(`⚠️ [Captcha] captchaResolve em ${targetUrl} indisponível (${errMsg}). Tentando próximo endpoint...`);
+          } else {
+            console.warn(`⚠️ [Captcha] captchaResolve em ${targetUrl} indisponível (${errMsg})`);
+          }
+          return null;
+        });
+
+        if (!res) continue;
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => "");
+          if (!isLast) {
+            console.warn(`⚠️ [Captcha] captchaResolve (${targetUrl}) HTTP ${res.status}: ${text.slice(0, 100)}. Tentando próximo endpoint...`);
+          } else {
+            console.warn(`⚠️ [Captcha] captchaResolve (${targetUrl}) HTTP ${res.status}: ${text.slice(0, 100)}`);
+          }
+          continue;
+        }
+
+        const data = (await res.json().catch(() => null)) as {
+          success?: boolean;
+          x?: number;
+          error?: string;
+        } | null;
+
+        const duration = Date.now() - start;
+        if (data && data.success && typeof data.x === "number" && !isNaN(data.x)) {
+          console.log(`🤖 [Captcha] captchaResolve (${targetUrl}) (AI Vision) calculou arrasto X = ${data.x}px (${duration}ms)`);
+          return data.x;
+        } else {
+          const errInfo = data?.error || JSON.stringify(data);
+          if (!isLast) {
+            console.warn(`⚠️ [Captcha] captchaResolve (${targetUrl}) não retornou coordenada válida: ${errInfo}. Tentando próximo endpoint...`);
+          } else {
+            console.warn(`⚠️ [Captcha] captchaResolve (${targetUrl}) não retornou coordenada válida: ${errInfo}`);
+          }
+        }
+      } catch (err: any) {
+        const errMsg = err?.name === "TimeoutError" ? "timeout de 8s excedido" : (err.message || String(err));
+        if (!isLast) {
+          console.warn(`⚠️ [Captcha] Erro ao consultar ${targetUrl}: ${errMsg}. Tentando próximo endpoint...`);
+        } else {
+          console.warn(`⚠️ [Captcha] Erro ao consultar ${targetUrl}: ${errMsg}`);
+        }
+      }
     }
 
-    const data = (await res.json().catch(() => null)) as {
-      success?: boolean;
-      x?: number;
-      error?: string;
-    } | null;
-
-    const duration = Date.now() - start;
-    if (data && data.success && typeof data.x === "number" && !isNaN(data.x)) {
-      console.log(`🤖 [Captcha] captchaResolve (AI Vision) calculou arrasto X = ${data.x}px (${duration}ms)`);
-      return data.x;
-    } else {
-      console.warn(`⚠️ [Captcha] captchaResolve não retornou coordenada: ${data?.error || JSON.stringify(data)}`);
-      return null;
-    }
+    return null;
   } catch (err: any) {
     console.warn(`⚠️ [Captcha] Erro no captchaResolve: ${err.message || String(err)}`);
     return null;

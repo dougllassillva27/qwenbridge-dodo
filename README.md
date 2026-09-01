@@ -342,6 +342,7 @@ npm run typecheck  # tipos
 | Variável | Default | Descrição |
 |---|---|---|
 | `CAPTCHA_SOLVER_ENABLED` | `true` | Solver Baxia/TMD ativo por padrão; use `false` somente como desligamento de emergência |
+| `CAPTCHA_RESOLVER_URL` | `http://127.0.0.1:50006` | URL ou lista de URLs/IPs (separados por vírgula) do microserviço captchaResolve (OpenAI/Vision) com failover automático |
 | `CAPTCHA_SOLVER_MAX_ATTEMPTS` | `3` | Máximo de arrastos por challenge |
 | `CAPTCHA_SOLVER_TIMEOUT_MS` | `15000` | Tempo para o iframe Baxia aparecer |
 | `CAPTCHA_SOLVER_RETRY_DELAY_MS` | `1000` | Espera entre tentativas do slider |

@@ -1,5 +1,20 @@
 import { z } from "zod";
 
+export function parseResolverUrls(input?: string | string[]): string[] {
+  if (!input) return [];
+  const rawList = Array.isArray(input) ? input : input.split(/[,;\s]+/);
+  const seen = new Set<string>();
+  const list: string[] = [];
+  for (const item of rawList) {
+    const trimmed = item.trim().replace(/\/+$/, "");
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      list.push(trimmed);
+    }
+  }
+  return list;
+}
+
 const envSchema = z
   .object({
     PORT: z
@@ -51,6 +66,7 @@ const envSchema = z
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
     CAPTCHA_RESOLVER_URL: z.string().default("http://127.0.0.1:50006"),
+    CAPTCHA_RESOLVER_URLS: z.string().optional(),
     CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
     CAPTCHA_SOLVER_TIMEOUT_MS: z.string().default("15000"),
     CAPTCHA_SOLVER_RETRY_DELAY_MS: z.string().default("1000"),
@@ -200,6 +216,7 @@ export const config = {
   captcha: {
     enabled: env.CAPTCHA_SOLVER_ENABLED === "true",
     resolverUrl: env.CAPTCHA_RESOLVER_URL,
+    resolverUrls: parseResolverUrls(env.CAPTCHA_RESOLVER_URLS || env.CAPTCHA_RESOLVER_URL),
     maxAttempts: Math.max(1, Math.min(5, parseInt(env.CAPTCHA_SOLVER_MAX_ATTEMPTS))),
     timeoutMs: Math.max(0, parseInt(env.CAPTCHA_SOLVER_TIMEOUT_MS)),
     retryDelayMs: Math.max(0, parseInt(env.CAPTCHA_SOLVER_RETRY_DELAY_MS)),

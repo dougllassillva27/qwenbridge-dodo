@@ -4,7 +4,9 @@ import type { FrameLocator, Locator, Page } from "playwright";
 import {
   extractBaxiaChallengeUrl,
   solveBaxiaCaptcha,
+  resolveViaCaptchaService,
 } from "../services/captcha-solver.ts";
+import { parseResolverUrls } from "../core/config.ts";
 
 type LocatorOptions = {
   isVisible?: () => Promise<boolean>;
@@ -484,3 +486,72 @@ test("challenge recovery reloads the chat page when the body carries no url", as
     ),
   );
 });
+
+test("parseResolverUrls parses strings, arrays, commas and deduplicates", () => {
+  assert.deepEqual(parseResolverUrls(), []);
+  assert.deepEqual(parseResolverUrls(""), []);
+  assert.deepEqual(
+    parseResolverUrls("http://127.0.0.1:50006, http://192.168.1.10:50006/"),
+    ["http://127.0.0.1:50006", "http://192.168.1.10:50006"],
+  );
+  assert.deepEqual(
+    parseResolverUrls(["http://127.0.0.1:50006/", "http://vps-ip:50006", "http://127.0.0.1:50006"]),
+    ["http://127.0.0.1:50006", "http://vps-ip:50006"],
+  );
+  assert.deepEqual(
+    parseResolverUrls("http://127.0.0.1:50006;http://172.17.0.1:50006"),
+    ["http://127.0.0.1:50006", "http://172.17.0.1:50006"],
+  );
+});
+
+test("resolveViaCaptchaService falls back to secondary endpoint when primary fails", async () => {
+  const originalFetch = globalThis.fetch;
+  const queriedUrls: string[] = [];
+
+  globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit) => {
+    const urlStr = url.toString();
+    queriedUrls.push(urlStr);
+
+    if (urlStr.includes("127.0.0.1")) {
+      // Simulate connection refused on primary (local) IP
+      throw new Error("connect ECONNREFUSED 127.0.0.1:50006");
+    }
+
+    if (urlStr.includes("vps-ip")) {
+      // Secondary endpoint responds successfully
+      return new Response(JSON.stringify({ success: true, x: 185 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+
+    return new Response("Not found", { status: 404 });
+  }) as typeof fetch;
+
+  try {
+    const mockFrame = {
+      locator: () => ({
+        first: () => ({
+          screenshot: async () => Buffer.from("fake-image"),
+        }),
+      }),
+    } as any;
+    const mockPage = {} as any;
+
+    const x = await resolveViaCaptchaService(
+      mockFrame,
+      mockPage,
+      "test-account",
+      "http://127.0.0.1:50006, http://vps-ip:50006",
+    );
+
+    assert.equal(x, 185);
+    assert.deepEqual(queriedUrls, [
+      "http://127.0.0.1:50006/resolve",
+      "http://vps-ip:50006/resolve",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
