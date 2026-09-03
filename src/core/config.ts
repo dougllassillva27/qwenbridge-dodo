@@ -9,7 +9,7 @@ const envSchema = z
         const port = Number(value);
         return port >= 1 && port <= 65535;
       }, "PORT must be between 1 and 65535")
-      .default("3000"),
+      .default("7936"),
     HOST: z.string().default("0.0.0.0"),
     INTERNAL_HOST: z.string().default("127.0.0.1"),
     USER_AGENT: z
@@ -19,9 +19,9 @@ const envSchema = z
       ),
     QWEN_BX_V: z.string().default("2.5.37"),
     // Version header on Qwen API requests = the deployed web bundle version
-    // (snapshot 18/08, networkv2 HAR: bundle qwen-chat-fe/0.2.86). The server
-    // does not validate it today; override via env when Qwen ships a new bundle.
-    QWEN_WEB_VERSION: z.string().default("0.2.86"),
+    // (snapshot network/chat.qwen.ai.v2.all.har: bundle qwen-chat-fe/0.2.89).
+    // Override via env when Qwen ships a new bundle.
+    QWEN_WEB_VERSION: z.string().default("0.2.89"),
     // Controls bx-ua/bx-umidtoken injection on the GENERAL API paths
     // (chats/new, settings): those work without them (live-probed). The
     // completions path is the exception — the 0.2.86 HAR shows the real
@@ -59,6 +59,10 @@ const envSchema = z
     CAPTCHA_SOLVER_RETRY_DELAY_MS: z.string().default("1000"),
     CAPTCHA_SOLVER_SETTLE_MS: z.string().default("2000"),
     CAPTCHA_ACCOUNT_COOLDOWN_MS: z.string().default("120000"),
+    // Cap for the escalating quarantine applied when a challenge could NOT be
+    // solved (hard block). Each consecutive hard block doubles the window
+    // (base = CAPTCHA_ACCOUNT_COOLDOWN_MS) up to this cap.
+    CAPTCHA_HARD_BLOCK_MAX_COOLDOWN_MS: z.string().default("3600000"),
     OSS_MULTIPART_THRESHOLD_MB: z.string().default("5"),
     CHAT_REQUEST_LOG: z.string().default("false"),
     HTTP_TIMEOUT: z.string().default("15000"),
@@ -99,7 +103,7 @@ const envSchema = z
     RETRY_AUTO_MALFORMED_TOOLS_MAX: z.string().default("2"),
     MAX_TOOL_CALLS_PER_TURN: z.string().default("24"),
     QWEN_REPEATED_TOOL_CALL_WARN: z.string().default("2"),
-    ACCOUNT_MAX_CONCURRENT_STREAMS: z.string().default("1"),
+    ACCOUNT_MAX_CONCURRENT_STREAMS: z.string().default("2"),
     ACCOUNT_BUSY_WAIT_MS: z.string().default("30000"),
     // Cap for the "wait forever" account-lease queue (thread owner / last
     // usable account): the queue previously had NO deadline, so a stuck lease
@@ -155,7 +159,12 @@ const envSchema = z
     CONTEXT_METER_WINDOW_TOKENS: z.string().default("0"),
     CONTEXT_METER_REPORT_USAGE: z.string().default("true"),
     DELETE_ALL_CHATS_ON_SHUTDOWN: z.string().default("false"),
-    SESSION_KEEP_ALIVE_ENABLED: z.string().default("false"),
+    // Keep idle account pages alive (subtlePageActivity + occasional reload).
+    // The Baxia WAF scores live page behavior (pointer/scroll events, open
+    // session) — an account whose page sits frozen for minutes returns a low
+    // trust score and gets TMD-challenged on the next request. On by default;
+    // the keeper skips accounts that are mid-stream or mutex-busy.
+    SESSION_KEEP_ALIVE_ENABLED: z.string().default("true"),
     SESSION_KEEP_ALIVE_INTERVAL_MS: z.string().default("30000"),
     SESSION_KEEP_ALIVE_IDLE_MS: z.string().default("120000"),
     SESSION_KEEP_ALIVE_NAVIGATION_INTERVAL_MS: z.string().default("480000"),
@@ -208,6 +217,11 @@ export const config = {
     settleMs: Math.max(0, parseInt(env.CAPTCHA_SOLVER_SETTLE_MS)),
     /** Rest an account whose challenge could not be cleared before reusing it. */
     accountCooldownMs: Math.max(0, parseInt(env.CAPTCHA_ACCOUNT_COOLDOWN_MS)),
+    /** Cap for the escalating hard-block quarantine (×2 per consecutive block). */
+    hardBlockMaxCooldownMs: Math.max(
+      0,
+      parseInt(env.CAPTCHA_HARD_BLOCK_MAX_COOLDOWN_MS),
+    ),
   },
   oss: {
     multipartThresholdBytes: Math.max(
