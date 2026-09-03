@@ -1,5 +1,3 @@
-import type { AnthropicRequest } from "./types.ts";
-
 export interface ValidationResult {
   valid: boolean;
   error?: string;
@@ -9,7 +7,7 @@ export interface ValidationResult {
  * Validate Anthropic request format
  */
 export function validateAnthropicRequest(body: unknown): ValidationResult {
-  if (!body || typeof body !== "object") {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { valid: false, error: "Request body must be a JSON object" };
   }
 

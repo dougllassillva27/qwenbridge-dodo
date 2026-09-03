@@ -7,11 +7,17 @@ export interface AnthropicRequest {
   messages: AnthropicMessage[];
   tools?: AnthropicTool[];
   tool_choice?: AnthropicToolChoice;
+  thinking?: AnthropicThinking;
   stream?: boolean;
   temperature?: number;
   top_p?: number;
   top_k?: number;
   metadata?: Record<string, unknown>;
+}
+
+export interface AnthropicThinking {
+  type: "enabled" | "disabled";
+  budget_tokens?: number;
 }
 
 export interface AnthropicMessage {
@@ -20,14 +26,16 @@ export interface AnthropicMessage {
 }
 
 export interface AnthropicContentBlock {
-  type: "text" | "tool_use" | "tool_result" | "image" | "document";
+  type: "text" | "tool_use" | "tool_result" | "image" | "document" | "thinking";
   text?: string;
   id?: string;
   name?: string;
   input?: Record<string, unknown>;
   tool_use_id?: string;
   content?: string | AnthropicContentBlock[];
+  is_error?: boolean;
   source?: AnthropicImageSource;
+  thinking?: string;
 }
 
 export interface AnthropicImageSource {
@@ -60,11 +68,12 @@ export interface AnthropicResponse {
 }
 
 export interface AnthropicResponseContentBlock {
-  type: "text" | "tool_use";
+  type: "text" | "tool_use" | "thinking";
   text?: string;
   id?: string;
   name?: string;
   input?: Record<string, unknown>;
+  thinking?: string;
 }
 
 export interface AnthropicUsage {
@@ -90,8 +99,9 @@ export interface AnthropicStreamEvent {
 }
 
 export interface AnthropicStreamDelta {
-  type?: "text_delta" | "input_json_delta";
+  type?: "text_delta" | "input_json_delta" | "thinking_delta";
   text?: string;
+  thinking?: string;
   partial_json?: string;
   stop_reason?: string;
   stop_sequence?: string | null;
@@ -106,7 +116,7 @@ export interface AnthropicError {
   request_id?: string;
 }
 
-// OpenAI compatible types for internal translation
+// Internal OpenAI-compatible types for conversion
 export interface OpenAIRequest {
   model: string;
   messages: OpenAIMessage[];
@@ -114,6 +124,7 @@ export interface OpenAIRequest {
   max_completion_tokens?: number;
   tools?: OpenAITool[];
   tool_choice?: string | object;
+  reasoning_effort?: string;
   stream?: boolean;
   temperature?: number;
   top_p?: number;
@@ -121,9 +132,10 @@ export interface OpenAIRequest {
 
 export interface OpenAIMessage {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string | null | Array<{ type: string; text?: string; image_url?: { url: string } }>;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
+  reasoning_content?: string;
 }
 
 export interface OpenAITool {

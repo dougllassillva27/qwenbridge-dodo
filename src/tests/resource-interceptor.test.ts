@@ -40,7 +40,7 @@ test("isAbortedResource: aborts analytics and tracking beacons", () => {
 
 test("setupResourceInterception: sets up route handler on context", async () => {
   let registeredPattern = "";
-  let interceptedHandler: ((route: any) => Promise<void>) | null = null;
+  let interceptedHandler: any = null;
 
   const mockContext: any = {
     route: async (pattern: string, handler: (route: any) => Promise<void>) => {

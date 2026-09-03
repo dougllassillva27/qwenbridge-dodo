@@ -16,11 +16,11 @@ import { imagesGenerations } from "../routes/images.js";
 import { videosGenerations, videoTaskStatus } from "../routes/videos.js";
 import { responsesApp } from "../routes/responses/index.js";
 import { completionsLegacy } from "../routes/completions.js";
+import { anthropicApp } from "../routes/anthropic/index.ts";
 import { sendOpenAIError } from "./error-helpers.js";
 import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
 import { isAuthMockEnabled } from "../services/auth-playwright.js";
-import { anthropicApp } from "../routes/anthropic/index.js";
 import { dashboardApp } from "./dashboard.js";
 import { adminApp } from "./admin.ts";
 
@@ -214,7 +214,24 @@ function verifyApiKey(c: Context): Response | null {
   if (!apiKey) return null;
 
   const candidates = extractProvidedApiKeys(c);
+  const isAnthropic =
+    c.req.path.startsWith("/v1/messages") ||
+    !!c.req.header("anthropic-version");
+
   if (candidates.length === 0) {
+    if (isAnthropic) {
+      c.header("anthropic-version", c.req.header("anthropic-version") || "2023-06-01");
+      return c.json(
+        {
+          type: "error",
+          error: {
+            type: "authentication_error",
+            message: "Missing or invalid credentials (Authorization Bearer or x-api-key)",
+          },
+        },
+        401,
+      );
+    }
     return sendOpenAIError(
       c,
       new AuthError(
@@ -225,9 +242,21 @@ function verifyApiKey(c: Context): Response | null {
   if (candidates.some((token) => constantTimeStringEqual(token, apiKey))) {
     return null;
   }
+  if (isAnthropic) {
+    c.header("anthropic-version", c.req.header("anthropic-version") || "2023-06-01");
+    return c.json(
+      {
+        type: "error",
+        error: {
+          type: "authentication_error",
+          message: "Invalid API key",
+        },
+      },
+      401,
+    );
+  }
   return sendOpenAIError(c, new AuthError("Invalid API key"));
 }
-
 app.use("/v1/*", async (c, next) => {
   const error = verifyApiKey(c);
   if (error) return error;
@@ -266,6 +295,7 @@ const LEGACY_REDIRECTS: Array<[string, string]> = [
   ["/completions", "/v1/completions"],
   ["/responses", "/v1/responses"],
   ["/models", "/v1/models"],
+  ["/messages", "/v1/messages"],
 ];
 for (const [from, to] of LEGACY_REDIRECTS) {
   app.all(from, (c) => c.redirect(to, 308));

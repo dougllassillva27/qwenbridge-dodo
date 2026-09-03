@@ -2349,7 +2349,7 @@ export class StreamingToolParser {
             );
             this.processToolContent(missingOpenRecovery.candidate, result);
             this.currentOpenTag = TOOL_START_LITERAL;
-            this.currentCloseTag = TOOL_END;
+            this.currentCloseTag = TOOL_CALL_CLOSE;
             continue;
           }
 
@@ -2407,7 +2407,7 @@ export class StreamingToolParser {
           this.processToolContent(content, result);
           this.insideTool = false;
           this.currentOpenTag = TOOL_START_LITERAL;
-          this.currentCloseTag = TOOL_END;
+          this.currentCloseTag = TOOL_CALL_CLOSE;
           this.clearIncrementalToolCall();
         } else {
           // Check if a new <tool_call> opening tag appeared without closing the current one

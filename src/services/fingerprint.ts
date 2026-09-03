@@ -180,12 +180,16 @@ export function rotateFingerprintSeed(accountId: string): number {
   return next;
 }
 
+export function getFingerprintRotation(accountId: string): number {
+  return loadSalt(accountId);
+}
+
 export function getFingerprintProfile(accountId: string): FingerprintProfile {
   const cached = profileCache.get(accountId);
   if (cached) return cached;
 
   const salt = loadSalt(accountId);
-  const seed = (seedFromString(accountId) ^ salt) >>> 0;
+  const seed = seedFromString(salt === 0 ? accountId : `${accountId}#r${salt}`);
   const rng = mulberry32(seed);
   const viewport = pick(rng, VIEWPORTS);
   const webgl = pick(rng, WEBGL_PROFILES);

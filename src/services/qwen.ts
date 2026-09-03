@@ -564,42 +564,58 @@ async function withIsolatedQwenPage<T>(
   );
 }
 
-// Per-account stream serialization: one active stream per account at a time
-const accountStreamMutexes = new Map<string, { queue: Array<() => void>; locked: boolean }>();
+// Per-account stream slots: a counting semaphore capped by
+// config.concurrency.maxStreamsPerAccount (NOT a capacity-1 mutex). The browser
+// relay multiplexes concurrent streams on one page via reqId (browserStreamStates),
+// so serializing to 1 here silently overrode the lease cap and made
+// ACCOUNT_MAX_CONCURRENT_STREAMS>1 unreachable (the second stream queued behind
+// the first's whole generation). FIFO handoff on release keeps the old
+// leak-recovery semantics (release is idempotent; a dropped stream still blocks
+// its slot until cancel/idle-timeout frees it — same as before).
+interface AccountStreamSlots {
+  active: number;
+  queue: Array<() => void>;
+}
+const accountStreamMutexes = new Map<string, AccountStreamSlots>();
 
-function getAccountStreamMutex(accountId: string): { queue: Array<() => void>; locked: boolean } {
-  let mutex = accountStreamMutexes.get(accountId);
-  if (!mutex) {
-    mutex = { queue: [], locked: false };
-    accountStreamMutexes.set(accountId, mutex);
+function getAccountStreamMutex(
+  accountId: string,
+): AccountStreamSlots {
+  let slots = accountStreamMutexes.get(accountId);
+  if (!slots) {
+    slots = { active: 0, queue: [] };
+    accountStreamMutexes.set(accountId, slots);
   }
-  return mutex;
+  return slots;
+}
+
+function streamSlotCapacity(): number {
+  return Math.max(1, config.concurrency.maxStreamsPerAccount);
+}
+
+function createStreamSlotRelease(slots: AccountStreamSlots): () => void {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    slots.active -= 1;
+    const next = slots.queue.shift();
+    if (next) {
+      // Hand the slot directly to the waiter (FIFO), same as the old mutex.
+      slots.active += 1;
+      next();
+    }
+  };
 }
 
 async function acquireAccountStreamLock(accountId: string): Promise<() => void> {
-  const mutex = getAccountStreamMutex(accountId);
-  if (!mutex.locked) {
-    mutex.locked = true;
-    return () => {
-      const next = mutex.queue.shift();
-      if (next) {
-        next();
-      } else {
-        mutex.locked = false;
-      }
-    };
+  const slots = getAccountStreamMutex(accountId);
+  if (slots.active < streamSlotCapacity()) {
+    slots.active += 1;
+    return Promise.resolve(createStreamSlotRelease(slots));
   }
   return new Promise<() => void>((resolve) => {
-    mutex.queue.push(() => {
-      resolve(() => {
-        const next = mutex.queue.shift();
-        if (next) {
-          next();
-        } else {
-          mutex.locked = false;
-        }
-      });
-    });
+    slots.queue.push(() => resolve(createStreamSlotRelease(slots)));
   });
 }
 
@@ -2376,7 +2392,8 @@ export async function createQwenStream(
   if (signal?.aborted) {
     throw new Error("client aborted before stream creation");
   }
-  // Serialize streams per account: one active stream at a time per browser context
+  // Take a stream slot for the account (up to maxStreamsPerAccount concurrent;
+  // the relay multiplexes them on the page via reqId).
   const streamLockKey = accountId || "global";
   const startedAt = Date.now();
   const releaseStreamLock = await acquireAccountStreamLock(streamLockKey);

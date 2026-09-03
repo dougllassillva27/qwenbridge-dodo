@@ -99,9 +99,9 @@ export async function chatCompletions(c: Context) {
     trackModelUsage(body.model || modelId);
     const user = (c as any).get?.("user");
     trackUsage(user?.id || "global", prompt || currentPrompt || "", false);
-
+    const routeLabel = c.req.header("x-qwenproxy-route") || "Chat";
     console.log(
-      `📥 [Chat] Incoming | req=${reqId} | ${body.model} | ${messages.length} msg(s) | stream=${isStream}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${allFiles.length ? ` | ${allFiles.length} file(s)` : ""}`,
+      `📥 [${routeLabel}] Incoming | req=${reqId} | ${body.model} | ${messages.length} msg(s) | stream=${isStream}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${allFiles.length ? ` | ${allFiles.length} file(s)` : ""}`,
     );
 
     // Intercept image/video generation models: they bypass the text chat flow
@@ -279,7 +279,7 @@ export async function chatCompletions(c: Context) {
     // so the 📤 line shows what was actually sent upstream.
     const replayed = streamResult.replayedFullContext === true;
     console.log(
-      `📤 [Chat] Request | req=${reqId} | ${streamResult.activeAccountLabel} | ${body.model} | ${replayed ? parsed.messageCount : msgCount} msg(s) | ${replayed ? fullPromptForRequest.length : finalPrompt.length} chars${replayed ? " | full-replay" : ""} | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | +${Date.now() - reqStartedAt}ms`,
+      `📤 [${routeLabel}] Request | req=${reqId} | ${streamResult.activeAccountLabel} | ${body.model} | ${replayed ? parsed.messageCount : msgCount} msg(s) | ${replayed ? fullPromptForRequest.length : finalPrompt.length} chars${replayed ? " | full-replay" : ""} | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | +${Date.now() - reqStartedAt}ms`,
     );
 
     const onAssistantComplete: ((event: AssistantCompleteEvent) => Promise<void> | void) | undefined = undefined;
