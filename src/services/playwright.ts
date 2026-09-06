@@ -32,7 +32,7 @@ import { subtlePageActivity } from "./human-behavior.ts";
 import { solveBaxiaCaptcha } from "./captcha-solver.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { setWafContextResetListener } from "../core/waf-isolation.ts";
-
+import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
 // Try to import playwright-extra and stealth, fallback to regular playwright
 let chromiumWithStealth: typeof chromium | null = null;
 
@@ -80,7 +80,7 @@ export function buildChromiumLaunchArgs(viewport: {
 }): string[] {
   const args = [
     "--disable-blink-features=AutomationControlled",
-    "--disable-features=IsolateOrigins,site-per-process,TranslateUI",
+    "--disable-features=IsolateOrigins,site-per-process,TranslateUI,Translate,OptimizationHints,MediaRouter",
     "--disable-infobars",
     "--no-first-run",
     "--no-default-browser-check",
@@ -97,6 +97,10 @@ export function buildChromiumLaunchArgs(viewport: {
     "--mute-audio",
     "--disable-default-apps",
     "--disable-component-extensions-with-background-pages",
+    "--disable-breakpad",
+    "--disable-component-update",
+    "--disable-domain-reliability",
+    "--disable-gpu-shader-disk-cache",
   ];
 
   if (config.playwright.lowMemoryFlags) {
@@ -848,7 +852,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
       secChUa: "",
       secChUaMobile: "?0",
       secChUaPlatform: "",
-      version: config.qwen.webVersion,
+      version: getQwenWebVersion(),
     };
     try {
       if (!userAgent) {
@@ -868,19 +872,29 @@ export async function getBasicHeaders(accountId: string): Promise<{
               platform = data.platform || "";
               mobile = data.mobile ? "?1" : "?0";
             }
-            return { ua, secChUa, platform, mobile };
+            let bundleVersion: string | null = null;
+            try {
+              const el = document.querySelector('link[href*="qwen-chat-fe"], script[src*="qwen-chat-fe"], img[src*="qwen-chat-fe"]');
+              const src = el ? (el.getAttribute("href") || el.getAttribute("src") || "") : "";
+              const match = src.match(/qwen-chat-fe\/(\d+\.\d+\.\d+)/) || document.documentElement.innerHTML.match(/qwen-chat-fe\/(\d+\.\d+\.\d+)/);
+              if (match) bundleVersion = match[1];
+            } catch {}
+            return { ua, secChUa, platform, mobile, bundleVersion };
           }),
           config.timeouts.page,
           `User-agent lookup timed out for ${accountId}`,
         );
         userAgent = nav.ua;
+        if (nav.bundleVersion) {
+          updateQwenWebVersion(nav.bundleVersion);
+        }
         cachedUserAgents.set(accountId, userAgent);
         const hints = getHeaderCache(accountId).headers;
         clientHints = {
           secChUa: nav.secChUa,
           secChUaMobile: nav.mobile,
           secChUaPlatform: nav.platform ? JSON.stringify(nav.platform) : "",
-          version: hints["version"] || config.qwen.webVersion,
+          version: nav.bundleVersion || hints["version"] || getQwenWebVersion(),
         };
         if (nav.secChUa) hints["sec-ch-ua"] = nav.secChUa;
         hints["sec-ch-ua-mobile"] = nav.mobile;
@@ -891,7 +905,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
           secChUa: hints["sec-ch-ua"] || "",
           secChUaMobile: hints["sec-ch-ua-mobile"] || "?0",
           secChUaPlatform: hints["sec-ch-ua-platform"] || "",
-          version: hints["version"] || config.qwen.webVersion,
+          version: hints["version"] || getQwenWebVersion(),
         };
       }
     } catch {
@@ -1684,10 +1698,11 @@ export async function captureQwenHeaders(
       headersCaptured = true;
       if (timeout) clearTimeout(timeout);
       cache.headers = capturedHeaders;
-      cache.lastRefresh = Date.now();
-      // The account now has a valid anti-bot header set — the rotation gate
-      // (account-manager `markAccountHeadersReady`) may route requests to it.
+      if (capturedHeaders["version"]) {
+        updateQwenWebVersion(capturedHeaders["version"]);
+      }
       markAccountHeadersReady(accountId);
+      cache.lastRefresh = Date.now();
       // Header interception can set challenge/session cookies, so do not reuse
       // a cookie snapshot taken before this browser request.
       cookieCaches.delete(accountId);
@@ -1828,10 +1843,11 @@ export async function captureQwenHeaders(
         armOverallDeadline();
 
         try {
-          // Navigate on the first attempt, or reload when the previous attempt
-          // produced no completion request (the page is likely blocked by
-          // WAF/captcha and needs a fresh load).
-          if (attempt === 1 || lastAttemptGraceTimedOut) {
+          // Navigate on the first attempt, or reload when attempt 2+ produced
+          // no request (indicating a stuck page/challenge that needs a fresh load).
+          // Attempt 2 preserves the page from attempt 1 so the bx SDK that just
+          // finished initializing in the background is not thrown away.
+          if (attempt === 1 || (lastAttemptGraceTimedOut && attempt >= 3)) {
             lastAttemptGraceTimedOut = false;
             await openChatPage();
           }
@@ -2156,7 +2172,105 @@ export function removePlaywrightProfile(
   }
 }
 
-const PROFILE_RESET_TIMEOUT_MS = 45_000;
+/**
+ * Safely prunes transient cache directories (V8 Code Cache, HTTP disk cache,
+ * GPU shader cache) from a Playwright Chromium profile directory.
+ *
+ * Preserves 100% of session and authentication state:
+ * - Cookies, Local Storage, IndexedDB, Preferences, Network state.
+ *
+ * Never throws.
+ */
+export function prunePlaywrightProfileCaches(profilePath: string): {
+  freedBytes: number;
+  freedFiles: number;
+} {
+  const transientDirNames = [
+    "Code Cache",
+    "Cache",
+    "GPUCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+  ];
+
+  let freedBytes = 0;
+  let freedFiles = 0;
+
+  try {
+    const defaultDir = path.join(profilePath, "Default");
+    if (!fs.existsSync(defaultDir)) {
+      return { freedBytes, freedFiles };
+    }
+
+    for (const dirName of transientDirNames) {
+      const targetDir = path.join(defaultDir, dirName);
+      if (fs.existsSync(targetDir)) {
+        try {
+          const countAndRemove = (d: string) => {
+            try {
+              const entries = fs.readdirSync(d, { withFileTypes: true });
+              for (const e of entries) {
+                const full = path.join(d, e.name);
+                if (e.isDirectory()) {
+                  countAndRemove(full);
+                } else if (e.isFile()) {
+                  try {
+                    freedBytes += fs.statSync(full).size;
+                    freedFiles++;
+                  } catch {}
+                }
+              }
+            } catch {}
+          };
+          countAndRemove(targetDir);
+          fs.rmSync(targetDir, { recursive: true, force: true });
+        } catch {
+          // Best-effort: file lock might still linger temporarily
+        }
+      }
+    }
+  } catch {
+    // Best-effort
+  }
+
+  return { freedBytes, freedFiles };
+}
+
+/**
+ * Prunes transient caches across all profile directories in data/qwen_profiles.
+ */
+export function pruneAllPlaywrightProfiles(baseDir = path.resolve("data", "qwen_profiles")): {
+  totalFreedBytes: number;
+  totalFreedFiles: number;
+  profilesCleaned: number;
+} {
+  let totalFreedBytes = 0;
+  let totalFreedFiles = 0;
+  let profilesCleaned = 0;
+
+  try {
+    if (!fs.existsSync(baseDir)) {
+      return { totalFreedBytes, totalFreedFiles, profilesCleaned };
+    }
+
+    const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const profilePath = path.join(baseDir, entry.name);
+        const { freedBytes, freedFiles } = prunePlaywrightProfileCaches(profilePath);
+        if (freedFiles > 0) {
+          totalFreedBytes += freedBytes;
+          totalFreedFiles += freedFiles;
+          profilesCleaned++;
+        }
+      }
+    }
+  } catch {}
+
+  return { totalFreedBytes, totalFreedFiles, profilesCleaned };
+}
+
+const PROFILE_RESET_TIMEOUT_MS = Math.max(90_000, config.timeouts.headers);
 
 export async function refreshHeadersWithProfileReset(
   accountId: string,
@@ -2485,6 +2599,10 @@ async function closePlaywrightForAccountLocked(
     }
   } finally {
     cleanupPlaywrightAccountState(accountId);
+    try {
+      const profilePath = path.resolve("data", "qwen_profiles", accountId);
+      prunePlaywrightProfileCaches(profilePath);
+    } catch {}
   }
 }
 
