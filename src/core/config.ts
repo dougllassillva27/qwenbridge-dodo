@@ -34,9 +34,9 @@ const envSchema = z
       ),
     QWEN_BX_V: z.string().default("2.5.37"),
     // Version header on Qwen API requests = the deployed web bundle version
-    // (snapshot network/chat.qwen.ai.v2.all.har: bundle qwen-chat-fe/0.2.89).
+    // (fallback when dynamic DOM detection is not yet completed).
     // Override via env when Qwen ships a new bundle.
-    QWEN_WEB_VERSION: z.string().default("0.2.89"),
+    QWEN_WEB_VERSION: z.string().default("0.2.91"),
     // Controls bx-ua/bx-umidtoken injection on the GENERAL API paths
     // (chats/new, settings): those work without them (live-probed). The
     // completions path is the exception — the 0.2.86 HAR shows the real
@@ -85,7 +85,7 @@ const envSchema = z
     CHAT_TIMEOUT: z.string().default("180000"),
     NAVIGATION_TIMEOUT: z.string().default("60000"),
     PAGE_TIMEOUT: z.string().default("60000"),
-    HEADERS_TIMEOUT: z.string().default("60000"),
+    HEADERS_TIMEOUT: z.string().default("90000"),
     TIME_TO_FIRST_BYTE: z.string().default("60000"),
     IDLE_STREAM_TIMEOUT: z.string().default("60000"),
     // Deadline for the FIRST upstream chunk on thinking models (the reasoning

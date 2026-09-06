@@ -296,6 +296,7 @@ const LEGACY_REDIRECTS: Array<[string, string]> = [
   ["/responses", "/v1/responses"],
   ["/models", "/v1/models"],
   ["/messages", "/v1/messages"],
+  ["/messages/count_tokens", "/v1/messages/count_tokens"],
 ];
 for (const [from, to] of LEGACY_REDIRECTS) {
   app.all(from, (c) => c.redirect(to, 308));
@@ -998,7 +999,7 @@ export async function startServer(options?: {
 +${"-".repeat(W)}+
 |${blank()}|
 |${center("QwenProxy")}|
-|${center("OpenAI-Compatible API")}|
+|${center("OpenAI & Anthropic Compatible API")}|
 |${blank()}|
 +${"-".repeat(W)}+
 |${blank()}|
