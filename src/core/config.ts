@@ -80,6 +80,7 @@ const envSchema = z
     LARGE_PROMPT_THRESHOLD: z.string().default("524288"),
     LARGE_PROMPT_UPLOAD_CACHE_TTL_MS: z.string().default("1800000"),
     LARGE_PROMPT_INLINE: z.string().default("false"),
+    STREAM_DEGENERATE_GUARD: z.enum(["prone", "always", "off"]).default("always"),
     CHAT_REQUEST_LOG: z.string().default("false"),
     HTTP_TIMEOUT: z.string().default("15000"),
     CHAT_TIMEOUT: z.string().default("180000"),
@@ -252,6 +253,7 @@ export const config = {
     cacheTtlMs: Math.max(0, parseInt(env.LARGE_PROMPT_UPLOAD_CACHE_TTL_MS)),
     inline: env.LARGE_PROMPT_INLINE === "true",
   },
+  streamDegenerateGuard: env.STREAM_DEGENERATE_GUARD as "prone" | "always" | "off",
   timeouts: {
     http: parseInt(env.HTTP_TIMEOUT),
     chat: parseInt(env.CHAT_TIMEOUT),

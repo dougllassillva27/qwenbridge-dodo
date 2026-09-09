@@ -60,6 +60,7 @@ function resolveChatMode(headerValue: string | undefined): ChatMode {
 
 export async function chatCompletions(c: Context) {
   let releaseChatLock: (() => void) | null = null;
+  let usagePrompt = "";
   const startedAt = Date.now();
   const timings: Record<string, number> = {};
   const mark = (name: string, since: number) => {
@@ -86,6 +87,8 @@ export async function chatCompletions(c: Context) {
       conversationKey,
     } = parsed;
 
+    usagePrompt = prompt || currentPrompt || "";
+
     const messages = body.messages || [];
     const declaredTools = Array.isArray((body as any).tools)
       ? (body as any).tools
@@ -97,8 +100,6 @@ export async function chatCompletions(c: Context) {
     const reqStartedAt = Date.now();
     metrics.increment("requests.completions");
     trackModelUsage(body.model || modelId);
-    const user = (c as any).get?.("user");
-    trackUsage(user?.id || "global", prompt || currentPrompt || "", false);
     const routeLabel = c.req.header("x-qwenproxy-route") || "Chat";
     console.log(
       `📥 [${routeLabel}] Incoming | req=${reqId} | ${body.model} | ${messages.length} msg(s) | stream=${isStream}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${allFiles.length ? ` | ${allFiles.length} file(s)` : ""}`,
@@ -618,6 +619,8 @@ export async function chatCompletions(c: Context) {
       return new Response(null, { status: 499 });
     }
 
+    const user = (c as any).get?.("user");
+    trackUsage(user?.id || "global", usagePrompt, true);
     return handleChatCompletionsError(c, err);
   } finally {
     // Lock released via onStreamComplete when stream finishes

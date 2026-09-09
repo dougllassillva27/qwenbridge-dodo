@@ -58,6 +58,7 @@ import {
   isDegenerateAnswer,
   buildAnswerDirective,
 } from "../../utils/degenerate-answer.ts";
+import { trackUsage } from "../../core/usage-tracker.ts";
 import {
   isNetworkLikeError,
   throwFromSseUpstreamError,
@@ -585,6 +586,16 @@ export async function processNonStreamingResponse(
         usage.completion_tokens,
       );
     }
+    if (usage) {
+      const user = (c as any).get?.("user");
+      trackUsage(
+        user ? user.id : "anonymous",
+        params.userPrompt || params.finalPrompt || "",
+        false,
+        usage.completion_tokens,
+        usage.prompt_tokens,
+      );
+    }
     for (const [name, value] of Object.entries(
       getContextMeterHeaders((usage as any).context_meter),
     )) {
@@ -740,7 +751,14 @@ export async function processNonStreamingResponse(
 
     // Degenerate answer guard (non-streaming): if the reply is a terse acknowledgment like "Yes", "OK", "Sim"
     // and we have midStreamRetry context without tool calls, regenerate on a clean chat with directive.
+    const guardMode = config.streamDegenerateGuard ?? "prone";
+    const hasUploadContext =
+      (midStreamRetry?.allFiles?.length || 0) > 0 ||
+      Buffer.byteLength(params.finalPrompt || "", "utf-8") > config.largePrompt.threshold ||
+      Buffer.byteLength(midStreamRetry?.fullPrompt || "", "utf-8") > config.largePrompt.threshold;
+
     if (
+      guardMode !== "off" &&
       isDegenerateAnswer(finalContent) &&
       toolCallsOut.length === 0 &&
       midStreamRetry &&
@@ -1138,12 +1156,21 @@ export async function processStreamingResponse(
     // so if Qwen produces a terse degenerate answer ("Yes", "OK", "Sim"),
     // it can be discarded and regenerated on a clean chat before reaching the client.
     const GUARD_HOLD_BYTES = 800;
+    const guardMode = config.streamDegenerateGuard ?? "prone";
+    const hasUploadContext =
+      (midStreamRetry?.allFiles?.length || 0) > 0 ||
+      Buffer.byteLength(params.finalPrompt || "", "utf-8") > config.largePrompt.threshold ||
+      Buffer.byteLength(midStreamRetry?.fullPrompt || "", "utf-8") > config.largePrompt.threshold;
+
     let guardActive =
       !!midStreamRetry &&
-      ((midStreamRetry.allFiles?.length || 0) > 0 ||
-        (midStreamRetry.toolsCount || 0) > 0 ||
-        (midStreamRetry.messageCount || 0) > 1 ||
-        (midStreamRetry.fullPrompt?.length || 0) > 500);
+      guardMode !== "off" &&
+      (guardMode === "always" ||
+        (guardMode === "prone" &&
+          (hasUploadContext ||
+            (midStreamRetry.toolsCount || 0) > 0 ||
+            (midStreamRetry.messageCount || 0) > 1 ||
+            (midStreamRetry.fullPrompt?.length || 0) > 500)));
     let heldOutput = '';
 
     const releaseGuard = () => {
@@ -2653,6 +2680,16 @@ export async function processStreamingResponse(
           activeAccountId,
           usage.prompt_tokens,
           usage.completion_tokens,
+        );
+      }
+      if (usage) {
+        const user = (c as any).get?.("user");
+        trackUsage(
+          user ? user.id : "anonymous",
+          params.userPrompt || params.finalPrompt || "",
+          false,
+          usage.completion_tokens,
+          usage.prompt_tokens,
         );
       }
       const finalFinishReason =
