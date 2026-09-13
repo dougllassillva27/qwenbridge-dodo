@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 
 import { config } from "../core/config.ts";
+import { getSyncStatePath } from "../core/paths.ts";
 import type {
   ClientSyncResult,
   SyncAllOptions,
@@ -73,7 +74,99 @@ export function getDefaultPaths(): {
 }
 
 export function getDefaultStateFilePath(): string {
-  return path.join(process.cwd(), "data", "sync-state.json");
+  return getSyncStatePath();
+}
+export interface ClientDetectionStatus {
+  id: "claude-code" | "codex" | "opencode" | "omp";
+  installed: boolean;
+  synced: boolean;
+  model?: string;
+  url?: string;
+}
+
+/**
+ * Inspects a client configuration file to determine whether the client is installed
+ * and whether it is actively configured to route to QwenProxy.
+ */
+export function inspectClientSyncStatus(
+  id: "claude-code" | "codex" | "opencode" | "omp",
+  filePath?: string,
+  port = 7936,
+): ClientDetectionStatus {
+  const defaultPaths = getDefaultPaths();
+  const targetPath =
+    filePath ||
+    (id === "claude-code"
+      ? defaultPaths.claudeCode
+      : id === "codex"
+        ? defaultPaths.codex
+        : id === "opencode"
+          ? defaultPaths.openCode
+          : defaultPaths.omp);
+
+  if (!fs.existsSync(targetPath)) {
+    return { id, installed: false, synced: false };
+  }
+
+  try {
+    const raw = fs.readFileSync(targetPath, "utf-8");
+
+    if (id === "claude-code") {
+      const data = JSON.parse(raw);
+      const url = data?.env?.ANTHROPIC_BASE_URL || "";
+      const model = data?.env?.ANTHROPIC_MODEL || data?.model || "";
+      const isSynced =
+        (url.includes(String(port)) || url.includes("qwenproxy")) &&
+        (model.toLowerCase().includes("qwen") || Boolean(data?.env?.ANTHROPIC_AUTH_TOKEN));
+      return {
+        id,
+        installed: true,
+        synced: isSynced,
+        model: model || undefined,
+        url: url || undefined,
+      };
+    }
+
+    if (id === "codex") {
+      const hasProvider = raw.includes("[model_providers.qwenproxy]");
+      const isProviderActive = /^model_provider\s*=\s*["']qwenproxy["']/m.test(raw);
+      const modelMatch = raw.match(/^model\s*=\s*["']([^"']+)["']/m);
+      const model = modelMatch ? modelMatch[1] : undefined;
+      return {
+        id,
+        installed: true,
+        synced: hasProvider && isProviderActive,
+        model,
+      };
+    }
+
+    if (id === "opencode") {
+      const hasQwen =
+        raw.includes('"qwenproxy"') &&
+        (raw.includes(String(port)) || raw.includes("QwenProxy") || raw.includes("qwen3"));
+      return {
+        id,
+        installed: true,
+        synced: hasQwen,
+      };
+    }
+
+    if (id === "omp") {
+      const hasQwen =
+        /^ {2}qwenproxy:\s*$/m.test(raw) ||
+        raw.includes("qwenproxy:") ||
+        (raw.includes(String(port)) && raw.includes("qwen3"));
+      return {
+        id,
+        installed: true,
+        synced: hasQwen,
+      };
+    }
+  } catch {
+    return { id, installed: true, synced: false };
+  }
+
+  return { id, installed: true, synced: false };
 }
 
 export interface SyncAllResult {

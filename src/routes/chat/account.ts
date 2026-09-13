@@ -10,7 +10,7 @@ import { markAccountSuccessful, markAccountFailed, getAccountsByPriority } from 
 import { recordWafHardBlock, noteWafRecovery } from "../../core/waf-isolation.ts";
 import { loadAccounts, type QwenAccount } from "../../core/accounts.ts";
 import { config, type ChatMode } from "../../core/config.ts";
-import { ClientAbortedError, UpstreamRateLimit } from "../../core/errors.ts";
+import { ClientAbortedError, UpstreamRateLimit, ValidationError } from "../../core/errors.ts";
 import {
   assertPromptWithinLimits,
   truncatePromptToIntelligentLimit,
@@ -35,7 +35,7 @@ import {
 	type AccountLease,
 } from "../../core/account-concurrency.ts";
 import { isAuthMockEnabled } from "../../services/auth-playwright.ts";
-import { refreshHeaders } from "../../services/playwright.ts";
+import { isPlaywrightInitialized, refreshHeaders } from "../../services/playwright.ts";
 import {
 	clearAllSessionsForAccount,
 	createQwenStream,
@@ -77,7 +77,18 @@ const MAX_ANTI_BOT_ROTATIONS = 1;
  * a stuck account page (closed context / WAF) can otherwise hold each browser
  * op for 60s and keep the personalization mutex blocked for minutes.
  */
-const PERSONALIZATION_SYNC_DEADLINE_MS = 30_000;
+export const PERSONALIZATION_SYNC_DEADLINE_MS = 30_000;
+export const COLD_ACCOUNT_PERSONALIZATION_SYNC_DEADLINE_MS = 60_000;
+
+export function computePersonalizationDeadlineMs(
+	accountId: string | undefined,
+	navigationTimeoutMs = config.timeouts.navigation,
+): number {
+	if (accountId && accountId !== "global" && isPlaywrightInitialized(accountId)) {
+		return PERSONALIZATION_SYNC_DEADLINE_MS;
+	}
+	return Math.max(COLD_ACCOUNT_PERSONALIZATION_SYNC_DEADLINE_MS, navigationTimeoutMs);
+}
 
 /**
  * Hard deadline for a single stream-acquire attempt (models sync + truncation
@@ -267,8 +278,8 @@ export function resolveInitialAccount(
 		return { account, configuredAccounts };
 	}
 
-	throw new Error(
-		"No Qwen accounts configured. Add accounts with npm run login.",
+	throw new ValidationError(
+		"Nenhuma conta Qwen configurada no servidor. Adicione uma conta na aba [5] Contas da TUI.",
 	);
 }
 
@@ -474,13 +485,17 @@ export async function acquireUpstreamStream(
 		if (
 			isAccountTemporarilyBusy(accountId) &&
 			params.allowTemporarilyBusyAccountId !== accountId &&
-			accountId !== stickyThreadAccountId
+			accountId !== stickyThreadAccountId &&
+			hasFreeAlternateAccount(configuredAccounts, accountId, triedAccountIds)
 		) {
 			console.log(
 				`⏭️  [Chat] Skipping account ${accountEmail} (${accountId}) temporarily busy (chat in progress)`,
 			);
-			account = getNextAvailableAccount(triedAccountIds);
-			continue;
+			const nextCandidate = getNextAvailableAccount(triedAccountIds);
+			if (nextCandidate && !getAccountCooldownInfo(nextCandidate.id)) {
+				account = nextCandidate;
+				continue;
+			}
 		}
 
 		// Do not wait 30 seconds on a saturated account when another account is
@@ -1179,15 +1194,16 @@ async function tryCreateStreamWithRetry(
 								return false;
 							},
 						);
+						const syncDeadlineMs = computePersonalizationDeadlineMs(currentAccountId);
 						personalizationApplied = await Promise.race([
 							syncPromise,
 							new Promise<boolean>((resolve) => {
 								personalizationDeadlineTimer = setTimeout(() => {
 									if (!syncSettled) {
-										syncFailure = `sync timed out after ${PERSONALIZATION_SYNC_DEADLINE_MS}ms`;
+										syncFailure = `sync timed out after ${syncDeadlineMs}ms`;
 									}
 									resolve(false);
-								}, PERSONALIZATION_SYNC_DEADLINE_MS);
+								}, syncDeadlineMs);
 							}),
 						]);
 						// The sync won the race: stop the deadline so it cannot keep the

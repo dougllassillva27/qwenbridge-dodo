@@ -1,7 +1,4 @@
-/*
- * File: index.ts
- * Project: QwenProxy
- *
+/**
  * Thin orchestrator for chat completions. Delegates to specialized modules:
  * - validation.ts: request parsing
  * - context.ts: prompt building and topic analysis
@@ -52,7 +49,12 @@ function formatTimingHeader(timings: Record<string, number>): string {
  * else silently uses the configured default.
  */
 function resolveChatMode(headerValue: string | undefined): ChatMode {
-  if (headerValue === "thread" || headerValue === "temp") return headerValue;
+  if (headerValue === "thread" || headerValue === "temp" || headerValue === "temp-thread") {
+    return headerValue;
+  }
+  if (headerValue === "temp_thread") {
+    return "temp-thread";
+  }
   return config.qwen.chatMode;
 }
 

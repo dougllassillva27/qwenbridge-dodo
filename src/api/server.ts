@@ -268,6 +268,8 @@ app.get("/health", async (c) => {
         }
       : undefined,
     timestamp: Date.now(),
+    readyAccounts: (await import("../core/account-manager.js")).getHeadersReadyAccountIds(),
+    activeAccounts: (await import("../services/playwright.js")).getActivePlaywrightAccountIds(),
     metrics: {
       cache: await cache?.getStats(),
     },
@@ -595,6 +597,7 @@ export async function stopServer(): Promise<void> {
 
 export async function startServer(options?: {
   installSignalHandlers?: boolean;
+  showBanner?: boolean;
 }): Promise<StartedServerInfo> {
   if (server) {
     if (options?.installSignalHandlers !== false) installSignalHandlers();
@@ -647,15 +650,16 @@ export async function startServer(options?: {
     const BATCH_SIZE = config.playwright.initBatchSize;
 
     if (accounts.length > 0) {
-      let readyAccountId: string | null = null;
       const totalAccounts = accounts.length;
 
       // Warm accounts in priority order (recently successful accounts first),
-      // skipping accounts still on cooldown, so the startup account matches
-      // the one request routing will pick first.
+      // skipping accounts still on cooldown. Warm the primary account first so
+      // the server binds the port and goes online immediately (~15-20s).
+      // Reserve account(s) and standby validations run seamlessly in background.
       const warmOrder = getAccountsByPriority(accounts).filter(
         (account) => !getAccountCooldownInfo(account.id),
       );
+      const readyAccountIds = new Set<string>();
 
       for (let i = 0; i < warmOrder.length; i++) {
         const ok = await prepareAccountRuntime(
@@ -666,24 +670,24 @@ export async function startServer(options?: {
           warmQwenChatPool,
         );
         if (ok) {
+          readyAccountIds.add(warmOrder[i].id);
           console.log(
-            `✅ [Server] Account ready (${i + 1}/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
+            `✅ [Server] Account ready (1/${totalAccounts}): ${maskEmail(warmOrder[i].email)}`,
           );
-          readyAccountId = warmOrder[i].id;
           break;
         }
       }
 
       const remainingAccounts = accounts.filter(
-        (account) => account.id !== readyAccountId,
+        (account) => !readyAccountIds.has(account.id),
       );
-      if (readyAccountId === null) {
+      if (readyAccountIds.size === 0) {
         console.warn(
           `⚠️  [Server] No account ready during startup; continuing in background`,
         );
       }
 
-      if (config.playwright.prepareAllOnStartup || readyAccountId === null) {
+      if (config.playwright.prepareAllOnStartup || readyAccountIds.size === 0) {
         if (config.playwright.prepareAllOnStartup && remainingAccounts.length > 0) {
           console.log(
             `🪶 [Server] Preparing ${remainingAccounts.length} standby account(s) in background`,
@@ -707,28 +711,59 @@ export async function startServer(options?: {
           `🪶 [Server] ${remainingAccounts.length} standby account(s) will initialize on demand`,
         );
 
-        // Validate standby accounts in background: check login, add to priority,
-        // but keep browser closed until actually needed
+        // In background: warm 1 reserve account (if maxActiveContexts > 1) and
+        // validate the rest of the standby accounts
         void (async () => {
           const { validateAccountLogin } = await import("../services/playwright.ts");
           const { ensureAccountInPriority } = await import("../core/account-priority.ts");
 
+          let accountsToValidate = remainingAccounts;
+
+          // Warm reserve account in background for fast failover without delaying startup
+          if (config.playwright.maxActiveContexts > 1 && remainingAccounts.length > 0) {
+            let reserveCandidateIdx = 0;
+            for (; reserveCandidateIdx < remainingAccounts.length; reserveCandidateIdx++) {
+              const reserveAccount = remainingAccounts[reserveCandidateIdx];
+              try {
+                const ok = await prepareAccountRuntime(
+                  reserveAccount,
+                  getAccountCredentials,
+                  initPlaywrightForAccount,
+                  disableNativeTools,
+                  warmQwenChatPool,
+                );
+                if (ok) {
+                  ensureAccountInPriority(reserveAccount.id);
+                  console.log(
+                    `✅ [Server] Reserve account ready (2/${totalAccounts}): ${maskEmail(reserveAccount.email)}`,
+                  );
+                  reserveCandidateIdx++;
+                  break;
+                }
+              } catch (err) {
+                console.warn(
+                  `⚠️  [Server] Failed to warm reserve account ${maskEmail(reserveAccount.email)}: ${getErrorMessage(err)}`,
+                );
+              }
+            }
+            accountsToValidate = remainingAccounts.slice(reserveCandidateIdx);
+          }
+
           let validated = 0;
           let failed = 0;
 
-          for (const account of remainingAccounts) {
+          for (const account of accountsToValidate) {
             try {
-              // Add to priority list first (initial priority based on config order)
-              ensureAccountInPriority(account.id);
-
-              // Validate login in background
+              const creds = getAccountCredentials(account.id) ?? account;
+              // Validate login in background with real unmasked credentials
               const ok = await validateAccountLogin(
-                account,
+                creds,
                 config.playwright.headless,
                 config.playwright.browser,
               );
-
               if (ok) {
+                // Add to priority list only once validated
+                ensureAccountInPriority(account.id);
                 validated++;
                 console.log(
                   `✅ [Server] Standby account validated: ${maskEmail(account.email)}`,
@@ -736,20 +771,26 @@ export async function startServer(options?: {
               } else {
                 failed++;
                 console.warn(
-                  `⚠️  [Server] Standby account login failed: ${maskEmail(account.email)}`,
+                  `⚠️  [Server] Standby account login failed: ${maskEmail(account.email)} (quarantined)`,
                 );
               }
             } catch (error) {
               failed++;
               console.warn(
-                `⚠️  [Server] Standby account validation error: ${maskEmail(account.email)}: ${getErrorMessage(error)}`,
+                `⚠️  [Server] Standby account validation error: ${maskEmail(account.email)}: ${getErrorMessage(error)} (quarantined)`,
+              );
+              const { markAccountRateLimited } = await import("../core/account-manager.ts");
+              markAccountRateLimited(
+                account.id,
+                24 * 3600 * 1000,
+                `StandbyValidationError: ${getErrorMessage(error)}`,
               );
             }
           }
 
           if (validated > 0 || failed > 0) {
             console.log(
-              `🪶 [Server] Standby validation complete: ${validated} ok, ${failed} failed`,
+              `✅ [Server] Standby validation complete: ${validated} account(s) ready${failed > 0 ? `, ${failed} failed` : ""}`,
             );
           }
         })().catch((error) => {
@@ -827,7 +868,8 @@ export async function startServer(options?: {
 
     const endpoint = `${started.url}/v1`;
 
-    console.log(`
+    if (options?.showBanner !== false) {
+      console.log(`
 +${"-".repeat(W)}+
 |${blank()}|
 |${center("QwenProxy")}|
@@ -843,6 +885,7 @@ export async function startServer(options?: {
 |${blank()}|
 +${"-".repeat(W)}+
 `);
+    }
     return started;
   })();
 

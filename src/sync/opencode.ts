@@ -3,7 +3,36 @@ import path from "node:path";
 import type { ClientSyncResult, SyncOptions } from "./types.ts";
 import { createTimestampBackup, restoreFromBackup } from "./utils.ts";
 
-function buildOpenCodeProviderObject(baseUrl: string, apiKey: string): Record<string, any> {
+function buildOpenCodeProviderObject(
+  baseUrl: string,
+  apiKey: string,
+  primaryModel: string = "qwen3.8-max",
+): Record<string, any> {
+  const modelsObj: Record<string, any> = {};
+  const modelList = [primaryModel];
+  if (primaryModel !== "qwen3.7-plus") {
+    modelList.push("qwen3.7-plus");
+  }
+
+  for (const m of modelList) {
+    modelsObj[m] = {
+      name:
+        m === "qwen3.8-max"
+          ? "Qwen 3.8 Max"
+          : m === "qwen3.7-plus"
+            ? "Qwen 3.7 Plus"
+            : m,
+      limit: { context: 1048576, output: 65536 },
+      modalities: { input: ["text", "image"], output: ["text"] },
+      reasoning: true,
+      variants: {
+        low: { effort: "low" },
+        medium: { effort: "medium" },
+        high: { effort: "high" },
+      },
+    };
+  }
+
   return {
     npm: "@ai-sdk/openai-compatible",
     name: "QwenProxy",
@@ -11,39 +40,95 @@ function buildOpenCodeProviderObject(baseUrl: string, apiKey: string): Record<st
       baseURL: baseUrl,
       apiKey: apiKey,
     },
-    models: {
-      "qwen3.8-max": {
-        name: "Qwen 3.8 Max",
-        limit: { context: 1048576, output: 65536 },
-        modalities: { input: ["text", "image"], output: ["text"] },
-        reasoning: true,
-        variants: {
-          low: { effort: "low" },
-          medium: { effort: "medium" },
-          high: { effort: "high" },
-          max: { effort: "max" },
-        },
-      },
-      "qwen3.7-plus": {
-        name: "Qwen 3.7 Plus",
-        limit: { context: 1048576, output: 65536 },
-        modalities: { input: ["text", "image"], output: ["text"] },
-        reasoning: true,
-        variants: {
-          low: { effort: "low" },
-          medium: { effort: "medium" },
-          high: { effort: "high" },
-        },
-      },
-    },
+    models: modelsObj,
   };
+}
+function findKeyObjectSpan(content: string, key: string): { start: number; end: number; hasTrailingComma: boolean } | null {
+  const regex = new RegExp(`"${key}"\\s*:\\s*\\{`);
+  const match = content.match(regex);
+  if (!match || match.index === undefined) return null;
+
+  const startIndex = match.index;
+  const braceIndex = content.indexOf("{", startIndex + match[0].length - 1);
+  if (braceIndex === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+  let escape = false;
+
+  for (let i = braceIndex; i < content.length; i++) {
+    const ch = content[i];
+    const nextCh = content[i + 1] || "";
+
+    if (inLineComment) {
+      if (ch === "\n") inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && nextCh === "/") {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (inString) {
+      if (escape) {
+        escape = false;
+      } else if (ch === "\\") {
+        escape = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === "/" && nextCh === "/") {
+      inLineComment = true;
+      i++;
+      continue;
+    }
+    if (ch === "/" && nextCh === "*") {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        let endIndex = i + 1;
+        let hasTrailingComma = false;
+        while (endIndex < content.length && /[\s,]/.test(content[endIndex])) {
+          if (content[endIndex] === ",") {
+            hasTrailingComma = true;
+            endIndex++;
+            break;
+          }
+          if (content[endIndex] === "\n") {
+            break;
+          }
+          endIndex++;
+        }
+        return { start: startIndex, end: endIndex, hasTrailingComma };
+      }
+    }
+  }
+
+  return null;
 }
 
 export function syncOpenCode(options: SyncOptions): ClientSyncResult {
-  const { filePath, apiKey, baseUrl } = options;
+  const { filePath, apiKey, baseUrl, model = "qwen3.8-max" } = options;
   try {
-    fs.mkdirSync(path.dirname(filePath), { recursive: true });
-
     let backupPath: string | undefined;
     let content = "";
 
@@ -52,10 +137,10 @@ export function syncOpenCode(options: SyncOptions): ClientSyncResult {
       content = fs.readFileSync(filePath, "utf-8");
     }
 
-    const providerObj = buildOpenCodeProviderObject(baseUrl, apiKey);
+    const providerObj = buildOpenCodeProviderObject(baseUrl, apiKey, model);
     const providerJson = JSON.stringify(providerObj, null, 6)
       .split("\n")
-      .map((line, idx) => (idx === 0 ? line : "    " + line))
+      .map((line, idx) => (idx === 0 ? line : `    ${line}`))
       .join("\n");
 
     const qwenEntry = `    "qwenproxy": ${providerJson}`;
@@ -69,10 +154,14 @@ export function syncOpenCode(options: SyncOptions): ClientSyncResult {
       };
       fs.writeFileSync(filePath, JSON.stringify(initial, null, 2) + "\n", "utf-8");
     } else {
-      // Check if "qwenproxy" already exists under "provider"
-      const existingQwenRegex = /"qwenproxy"\s*:\s*\{[\s\S]*?\n\s*\},?/m;
-      if (existingQwenRegex.test(content)) {
-        content = content.replace(existingQwenRegex, `"qwenproxy": ${providerJson},`);
+      // Check if "qwenproxy" already exists under "provider" with balanced braces
+      const existingSpan = findKeyObjectSpan(content, "qwenproxy");
+      if (existingSpan) {
+        const comma = existingSpan.hasTrailingComma ? "," : "";
+        content =
+          content.slice(0, existingSpan.start) +
+          `"qwenproxy": ${providerJson}${comma}` +
+          content.slice(existingSpan.end);
       } else {
         const providerMatch = content.match(/"provider"\s*:\s*\{/);
         if (providerMatch && providerMatch.index !== undefined) {

@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
-import { getQwenHeaders } from "./auth-playwright.ts";
+import { getQwenHeaders, isAuthMockEnabled } from "./auth-playwright.ts";
 import { buildQwenRequestHeaders } from "./qwen-headers.ts";
 import { qwenUrl } from "./qwen-url.ts";
 
@@ -592,6 +592,7 @@ async function requestCompletionsWithBrowserFallback(params: {
   let sawAntiBotChallenge = false;
   let lastFailureDetail = "";
 
+  if (!config.qwen.browserOnlyFetch) {
   for (let attempt = 1; attempt <= NODE_COMPLETION_ATTEMPTS; attempt++) {
     if (signal.aborted) break;
     if (attempt > 1) {
@@ -638,6 +639,7 @@ async function requestCompletionsWithBrowserFallback(params: {
         error instanceof Error ? error.message : String(error);
       break;
     }
+  }
   }
 
   if (!signal.aborted) {
@@ -722,8 +724,71 @@ async function createMediaChatSession(
   chatModel: string,
   chatType: "t2i" | "t2v",
   signal: AbortSignal,
+  accountId?: string,
 ): Promise<string> {
   const title = chatType === "t2i" ? "Image Generation" : "Video Generation";
+
+  if (accountId && !isAuthMockEnabled()) {
+    return withAccountPage(
+      accountId,
+      async (page) => {
+        const result = await page.evaluate(
+          async ({ url, headers, body }) => {
+            try {
+              const response = await fetch(url, {
+                method: "POST",
+                credentials: "include",
+                headers,
+                body,
+              });
+              const rawText = await response.text().catch(() => "");
+              let data: any = null;
+              try {
+                data = JSON.parse(rawText);
+              } catch {}
+              return {
+                ok: response.ok,
+                status: response.status,
+                data,
+                rawText,
+              };
+            } catch (err: any) {
+              return {
+                ok: false,
+                status: 0,
+                data: null,
+                rawText: err?.message || String(err),
+              };
+            }
+          },
+          {
+            url: qwenUrl("/api/v2/chats/new"),
+            headers: buildHeadersFromCaptured(headers),
+            body: JSON.stringify({
+              title,
+              models: [chatModel],
+              chat_mode: "normal",
+              chat_type: chatType,
+              timestamp: Date.now(),
+              project_id: "",
+            }),
+          },
+        );
+        if (!result.ok) {
+          throw new UpstreamError(
+            `Failed to create ${chatType} chat session: ${result.status} ${String(result.rawText).substring(0, 200)}`,
+          );
+        }
+        const chatId = result.data?.data?.id || result.data?.data?.chat_id || result.data?.id;
+        if (!chatId) {
+          throw new UpstreamError(
+            `Upstream created ${chatType} chat without returning a chat ID`,
+          );
+        }
+        return chatId;
+      },
+    );
+  }
 
   const response = await fetch(qwenUrl("/api/v2/chats/new"), {
     method: "POST",
@@ -891,18 +956,9 @@ function parseJsonIfPossible(raw: string): unknown {
 }
 
 /**
- * Cooldown for a RateLimited error. Uses the hours the upstream reports in its
- * error message (e.g. "Please wait 4 hours...") when present; otherwise falls
- * back to the account manager's default cooldown.
+ * Cooldown for a RateLimited error. Per Invariant 4, daily quotas reset strictly
+ * at 00:00 UTC, so we delegate to markAccountRateLimited's default midnight calculation.
  */
-function rateLimitCooldownMs(err: UpstreamRateLimit): number | undefined {
-  const hourMatch = err.message?.match(/(\d+)\s*hours?/i);
-  if (hourMatch) {
-    const hours = Math.max(1, parseInt(hourMatch[1], 10));
-    return hours * 60 * 60 * 1000;
-  }
-  return undefined;
-}
 
 /**
  * Detects a Qwen daily usage limit response. The upstream answers HTTP 200
@@ -1101,7 +1157,7 @@ export async function generateImage(params: {
 
       const { headers } = await getQwenHeaders(forceHeaderRefresh, account.id);
       forceHeaderRefresh = false;
-      const chatId = await createMediaChatSession(headers, chatModel, "t2i", signal);
+      const chatId = await createMediaChatSession(headers, chatModel, "t2i", signal, account.id);
 
       logMediaDebug(
         mediaLog("image", "chat_created", {
@@ -1225,11 +1281,7 @@ export async function generateImage(params: {
       }
 
       if (lastError instanceof UpstreamRateLimit) {
-        markAccountRateLimited(
-          account.id,
-          rateLimitCooldownMs(lastError),
-          "RateLimited",
-        );
+        markAccountRateLimited(account.id, undefined, "RateLimited");
       } else {
         markAccountRateLimited(account.id, ACCOUNT_COOLDOWN_MS, "MediaGenFailed");
       }
@@ -1312,7 +1364,7 @@ export async function generateVideo(params: {
 
       const { headers } = await getQwenHeaders(forceHeaderRefresh, account.id);
       forceHeaderRefresh = false;
-      const chatId = await createMediaChatSession(headers, chatModel, "t2v", signal);
+      const chatId = await createMediaChatSession(headers, chatModel, "t2v", signal, account.id);
 
       logMediaDebug(
         mediaLog("video", "chat_created", {
@@ -1468,11 +1520,7 @@ export async function generateVideo(params: {
       }
 
       if (lastError instanceof UpstreamRateLimit) {
-        markAccountRateLimited(
-          account.id,
-          rateLimitCooldownMs(lastError),
-          "RateLimited",
-        );
+        markAccountRateLimited(account.id, undefined, "RateLimited");
       } else {
         markAccountRateLimited(account.id, ACCOUNT_COOLDOWN_MS, "MediaGenFailed");
       }
@@ -1525,20 +1573,20 @@ export async function pollVideoTask(params: {
     while (!effectiveSignal.aborted) {
       pollCount += 1;
       let json: Record<string, unknown> | null = null;
+      if (!config.qwen.browserOnlyFetch) {
+        const nodeResponse = await fetch(pollUrl, {
+          method: "GET",
+          headers: requestHeaders,
+          signal: effectiveSignal,
+        });
 
-      const nodeResponse = await fetch(pollUrl, {
-        method: "GET",
-        headers: requestHeaders,
-        signal: effectiveSignal,
-      });
-
-      if (nodeResponse.ok) {
-        const rawBody = await nodeResponse.text().catch(() => "");
-        if (!looksLikeAntiBotChallengeText(rawBody)) {
-          json = parseJsonIfPossible(rawBody) as Record<string, unknown> | null;
+        if (nodeResponse.ok) {
+          const rawBody = await nodeResponse.text().catch(() => "");
+          if (!looksLikeAntiBotChallengeText(rawBody)) {
+            json = parseJsonIfPossible(rawBody) as Record<string, unknown> | null;
+          }
         }
       }
-
       if (!json) {
         try {
           const browserJson = await fetchJsonInBrowser(accountId, pollUrl);

@@ -1,16 +1,61 @@
-/*
- * File: playwright.ts
- * Project: QwenProxy
- *
+/**
  * Playwright browser automation with stealth plugin for anti-bot evasion.
  * Captures real browser headers (bx-ua, bx-umidtoken) per account.
  */
 
-import { chromium, type BrowserContext, type Page } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "patchright";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
-import type { QwenAccount } from "../core/accounts.ts";
+import { spawnSync } from "child_process";
+import { createRequire } from "module";
+
+const requireLocal = createRequire(import.meta.url);
+
+function autoInstallPlaywrightChromium(): void {
+  const tryInstall = (mirror?: string): number | null => {
+    const installEnv = {
+      ...process.env,
+      PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT:
+        process.env.PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT || "120000",
+      ...(mirror ? { PLAYWRIGHT_DOWNLOAD_HOST: mirror } : {}),
+    };
+    try {
+      const patchrightEntry = requireLocal.resolve("patchright");
+      const cliPath = path.join(path.dirname(patchrightEntry), "cli.js");
+      if (fs.existsSync(cliPath)) {
+        console.log("⏳ [Playwright] Navegador Chromium não encontrado. Instalando automaticamente...");
+        const res = spawnSync(process.execPath, [cliPath, "install", "chromium"], {
+          stdio: "inherit",
+          env: installEnv,
+        });
+        return res.status;
+      }
+    } catch {}
+
+    console.log("⏳ [Playwright] Navegador Chromium não encontrado. Instalando via npx...");
+    const cmd = process.platform === "win32" ? "npx.cmd" : "npx";
+    const res = spawnSync(cmd, ["--yes", "patchright", "install", "chromium"], {
+      stdio: "inherit",
+      env: installEnv,
+    });
+    return res.status;
+  };
+
+  const status = tryInstall(process.env.PLAYWRIGHT_DOWNLOAD_HOST);
+  if (status !== 0 && !process.env.PLAYWRIGHT_DOWNLOAD_HOST) {
+    console.log("\n⚠️ [Playwright] Falha no CDN primário. Tentando espelho global de alta velocidade...");
+    tryInstall("https://npmmirror.com/mirrors/playwright");
+  }
+
+  try {
+    void (async () => {
+      const { cleanPlaywrightBrowsers } = await import("../clean-cache.ts");
+      await cleanPlaywrightBrowsers(true);
+    })();
+  } catch {}
+}
+import { loadAccounts, type QwenAccount } from "../core/accounts.ts";
 // Imported here rather than injected from session-keeper.ts: account-concurrency
 // only depends on config/logger, so playwright -> account-concurrency stays
 // acyclic, while the reverse direction would drag the browser layer into core.
@@ -21,11 +66,13 @@ import { Mutex } from "../core/mutex.ts";
 import {
   markAccountHeadersReady,
   unmarkAccountHeadersReady,
+  markAccountRateLimited,
 } from "../core/account-manager.ts";
 import { getAccountsByPriority } from "../core/account-priority.ts";
 import {
   clearFingerprintCache,
   getFingerprintProfile,
+  updateChromeMajor,
   type FingerprintProfile,
 } from "./fingerprint.ts";
 import { subtlePageActivity } from "./human-behavior.ts";
@@ -33,24 +80,14 @@ import { solveBaxiaCaptcha } from "./captcha-solver.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { setWafContextResetListener } from "../core/waf-isolation.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
-// Try to import playwright-extra and stealth, fallback to regular playwright
-let chromiumWithStealth: typeof chromium | null = null;
+import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 
-try {
-  const pwExtra = await import("playwright-extra");
-  const stealth = await import("puppeteer-extra-plugin-stealth");
+type ContextInitHook = (context: BrowserContext) => Promise<void> | void;
+const contextInitHooks: ContextInitHook[] = [];
 
-  if (pwExtra.chromium && stealth.default) {
-    const plugin = stealth.default();
-    pwExtra.chromium.use(plugin);
-    chromiumWithStealth = pwExtra.chromium;
-  }
-} catch {
-  console.warn(
-    "⚠️  [Playwright] playwright-extra/stealth not available, using regular playwright",
-  );
+export function onBrowserContextCreated(hook: ContextInitHook): void {
+  contextInitHooks.push(hook);
 }
-
 export type BrowserType = "chromium" | "chrome" | "edge";
 
 interface BrowserEngineConfig {
@@ -124,7 +161,7 @@ export function buildChromiumLaunchArgs(viewport: {
 // to the pool quickly (the 2026-08-22 log showed a lock held for 154s before
 // the waiter's recovery path finally ran). The chat lock keeps its own longer
 // hold budget (see acquireChatLock).
-const ACCOUNT_MUTEX_MAX_HOLD_MS = 60_000;
+const ACCOUNT_MUTEX_MAX_HOLD_MS = 180_000;
 const accountMutexes = new Map<string, Mutex>();
 
 function getAccountMutex(accountId: string): Mutex {
@@ -152,7 +189,7 @@ async function recoverStuckAccountMutex(
   );
   const context = accountContexts.get(accountId);
   if (context) {
-    await closePlaywrightContextBestEffort(accountId, context);
+    await closePlaywrightContextBestEffort(accountId, context, { skipStorageSave: true });
   }
   cleanupPlaywrightAccountState(accountId);
   if (accountMutexes.get(accountId) === mutex) {
@@ -195,6 +232,191 @@ async function acquireAccountMutex(
 const accountContexts = new Map<string, BrowserContext>();
 const accountPages = new Map<string, Page>();
 const cachedUserAgents = new Map<string, string>();
+
+let sharedBrowser: Browser | null = null;
+let sharedBrowserPromise: Promise<Browser> | null = null;
+
+export function getSharedBrowser(): Browser | null {
+  return sharedBrowser;
+}
+
+export function getStorageStatePath(accountId: string): string {
+  const profileDir = getAccountProfilePath(accountId);
+  return path.join(profileDir, "storage_state.json");
+}
+
+export function loadStorageState(accountId: string): string | undefined {
+  const p1 = getStorageStatePath(accountId);
+  const p2 = path.join(path.dirname(p1), `${accountId}_state.json`);
+  const chosenPath = fs.existsSync(p1) ? p1 : fs.existsSync(p2) ? p2 : undefined;
+  if (!chosenPath) return undefined;
+  try {
+    const raw = fs.readFileSync(chosenPath, "utf8");
+    const state = JSON.parse(raw);
+    if (!state || typeof state !== "object" || !Array.isArray(state.cookies)) {
+      return undefined;
+    }
+    return chosenPath;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function saveStorageState(
+  context: BrowserContext,
+  accountId: string,
+  timeoutMs = 5_000,
+): Promise<void> {
+  try {
+    const stateFile = getStorageStatePath(accountId);
+    const dir = path.dirname(stateFile);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    await withTimeout(
+      context.storageState({ path: stateFile }),
+      timeoutMs,
+      `storageState timed out after ${timeoutMs}ms`,
+    );
+  } catch (error) {
+    if (!isPlaywrightAlreadyClosedError(error)) {
+      console.warn(
+        `[Playwright] Failed to save storage state for ${accountId}: ${getErrorMessage(error)}`,
+      );
+    }
+  }
+}
+
+async function hasValidAuthCookie(context: BrowserContext, timeoutMs = 3_000): Promise<boolean> {
+  try {
+    const cookies = await withTimeout(
+      context.cookies(),
+      timeoutMs,
+      `cookies check timed out after ${timeoutMs}ms`,
+    );
+    return cookies.some(
+      (c) =>
+        (c.name.toLowerCase().includes("token") || c.name.toLowerCase().includes("session")) &&
+        (c.expires === undefined || c.expires === -1 || c.expires * 1000 > Date.now()),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detect whether the page is authenticated.
+ * Probes the authoritative /api/v1/auths/ endpoint from the page context (verified via HAR forensics)
+ * and falls back to inspecting the presence of visible "Log in" / "Sign up" buttons.
+ *
+ * The probe is bounded: page.evaluate ignores Playwright's default timeouts, so a
+ * WAF-blocked page whose in-page fetch never settles would hang the caller with no
+ * error at all. A probe that cannot answer is treated as "not logged in" — the
+ * caller re-authenticates or reloads, which is strictly better than burning the
+ * whole header budget waiting on a frozen page.
+ */
+export async function isPageLoggedIn(
+  page: Page,
+  timeoutMs = SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
+): Promise<boolean> {
+  if (!page) return false;
+  if (typeof page.isClosed === "function" && page.isClosed()) return false;
+  try {
+    const url = typeof page.url === "function" ? page.url() : "";
+    if (url.includes("/auth") || url.includes("/login")) return false;
+    if (typeof page.evaluate !== "function") return true;
+
+    const probe = page
+      .evaluate(async () => {
+        try {
+          const res = await fetch("/api/v1/auths/", { method: "GET" });
+          return res.status === 200;
+        } catch {
+          const btn = document.querySelector(
+            ".header-right-auth-button, button.header-right-auth-button, a[href*='/auth'], a[href*='/login']",
+          );
+          return !btn || (btn as HTMLElement).offsetWidth === 0;
+        }
+      })
+      .catch(() => false);
+
+    return await withTimeout(
+      probe,
+      Math.max(1_000, timeoutMs),
+      `session probe timed out after ${timeoutMs}ms`,
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function getOrLaunchSharedBrowser(
+  browserType: BrowserType = "chromium",
+  headless = true,
+): Promise<Browser> {
+  if (sharedBrowser && sharedBrowser.isConnected()) {
+    return sharedBrowser;
+  }
+  if (sharedBrowserPromise) {
+    return sharedBrowserPromise;
+  }
+
+  sharedBrowserPromise = (async () => {
+    const { engine, channel } = resolveBrowserEngine(browserType);
+    const defaultViewport = { width: 1280, height: 800 };
+    const launchArgs = buildChromiumLaunchArgs(defaultViewport);
+
+    console.log(
+      `🌐 [Playwright] Launching single shared ${browserType} browser...`,
+    );
+
+    let browser: Browser;
+    try {
+      browser = await engine.launch({
+        headless,
+        channel,
+        ignoreDefaultArgs: ["--enable-automation", "--enable-blink-features"],
+        args: launchArgs,
+      });
+    } catch (launchErr: any) {
+      if (launchErr?.message?.includes("Executable doesn't exist")) {
+        autoInstallPlaywrightChromium();
+        browser = await engine.launch({
+          headless,
+          channel,
+          ignoreDefaultArgs: ["--enable-automation", "--enable-blink-features"],
+          args: launchArgs,
+        });
+      } else {
+        throw launchErr;
+      }
+    }
+
+    try {
+      const v = browser.version();
+      const major = parseInt(v.split(".")[0], 10);
+      if (major >= 100) {
+        updateChromeMajor(major);
+      }
+    } catch {}
+    browser.on("disconnected", () => {
+      console.warn("[Playwright] Shared browser disconnected");
+      sharedBrowser = null;
+      for (const accountId of Array.from(accountPages.keys())) {
+        cleanupPlaywrightAccountState(accountId);
+      }
+    });
+
+    sharedBrowser = browser;
+    return browser;
+  })();
+
+  try {
+    return await sharedBrowserPromise;
+  } finally {
+    sharedBrowserPromise = null;
+  }
+}
 
 // Header cache per account
 interface AccountHeaderCache {
@@ -249,6 +471,16 @@ const FIRST_TRIGGER_GRACE_MS = 3_000;
  * sends cover it while still failing a page that never produces them.
  */
 const HEADER_CAPTURE_TRIGGER_ATTEMPTS = 3;
+/**
+ * A healthy Qwen chat page renders its input within a couple of seconds. When
+ * it never does, the page is blocked (WAF interstitial, punish document, or a
+ * cold SPA that failed to hydrate) and page.focus would wait out the 60s page
+ * default, freezing the whole capture. Bound the wait well under the header
+ * budget so a stuck page reloads and retries instead of hanging.
+ */
+const CHAT_INPUT_APPEAR_TIMEOUT_MS = 15_000;
+/** Per-action bound for focus/fill/type once the input is already visible. */
+const CHAT_INPUT_ACTION_TIMEOUT_MS = 10_000;
 
 /**
  * A challenge blocking the chat page makes the send button inert, so header
@@ -318,7 +550,7 @@ function isAccountServingStream(accountId: string): boolean {
   return true;
 }
 
-function getStealthScript(profile: FingerprintProfile): string {
+export function getStealthScript(profile: FingerprintProfile): string {
   const profileJson = JSON.stringify(profile).replace(/</g, "\\u003c");
   return `
     (function() {
@@ -566,6 +798,14 @@ function getStealthScript(profile: FingerprintProfile): string {
         function makeMime(desc, suffixes, type) {
           return { description: desc, suffixes: suffixes, type: type };
         }
+        function attachPlugin(mime, plugin) {
+          Object.defineProperty(mime, 'enabledPlugin', {
+            value: plugin,
+            enumerable: false,
+            configurable: true,
+            writable: true,
+          });
+        }
         const pdfMime = makeMime('Portable Document Format', 'pdf', 'application/pdf');
         const pdfxMime = makeMime('Portable Document Format', 'pdf', 'text/pdf');
         const pdfPlugin = {
@@ -576,8 +816,8 @@ function getStealthScript(profile: FingerprintProfile): string {
           0: pdfMime,
           1: pdfxMime,
         };
-        pdfMime.enabledPlugin = pdfPlugin;
-        pdfxMime.enabledPlugin = pdfPlugin;
+        attachPlugin(pdfMime, pdfPlugin);
+        attachPlugin(pdfxMime, pdfPlugin);
 
         const chromePdfMime = makeMime('Portable Document Format', 'pdf', 'application/pdf');
         const chromePdfMime2 = makeMime('Portable Document Format', 'pdf', 'text/pdf');
@@ -589,8 +829,8 @@ function getStealthScript(profile: FingerprintProfile): string {
           0: chromePdfMime,
           1: chromePdfMime2,
         };
-        chromePdfMime.enabledPlugin = chromePdfPlugin;
-        chromePdfMime2.enabledPlugin = chromePdfPlugin;
+        attachPlugin(chromePdfMime, chromePdfPlugin);
+        attachPlugin(chromePdfMime2, chromePdfPlugin);
 
         const nativePlugin = {
           name: 'Native Client',
@@ -600,9 +840,8 @@ function getStealthScript(profile: FingerprintProfile): string {
           0: makeMime('Native Client Executable', '', 'application/x-nacl'),
           1: makeMime('Portable Native Client Executable', '', 'application/x-pnacl'),
         };
-        nativePlugin[0].enabledPlugin = nativePlugin;
-        nativePlugin[1].enabledPlugin = nativePlugin;
-
+        attachPlugin(nativePlugin[0], nativePlugin);
+        attachPlugin(nativePlugin[1], nativePlugin);
         const pluginsList = [pdfPlugin, chromePdfPlugin, nativePlugin];
         const mimeList = [pdfMime, pdfxMime, chromePdfMime, chromePdfMime2, nativePlugin[0], nativePlugin[1]];
 
@@ -1029,11 +1268,26 @@ export async function getBasicHeaders(accountId: string): Promise<{
   }
 }
 
+async function resolveAccountCredentials(account: QwenAccount): Promise<QwenAccount> {
+  if (account.password && account.password !== "***") {
+    return account;
+  }
+  try {
+    const { getAccountCredentials } = await import("../core/accounts.ts");
+    const creds = getAccountCredentials(account.id);
+    if (creds && creds.password && creds.password !== "***") {
+      return creds;
+    }
+  } catch {}
+  return account;
+}
+
 export async function initPlaywrightForAccount(
-  account: QwenAccount,
+  rawAccount: QwenAccount,
   headless = true,
   browserType: BrowserType = "chromium",
 ): Promise<void> {
+  const account = await resolveAccountCredentials(rawAccount);
   if (accountPages.has(account.id)) {
     console.log(
       `[Playwright] Already initialized for ${maskEmail(account.email)}`,
@@ -1054,14 +1308,11 @@ export async function initPlaywrightForAccount(
     // If a context limit is configured, make room by closing idle contexts.
     await evictIdlePlaywrightContextsToLimit().catch(() => {});
 
-    const profilePath = path.resolve("data", "qwen_profiles", account.id);
+    const profilePath = getAccountProfilePath(account.id);
     const fingerprint = getFingerprintProfile(account.id);
     const { engine, channel } = resolveBrowserEngine(browserType);
 
-    // Use playwright-extra with stealth if available, otherwise regular chromium
-    const engineToUse = chromiumWithStealth || engine;
-
-    const acctContext = await engineToUse.launchPersistentContext(profilePath, {
+    const launchOptions = {
       headless,
       channel,
       userAgent: fingerprint.userAgent,
@@ -1072,7 +1323,7 @@ export async function initPlaywrightForAccount(
       deviceScaleFactor: 1,
       isMobile: false,
       hasTouch: false,
-      colorScheme: "light",
+      colorScheme: "light" as const,
       extraHTTPHeaders: {
         "sec-ch-ua": fingerprint.secChUa,
         "sec-ch-ua-mobile": "?0",
@@ -1080,11 +1331,51 @@ export async function initPlaywrightForAccount(
       },
       ignoreDefaultArgs: ["--enable-automation", "--enable-blink-features"],
       args: buildChromiumLaunchArgs(fingerprint.viewport),
-    });
+    };
+
+    let acctContext: BrowserContext;
+    try {
+      acctContext = await engine.launchPersistentContext(profilePath, launchOptions);
+    } catch (launchErr: any) {
+      if (launchErr?.message?.includes("Executable doesn't exist")) {
+        autoInstallPlaywrightChromium();
+        acctContext = await engine.launchPersistentContext(profilePath, launchOptions);
+      } else {
+        throw launchErr;
+      }
+    }
+
+    try {
+      const v = acctContext.browser()?.version();
+      if (v) {
+        const major = parseInt(v.split(".")[0], 10);
+        if (major >= 100) {
+          updateChromeMajor(major);
+        }
+      }
+    } catch {}
 
     try {
       // Comprehensive stealth scripts for anti-bot evasion
       await acctContext.addInitScript(getStealthScript(fingerprint));
+      for (const hook of contextInitHooks) {
+        await hook(acctContext);
+      }
+
+      // If native profile cookies are empty but a backup storage_state.json exists, restore cookies
+      const storageState = loadStorageState(account.id);
+      if (storageState) {
+        try {
+          const raw = fs.readFileSync(storageState, "utf8");
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed.cookies) && parsed.cookies.length > 0) {
+            const currentCookies = await acctContext.cookies();
+            if (currentCookies.length === 0) {
+              await acctContext.addCookies(parsed.cookies).catch(() => {});
+            }
+          }
+        } catch {}
+      }
 
       // Persistent contexts may already contain an initial about:blank tab.
       // Reuse it instead of creating a second tab. Prefer a tab already on the
@@ -1132,17 +1423,24 @@ export async function initPlaywrightForAccount(
             waitUntil: "domcontentloaded",
             timeout: config.timeouts.navigation,
           });
-          const url = acctPage.url();
-          if (url.includes("auth") || url.includes("login")) {
+          const loggedIn = await isPageLoggedIn(acctPage);
+          if (!loggedIn) {
             if (account.email && account.password) {
               console.warn(
                 `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
               );
-              await loginToQwen(account.id, account.email, account.password);
+              const ok = await loginToQwen(account.id, account.email, account.password);
+              if (!ok) {
+                validationError = new Error(
+                  `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
+                );
+                continue;
+              }
             } else {
-              console.warn(
-                `[Playwright] Session expired for account ${account.id} but no credentials available.`,
+              validationError = new Error(
+                `Session expired for account ${account.id} but no credentials available for re-login (run 'qpx login')`,
               );
+              break;
             }
           }
           validationError = null;
@@ -1163,8 +1461,6 @@ export async function initPlaywrightForAccount(
         );
         throw validationError;
       }
-
-      // Capture headers by navigating and intercepting
       await captureQwenHeaders(account.id);
 
       // Header capture may leave the UI on a generated chat page. Return the
@@ -1185,7 +1481,7 @@ export async function initPlaywrightForAccount(
 
       touchAccountActivity(account.id);
     } catch (error) {
-      await closePlaywrightContextBestEffort(account.id, acctContext);
+      await closePlaywrightContextBestEffort(account.id, acctContext, { skipStorageSave: true });
       cleanupPlaywrightAccountState(account.id);
       throw error;
     }
@@ -1202,10 +1498,11 @@ export async function initPlaywrightForAccount(
  * This is much lighter than full initPlaywrightForAccount (no header capture).
  */
 export async function validateAccountLogin(
-  account: QwenAccount,
+  rawAccount: QwenAccount,
   headless = true,
   browserType: BrowserType = "chromium",
 ): Promise<boolean> {
+  const account = await resolveAccountCredentials(rawAccount);
   if (accountPages.has(account.id)) {
     // Already initialized, no need to validate
     return true;
@@ -1217,13 +1514,10 @@ export async function validateAccountLogin(
   );
   try {
     if (accountPages.has(account.id)) return true;
-
-    const profilePath = path.resolve("data", "qwen_profiles", account.id);
+    const profilePath = getAccountProfilePath(account.id);
     const fingerprint = getFingerprintProfile(account.id);
     const { engine, channel } = resolveBrowserEngine(browserType);
-    const engineToUse = chromiumWithStealth || engine;
-
-    const acctContext = await engineToUse.launchPersistentContext(profilePath, {
+    const launchOptions = {
       headless,
       channel,
       userAgent: fingerprint.userAgent,
@@ -1234,7 +1528,7 @@ export async function validateAccountLogin(
       deviceScaleFactor: 1,
       isMobile: false,
       hasTouch: false,
-      colorScheme: "light",
+      colorScheme: "light" as const,
       extraHTTPHeaders: {
         "sec-ch-ua": fingerprint.secChUa,
         "sec-ch-ua-mobile": "?0",
@@ -1242,17 +1536,43 @@ export async function validateAccountLogin(
       },
       ignoreDefaultArgs: ["--enable-automation", "--enable-blink-features"],
       args: buildChromiumLaunchArgs(fingerprint.viewport),
-    });
+    };
+
+    let acctContext: BrowserContext;
+    try {
+      acctContext = await engine.launchPersistentContext(profilePath, launchOptions);
+    } catch (launchErr: any) {
+      if (launchErr?.message?.includes("Executable doesn't exist")) {
+        autoInstallPlaywrightChromium();
+        acctContext = await engine.launchPersistentContext(profilePath, launchOptions);
+      } else {
+        throw launchErr;
+      }
+    }
 
     try {
       await acctContext.addInitScript(getStealthScript(fingerprint));
+
+      // If native profile cookies are empty but a backup storage_state.json exists, restore cookies
+      const storageState = loadStorageState(account.id);
+      if (storageState) {
+        try {
+          const raw = fs.readFileSync(storageState, "utf8");
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed.cookies) && parsed.cookies.length > 0) {
+            const currentCookies = await acctContext.cookies();
+            if (currentCookies.length === 0) {
+              await acctContext.addCookies(parsed.cookies).catch(() => {});
+            }
+          }
+        } catch {}
+      }
 
       const existingPages = acctContext.pages().filter((p) => !p.isClosed());
       const acctPage =
         existingPages.find((p) => p.url().startsWith(qwenOrigin())) ??
         existingPages[0] ??
         (await acctContext.newPage());
-
       // Check if already logged in via cookies
       const cookies = await acctContext.cookies();
       const hasAuthCookie = cookies.some(
@@ -1271,23 +1591,20 @@ export async function validateAccountLogin(
         } finally {
           accountPages.delete(account.id);
         }
-      } else if (hasAuthCookie) {
-        // Validate session by navigating to chat page
+      } else {
+        // Validate session by navigating to chat page and checking login state
         try {
           await acctPage.goto(qwenUrl("/"), {
             waitUntil: "domcontentloaded",
             timeout: config.timeouts.navigation,
           });
-          const url = acctPage.url();
-          if (url.includes("auth") || url.includes("login")) {
-            loggedIn = false;
-            if (account.email && account.password) {
-              accountPages.set(account.id, acctPage);
-              try {
-                loggedIn = await loginToQwen(account.id, account.email, account.password);
-              } finally {
-                accountPages.delete(account.id);
-              }
+          loggedIn = await isPageLoggedIn(acctPage);
+          if (!loggedIn && account.email && account.password) {
+            accountPages.set(account.id, acctPage);
+            try {
+              loggedIn = await loginToQwen(account.id, account.email, account.password);
+            } finally {
+              accountPages.delete(account.id);
             }
           }
         } catch {
@@ -1305,14 +1622,88 @@ export async function validateAccountLogin(
     release();
   }
 }
-
 // ─── Login ────────────────────────────────────────────────────────────────────
+
+export interface LoginAttemptResult {
+  success: boolean;
+  permanentFailure?: boolean;
+  reason?: string;
+}
+
+export function classifyQwenAuthError(
+  code?: string,
+  details?: string,
+): { isPermanent: boolean; reason: string } {
+  const c = (code || "").trim().toLowerCase();
+  const d = (details || "").trim().toLowerCase();
+  const combined = `${c} ${d}`;
+
+  if (
+    combined.includes("frozen") ||
+    combined.includes("blocked") ||
+    combined.includes("suspend") ||
+    combined.includes("bloquead")
+  ) {
+    return {
+      isPermanent: true,
+      reason: `Conta bloqueada ou suspensa (${details || code || "AccountSuspended"})`,
+    };
+  }
+
+  if (
+    combined.includes("password") ||
+    combined.includes("senha") ||
+    combined.includes("credential")
+  ) {
+    return {
+      isPermanent: true,
+      reason: `Senha incorreta (${details || code || "PasswordError"})`,
+    };
+  }
+
+  if (
+    combined.includes("user") ||
+    combined.includes("email") ||
+    combined.includes("account") ||
+    combined.includes("not exist") ||
+    combined.includes("not found") ||
+    combined.includes("not registered") ||
+    combined.includes("não encontrado") ||
+    combined.includes("não existe")
+  ) {
+    return {
+      isPermanent: true,
+      reason: `E-mail/usuário não encontrado (${details || code || "UserNotExist"})`,
+    };
+  }
+
+  return {
+    isPermanent: false,
+    reason: details || code || "Falha desconhecida no login",
+  };
+}
 
 async function loginToQwen(
   accountId: string,
   email: string,
   password: string,
 ): Promise<boolean> {
+  if (!password || password === "***") {
+    try {
+      const { getAccountCredentials } = await import("../core/accounts.ts");
+      const creds = getAccountCredentials(accountId);
+      if (creds && creds.password && creds.password !== "***") {
+        password = creds.password;
+      } else {
+        console.error(
+          `❌ [Playwright] Cannot login for ${maskEmail(email)}: password is masked ('***') and real credentials not found in store`,
+        );
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
   const page = accountPages.get(accountId);
   if (!page) return false;
 
@@ -1320,20 +1711,46 @@ async function loginToQwen(
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     // Try API login first
     const apiResult = await loginViaApi(page, email, password);
-    if (apiResult) {
+    if (apiResult.success) {
+      await saveStorageState(page.context(), accountId);
       return true;
+    }
+
+    if (apiResult.permanentFailure) {
+      console.error(
+        `❌ [Playwright] Falha irrecuperável de autenticação para ${maskEmail(email)}: ${apiResult.reason}`,
+      );
+      markAccountRateLimited(
+        accountId,
+        24 * 3600 * 1000,
+        `AuthPermanentFailure: ${apiResult.reason}`,
+      );
+      return false;
     }
 
     // Fallback to UI login
     const uiResult = await loginViaUi(page, email, password);
-    if (uiResult) {
+    if (uiResult.success) {
+      await saveStorageState(page.context(), accountId);
       return true;
+    }
+
+    if (uiResult.permanentFailure) {
+      console.error(
+        `❌ [Playwright] Falha irrecuperável de autenticação para ${maskEmail(email)}: ${uiResult.reason}`,
+      );
+      markAccountRateLimited(
+        accountId,
+        24 * 3600 * 1000,
+        `AuthPermanentFailure: ${uiResult.reason}`,
+      );
+      return false;
     }
 
     if (attempt < maxAttempts) {
       const backoffMs = attempt * 5_000;
       console.warn(
-        `⚠️  [Playwright] Login attempt ${attempt}/${maxAttempts} failed for ${maskEmail(email)}, retrying in ${backoffMs / 1000}s`,
+        `⚠️  [Playwright] Login attempt ${attempt}/${maxAttempts} failed for ${maskEmail(email)} (${apiResult.reason || uiResult.reason || "falha temporária"}), retrying in ${backoffMs / 1000}s`,
       );
       await sleep(backoffMs);
     }
@@ -1342,6 +1759,11 @@ async function loginToQwen(
   console.error(
     `❌ [Playwright] All login methods failed for ${maskEmail(email)}`,
   );
+  markAccountRateLimited(
+    accountId,
+    24 * 3600 * 1000,
+    "AuthFailed: All login methods exhausted",
+  );
   return false;
 }
 
@@ -1349,7 +1771,7 @@ async function loginViaApi(
   page: Page,
   email: string,
   password: string,
-): Promise<boolean> {
+): Promise<LoginAttemptResult> {
   try {
     await page.goto(qwenUrl("/auth"), {
       waitUntil: "domcontentloaded",
@@ -1359,7 +1781,7 @@ async function loginViaApi(
 
     // Check if already logged in
     if (!page.url().includes("/auth")) {
-      return true;
+      return { success: true };
     }
 
     const hashedPassword = crypto
@@ -1371,22 +1793,20 @@ async function loginViaApi(
     const result = await page.evaluate(
       async ({ email, password, signinUrl }) => {
         try {
-          const response = await fetch(signinUrl,
-            {
-              method: "POST",
-              signal: AbortSignal.timeout(10_000),
-              headers: {
-                accept: "application/json, text/plain, */*",
-                "content-type": "application/json",
-                source: "web",
-                timezone: new Date().toString().split(" (")[0],
-                "x-request-id": crypto.randomUUID(),
-              },
-              body: JSON.stringify({ email, password, login_type: "email" }),
+          const response = await fetch(signinUrl, {
+            method: "POST",
+            signal: AbortSignal.timeout(10_000),
+            headers: {
+              accept: "application/json, text/plain, */*",
+              "content-type": "application/json",
+              source: "web",
+              timezone: new Date().toString().split(" (")[0],
+              "x-request-id": crypto.randomUUID(),
             },
-          );
-          const data = await response.json();
-          return { ok: response.ok, data };
+            body: JSON.stringify({ email, password, login_type: "email" }),
+          });
+          const data = await response.json().catch(() => null);
+          return { ok: response.ok, status: response.status, data };
         } catch (e: any) {
           return { ok: false, error: e.message };
         }
@@ -1394,18 +1814,48 @@ async function loginViaApi(
       { email, password: hashedPassword, signinUrl },
     );
 
+    if (result.data) {
+      if (result.data.success === true) {
+        await page.goto(qwenUrl("/"), {
+          waitUntil: "domcontentloaded",
+          timeout: config.timeouts.navigation,
+        });
+        const loggedIn = !page.url().includes("auth") && !page.url().includes("login");
+        if (loggedIn) {
+          return { success: true };
+        }
+      } else if (result.data.success === false) {
+        const code = result.data?.data?.code || result.data?.code;
+        const details =
+          result.data?.data?.details || result.data?.details || result.data?.message;
+        const classified = classifyQwenAuthError(code, details);
+        return {
+          success: false,
+          permanentFailure: classified.isPermanent,
+          reason: classified.reason,
+        };
+      }
+    }
+
     if (result.ok) {
       await page.goto(qwenUrl("/"), {
         waitUntil: "domcontentloaded",
         timeout: config.timeouts.navigation,
       });
-      return !page.url().includes("auth") && !page.url().includes("login");
+      const loggedIn = !page.url().includes("auth") && !page.url().includes("login");
+      return {
+        success: loggedIn,
+        reason: loggedIn ? undefined : "Redirecionado de volta para /auth após signin",
+      };
     }
 
-    return false;
-  } catch (err) {
-    console.warn(`⚠️  [Playwright] API login error: ${err}`);
-    return false;
+    return {
+      success: false,
+      reason: result.error || `HTTP ${result.status || "desconhecido"} sem corpo JSON válido`,
+    };
+  } catch (err: any) {
+    console.warn(`⚠️  [Playwright] API login error: ${err?.message || err}`);
+    return { success: false, reason: err?.message || String(err) };
   }
 }
 
@@ -1413,7 +1863,7 @@ async function loginViaUi(
   page: Page,
   email: string,
   password: string,
-): Promise<boolean> {
+): Promise<LoginAttemptResult> {
   try {
     await page.goto(qwenUrl("/auth"), {
       waitUntil: "domcontentloaded",
@@ -1423,7 +1873,7 @@ async function loginViaUi(
 
     // Check if already logged in
     if (!page.url().includes("/auth")) {
-      return true;
+      return { success: true };
     }
 
     // Wait for email input
@@ -1439,11 +1889,11 @@ async function loginViaUi(
         timeout: config.timeouts.page,
       });
     } catch {
-      if (!page.url().includes("/auth")) return true;
+      if (!page.url().includes("/auth")) return { success: true };
       console.warn(
         `⚠️  [Playwright] Email input not found on ${page.url()} (possible captcha or anti-bot challenge)`,
       );
-      throw new Error("Email input not found");
+      return { success: false, reason: "Campo de e-mail não encontrado (possível captcha)" };
     }
 
     // Fill email
@@ -1485,6 +1935,34 @@ async function loginViaUi(
     }
     await sleep(3000);
 
+    // If a slider puzzle captcha appeared after submit, solve it automatically
+    await solveBaxiaCaptcha(page, {
+      waitForMs: 2000,
+      maxAttempts: config.captcha.maxAttempts,
+      retryDelayMs: config.captcha.retryDelayMs,
+    }).catch(() => {});
+    // Check for UI error elements in DOM (Ant Design errors, alerts, toasts)
+    const errorSelector = [
+      ".ant-form-item-explain-error",
+      ".ant-message-error",
+      ".ant-message-notice",
+      '[role="alert"]',
+      ".qwenchat-auth-error",
+      ".auth-error-message",
+    ].join(", ");
+    const errorEl = page.locator(errorSelector).first();
+    if (await errorEl.isVisible().catch(() => false)) {
+      const errorText = (await errorEl.innerText().catch(() => "")).trim();
+      if (errorText) {
+        const classified = classifyQwenAuthError(undefined, errorText);
+        return {
+          success: false,
+          permanentFailure: classified.isPermanent,
+          reason: `Formulário: ${classified.reason}`,
+        };
+      }
+    }
+
     // Check if login was successful
     const isLoggedIn =
       !page.url().includes("auth") && !page.url().includes("login");
@@ -1494,12 +1972,16 @@ async function loginViaUi(
         waitUntil: "domcontentloaded",
         timeout: config.timeouts.navigation,
       });
+      return { success: true };
     }
 
-    return isLoggedIn;
-  } catch (err) {
-    console.warn(`⚠️  [Playwright] UI login error: ${err}`);
-    return false;
+    return {
+      success: false,
+      reason: "A página permaneceu na tela de autenticação após envio do formulário",
+    };
+  } catch (err: any) {
+    console.warn(`⚠️  [Playwright] UI login error: ${err?.message || err}`);
+    return { success: false, reason: err?.message || String(err) };
   }
 }
 
@@ -1524,59 +2006,65 @@ export async function captureQwenHeaders(
   touchAccountActivity(accountId);
   const cache = getHeaderCache(accountId);
 
-  return new Promise<void>((resolve, reject) => {
-    let settled = false;
-    let routeRegistered = false;
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    let routeHandler: (route: any, request: any) => Promise<void>;
-    let sawIncompleteHeaders = false;
-    let headersCaptured = false;
-    let retriggerRequested = false;
-    let lastAttemptGraceTimedOut = false;
-    let graceTimeoutCount = 0;
-    let wakeTriggerLoop: (() => void) | undefined;
-    const deadline = Date.now() + timeoutMs;
-    const remainingBudgetMs = () => deadline - Date.now();
+  let cleanupRoute = async () => {};
+  try {
+    return await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let routeRegistered = false;
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      let routeHandler: (route: any, request: any) => Promise<void>;
+      let sawIncompleteHeaders = false;
+      let headersCaptured = false;
+      let retriggerRequested = false;
+      let lastAttemptGraceTimedOut = false;
+      let lastAttemptInputMissing = false;
+      let graceTimeoutCount = 0;
+      let wakeTriggerLoop: (() => void) | undefined;
+      const deadline = Date.now() + timeoutMs;
+      const remainingBudgetMs = () => deadline - Date.now();
 
-    const cleanupRoute = () => {
-      if (!routeRegistered) return;
-      void page
-        .unroute("**/api/v2/chat/completions*", routeHandler)
-        .catch(() => {});
-    };
-
-    const wakeTrigger = () => {
-      const wake = wakeTriggerLoop;
-      wakeTriggerLoop = undefined;
-      wake?.();
-    };
-
-    const settle = (error?: Error) => {
-      if (settled) return;
-      settled = true;
-      if (timeout) clearTimeout(timeout);
-      cleanupRoute();
-      // A trigger loop parked between attempts has to be released, otherwise it
-      // stays pending forever behind an already-settled capture.
-      wakeTrigger();
-      // When a trigger grace period expired (page fired no completion request),
-      // log the OUTCOME so the operator can see whether the retry loop
-      // recovered or the account is being rotated into cooldown — the bare
-      // per-attempt warning leaves that dangling.
-      if (graceTimeoutCount > 0) {
-        if (headersCaptured) {
-          console.log(
-            `✅ [Playwright] Header capture recovered for ${accountId} after ${graceTimeoutCount} silent send(s)`,
-          );
-        } else {
-          console.warn(
-            `❌ [Playwright] Header capture failed for ${accountId} after ${graceTimeoutCount} silent send(s): ${error?.message ?? "no completion request"}`,
-          );
+      cleanupRoute = async () => {
+        if (!routeRegistered) return;
+        routeRegistered = false;
+        if (!page.isClosed()) {
+          try {
+            await page.unroute("**/api/v2/chat/completions*", routeHandler);
+          } catch {}
         }
-      }
-      if (error) reject(error);
-      else resolve();
-    };
+      };
+
+      const wakeTrigger = () => {
+        const wake = wakeTriggerLoop;
+        wakeTriggerLoop = undefined;
+        wake?.();
+      };
+
+      const settle = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        void cleanupRoute();
+        // A trigger loop parked between attempts has to be released, otherwise it
+        // stays pending forever behind an already-settled capture.
+        wakeTrigger();
+        // When a trigger grace period expired (page fired no completion request),
+        // log the OUTCOME so the operator can see whether the retry loop
+        // recovered or the account is being rotated into cooldown — the bare
+        // per-attempt warning leaves that dangling.
+        if (graceTimeoutCount > 0) {
+          if (headersCaptured) {
+            console.log(
+              `✅ [Playwright] Header capture recovered for ${accountId} after ${graceTimeoutCount} silent send(s)`,
+            );
+          } else {
+            console.warn(
+              `❌ [Playwright] Header capture failed for ${accountId} after ${graceTimeoutCount} silent send(s): ${error?.message ?? "no completion request"}`,
+            );
+          }
+        }
+        if (error) reject(error);
+        else resolve();
+      };
 
     const incompleteHeadersError = () =>
       new Error(
@@ -1737,8 +2225,11 @@ export async function captureQwenHeaders(
       // burn every trigger attempt on a textarea that does not exist. Re-login
       // immediately when credentials are available; otherwise fail fast with a
       // clear diagnosis instead of 3 pointless grace timeouts.
-      const currentUrl = page.url();
-      if (currentUrl.includes("/auth") || currentUrl.includes("/login")) {
+      const loggedIn = await isPageLoggedIn(
+        page,
+        Math.max(1_000, Math.min(remainingBudgetMs(), SESSION_PROBE_NAVIGATION_TIMEOUT_MS)),
+      );
+      if (!loggedIn) {
         const { getAccountCredentials } = await import("../core/accounts.ts");
         const creds = getAccountCredentials(accountId);
         if (creds && creds.email && creds.password) {
@@ -1761,7 +2252,7 @@ export async function captureQwenHeaders(
         } else {
           settle(
             new Error(
-              `Header capture failed for ${accountId}: session expired and no credentials available for re-login`,
+              `Header capture failed for ${accountId}: session expired and no credentials available for re-login (run 'qpx login')`,
             ),
           );
           return;
@@ -1775,11 +2266,59 @@ export async function captureQwenHeaders(
       // Mirrors upstream 5b3fd3e (robust account header capture).
       const inputSelector =
         'textarea.message-input-textarea:visible, textarea:visible, [contenteditable="true"]:visible';
-      await page.focus(inputSelector);
+      // Bound the appearance wait: a page that never renders the chat input is
+      // blocked (WAF interstitial, punish document, or failed SPA hydration).
+      // Unbounded, page.focus would burn its 60s default timeout on every
+      // attempt, freezing the whole capture and cooling a healthy account with
+      // AuthInitFailed. A miss marks the attempt for a reload instead.
+      try {
+        await page
+          .locator(inputSelector)
+          .first()
+          .waitFor({
+            state: "visible",
+            timeout: Math.max(
+              1,
+              Math.min(CHAT_INPUT_APPEAR_TIMEOUT_MS, remainingBudgetMs()),
+            ),
+          });
+      } catch {
+        if (settled || page.isClosed()) return;
+        console.warn(
+          `⏱️  [Playwright] Chat input never appeared for ${accountId} (attempt ${attempt}); reloading`,
+        );
+        lastAttemptInputMissing = true;
+        retriggerRequested = true;
+        wakeTrigger();
+        return;
+      }
       if (settled || page.isClosed()) return;
-      await page.fill(inputSelector, "");
-      if (settled || page.isClosed()) return;
-      await page.type(inputSelector, "a", { delay: 100 });
+      const inputActionTimeoutMs = Math.max(
+        1,
+        Math.min(CHAT_INPUT_ACTION_TIMEOUT_MS, remainingBudgetMs()),
+      );
+      try {
+        await page.focus(inputSelector, { timeout: inputActionTimeoutMs });
+        if (settled || page.isClosed()) return;
+        await page.fill(inputSelector, "", { timeout: inputActionTimeoutMs });
+        if (settled || page.isClosed()) return;
+        await page.type(inputSelector, "a", {
+          delay: 100,
+          timeout: inputActionTimeoutMs,
+        });
+      } catch {
+        // The input detached mid-interaction (challenge overlay, SPA
+        // re-render): same diagnosis as never appearing — only a fresh load
+        // recovers it.
+        if (settled || page.isClosed()) return;
+        console.warn(
+          `⏱️  [Playwright] Chat input interaction failed for ${accountId} (attempt ${attempt}); reloading`,
+        );
+        lastAttemptInputMissing = true;
+        retriggerRequested = true;
+        wakeTrigger();
+        return;
+      }
       if (settled || page.isClosed()) return;
       await sleep(2000);
       if (settled || page.isClosed()) return;
@@ -1847,8 +2386,16 @@ export async function captureQwenHeaders(
           // no request (indicating a stuck page/challenge that needs a fresh load).
           // Attempt 2 preserves the page from attempt 1 so the bx SDK that just
           // finished initializing in the background is not thrown away.
-          if (attempt === 1 || (lastAttemptGraceTimedOut && attempt >= 3)) {
+          // A missing chat input is the exception: the page never rendered the
+          // chat UI, so there is no warm SDK state to protect and only a fresh
+          // load can recover it.
+          if (
+            attempt === 1 ||
+            lastAttemptInputMissing ||
+            (lastAttemptGraceTimedOut && attempt >= 3)
+          ) {
             lastAttemptGraceTimedOut = false;
+            lastAttemptInputMissing = false;
             await openChatPage();
           }
           if (settled) return;
@@ -1905,11 +2452,12 @@ export async function captureQwenHeaders(
             : new Error(`Header capture route registration failed for ${accountId}`),
         );
       });
-  });
+    });
+  } finally {
+    await cleanupRoute();
+  }
 }
-
 type CookieSnapshot = Awaited<ReturnType<BrowserContext["cookies"]>>;
-
 /**
  * Fetch the account context cookies once. The snapshot feeds every validity
  * check and the cookie string build, avoiding repeated CDP round-trips.
@@ -2096,7 +2644,7 @@ export async function withAccountPage<T>(
         );
         const context = accountContexts.get(accountId);
         if (context) {
-          await closePlaywrightContextBestEffort(accountId, context);
+          await closePlaywrightContextBestEffort(accountId, context, { skipStorageSave: true });
         }
         cleanupPlaywrightAccountState(accountId);
       }
@@ -2120,8 +2668,10 @@ function isPlaywrightProfileCorruptedError(error: unknown): boolean {
 
 async function resetPlaywrightProfileLocked(accountId: string): Promise<void> {
   await closePlaywrightForAccountLocked(accountId);
-  const profilePath = path.resolve("data", "qwen_profiles", accountId);
+  const profilePath = getAccountProfilePath(accountId);
   removePlaywrightProfile(profilePath);
+  const stateFile2 = path.join(path.dirname(profilePath), `${accountId}_state.json`);
+  try { fs.rmSync(stateFile2, { force: true }); } catch {}
 }
 
 /**
@@ -2239,7 +2789,7 @@ export function prunePlaywrightProfileCaches(profilePath: string): {
 /**
  * Prunes transient caches across all profile directories in data/qwen_profiles.
  */
-export function pruneAllPlaywrightProfiles(baseDir = path.resolve("data", "qwen_profiles")): {
+export function pruneAllPlaywrightProfiles(baseDir = getProfilesDir()): {
   totalFreedBytes: number;
   totalFreedFiles: number;
   profilesCleaned: number;
@@ -2268,6 +2818,64 @@ export function pruneAllPlaywrightProfiles(baseDir = path.resolve("data", "qwen_
   } catch {}
 
   return { totalFreedBytes, totalFreedFiles, profilesCleaned };
+}
+/**
+ * Removes profile directories in data/qwen_profiles that do not belong to any
+ * active account configured in the database or environment, plus any lingering
+ * .stale-* directories from previous lock renames.
+ */
+export function cleanupOrphanProfiles(
+  baseDir = getProfilesDir(),
+  activeAccountIds?: Set<string>,
+): {
+  removedCount: number;
+  freedBytes: number;
+} {
+  let removedCount = 0;
+  let freedBytes = 0;
+
+  try {
+    if (!fs.existsSync(baseDir)) {
+      return { removedCount, freedBytes };
+    }
+
+    const activeIds =
+      activeAccountIds ?? new Set(loadAccounts().map((a) => a.id));
+
+    const entries = fs.readdirSync(baseDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const isStale = entry.name.includes(".stale-");
+      const isOrphan = !isStale && !activeIds.has(entry.name);
+
+      if (isStale || isOrphan) {
+        const targetPath = path.join(baseDir, entry.name);
+        try {
+          let bytes = 0;
+          const countSize = (d: string) => {
+            try {
+              const subEntries = fs.readdirSync(d, { withFileTypes: true });
+              for (const e of subEntries) {
+                const full = path.join(d, e.name);
+                if (e.isDirectory()) countSize(full);
+                else if (e.isFile()) {
+                  try { bytes += fs.statSync(full).size; } catch {}
+                }
+              }
+            } catch {}
+          };
+          countSize(targetPath);
+          removePlaywrightProfile(targetPath);
+          if (!fs.existsSync(targetPath)) {
+            removedCount++;
+            freedBytes += bytes;
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return { removedCount, freedBytes };
 }
 
 const PROFILE_RESET_TIMEOUT_MS = Math.max(90_000, config.timeouts.headers);
@@ -2494,7 +3102,7 @@ export async function keepAlivePlaywrightAccount(
     if (shouldNavigate) {
       await page.goto(qwenUrl("/"), {
         waitUntil: "domcontentloaded",
-        timeout: Math.min(config.timeouts.navigation, 15_000),
+        timeout: Math.min(config.timeouts.navigation, 30_000),
       });
       lastKeepAliveNavigation.set(accountId, now);
     } else {
@@ -2524,7 +3132,7 @@ export function installContextDeathHandlers(
 ): void {
   const onDeath = (): void => {
     cleanupPlaywrightAccountState(accountId);
-    void closePlaywrightContextBestEffort(accountId, context).catch(() => {});
+    void closePlaywrightContextBestEffort(accountId, context, { skipStorageSave: true }).catch(() => {});
   };
   context.on("close", onDeath);
   page.on("crash", onDeath);
@@ -2547,11 +3155,23 @@ function cleanupPlaywrightAccountState(accountId: string): void {
 async function closePlaywrightContextBestEffort(
   accountId: string,
   context: BrowserContext,
+  options?: { skipStorageSave?: boolean },
 ): Promise<void> {
-  const browserProcess = getBrowserProcess(context);
+  if (!options?.skipStorageSave) {
+    try {
+      if (await hasValidAuthCookie(context)) {
+        await saveStorageState(context, accountId);
+      }
+    } catch {}
+  }
 
   try {
     const pages = context.pages();
+    for (const page of pages) {
+      if (!page.isClosed()) {
+        await (page as any).unrouteAll?.({ behavior: "ignoreErrors" }).catch(() => {});
+      }
+    }
     await Promise.all(
       pages.map((page) =>
         withTimeout(
@@ -2573,19 +3193,6 @@ async function closePlaywrightContextBestEffort(
         `[Playwright] Failed to close context for ${accountId}: ${getErrorMessage(error)}`,
       );
     }
-
-    if (browserProcess && !browserProcess.killed) {
-      try {
-        browserProcess.kill("SIGKILL");
-        console.warn(
-          `[Playwright] Killed lingering browser process for ${accountId}`,
-        );
-      } catch (killError) {
-        console.warn(
-          `[Playwright] Failed to kill browser process for ${accountId}: ${getErrorMessage(killError)}`,
-        );
-      }
-    }
   }
 }
 
@@ -2600,7 +3207,7 @@ async function closePlaywrightForAccountLocked(
   } finally {
     cleanupPlaywrightAccountState(accountId);
     try {
-      const profilePath = path.resolve("data", "qwen_profiles", accountId);
+      const profilePath = getAccountProfilePath(accountId);
       prunePlaywrightProfileCaches(profilePath);
     } catch {}
   }
@@ -2612,11 +3219,26 @@ async function closePlaywrightForAccountLocked(
  * that must not be logged as keep-alive failures.
  */
 export function isPlaywrightAlreadyClosedError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
+  if (!error) return false;
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "object" && "message" in error
+        ? String((error as any).message)
+        : String(error);
   return (
     message.includes("Target page, context or browser has been closed") ||
     message.includes("Browser has been closed") ||
-    message.includes("Target closed")
+    message.includes("Target closed") ||
+    message.includes("Target crashed") ||
+    message.includes("Page crashed") ||
+    message.includes("Assertion error") ||
+    message.includes("Cannot find parent object") ||
+    message.includes("Connection closed") ||
+    message.includes("session closed") ||
+    message.includes("Session closed") ||
+    message.includes("Network.setCacheDisabled") ||
+    message.includes("Protocol error")
   );
 }
 
@@ -2664,6 +3286,10 @@ export async function closeAllPlaywright(): Promise<void> {
     for (const accountId of accountIds) {
       await closePlaywrightForAccount(accountId);
     }
+    if (sharedBrowser && sharedBrowser.isConnected()) {
+      await sharedBrowser.close().catch(() => {});
+      sharedBrowser = null;
+    }
   } finally {
     closingAllPlaywright = false;
   }
@@ -2689,6 +3315,12 @@ export function registerPlaywrightAccountForTests(
   getAccountMutex(accountId);
   accountPages.set(accountId, page);
   lastAccountActivity.set(accountId, lastActivityAt);
+}
+
+export function unregisterPlaywrightAccountForTests(accountId: string): void {
+  accountPages.delete(accountId);
+  accountContexts.delete(accountId);
+  lastAccountActivity.delete(accountId);
 }
 
 // ─── Token TTL Diagnostics ───────────────────────────────────────────────────
@@ -2739,7 +3371,6 @@ export async function getTokenDiagnostics(
   const targetAccounts = accountId
     ? [accountId]
     : Array.from(accountContexts.keys());
-
   const allCookies: CookieDiagnostic[] = [];
   const headerDiags: HeaderDiagnostic[] = [];
 
