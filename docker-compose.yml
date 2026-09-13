@@ -2,7 +2,7 @@ services:
   qwenproxy:
     build: .
     container_name: qwenbridge
-    shm_size: '1gb'
+    shm_size: '2gb'
     ports:
       - "${PORT:-50002}:${PORT:-50002}"
     env_file:
@@ -17,6 +17,12 @@ services:
         reservations:
           memory: 512M
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:' + (process.env.PORT || 50002) + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
     logging:
       driver: "json-file"
       options:

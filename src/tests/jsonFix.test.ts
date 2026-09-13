@@ -83,3 +83,10 @@ test("robustParseJSON: handles unquoted key with equals separator", () => {
     assert.strictEqual(result.arguments.command, "git status");
 });
 
+test("robustParseJSON: handles stray backslashes escaping property quotes", () => {
+    const rawArgs = '{"pattern": "skill_view: rebuilt session skill view","conversation_id\\":\\"d5dc8b6c", "path": "C:\\\\Users\\\\amarober\\\\file.log"}';
+    const result = robustParseJSON(rawArgs);
+    assert.ok(result !== null);
+    assert.strictEqual(result.conversation_id, "d5dc8b6c");
+    assert.strictEqual(result.pattern, "skill_view: rebuilt session skill view");
+});

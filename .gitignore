@@ -30,6 +30,7 @@ networkv2/
 
 # Coverage & cache
 coverage/
+.tmp/
 .cache/
 graphify-out/
 

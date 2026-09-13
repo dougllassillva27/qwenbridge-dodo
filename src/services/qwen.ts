@@ -27,9 +27,8 @@ import {
   replaceModelMetadata,
   syncModelMetadata,
 } from "../core/model-registry.ts";
-import { type Page } from "playwright";
-import { withAccountPage } from "./playwright.ts";
-import { assertAntiBotHeaders } from "./playwright.ts";
+import { type Page, type BrowserContext } from "patchright";
+import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated } from "./playwright.ts";
 import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
 import { isAccountBusy } from "../core/account-concurrency.ts";
@@ -117,6 +116,30 @@ interface BrowserStreamState {
 
 const browserStreamStates = new Map<string, BrowserStreamState>();
 const browserStreamBindingPages = new WeakSet<object>();
+const browserStreamBindingContexts = new WeakSet<object>();
+
+export async function registerBrowserContextStreamBinding(
+  context: BrowserContext,
+): Promise<void> {
+  if (browserStreamBindingContexts.has(context)) return;
+  browserStreamBindingContexts.add(context);
+  try {
+    await context.exposeFunction(
+      BROWSER_STREAM_BINDING,
+      (requestId: string, event: BrowserStreamEvent) => {
+        handleBrowserStreamEvent(requestId, event);
+      },
+    );
+  } catch (error) {
+    logger.warn("[Qwen] Failed to register stream binding on context", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+onBrowserContextCreated((context) => {
+  void registerBrowserContextStreamBinding(context);
+});
 
 function wakeBrowserStreamState(state: BrowserStreamState): void {
   const waiters = Array.from(state.waiters);
@@ -154,14 +177,21 @@ function handleBrowserStreamEvent(
 }
 
 async function ensureBrowserStreamBinding(page: Page): Promise<void> {
+  const context = page.context();
+  if (!browserStreamBindingContexts.has(context)) {
+    await registerBrowserContextStreamBinding(context);
+  }
   if (browserStreamBindingPages.has(page)) return;
-
-  await page.exposeFunction(
-    BROWSER_STREAM_BINDING,
-    (requestId: string, event: BrowserStreamEvent) => {
-      handleBrowserStreamEvent(requestId, event);
-    },
-  );
+  try {
+    await page.exposeFunction(
+      BROWSER_STREAM_BINDING,
+      (requestId: string, event: BrowserStreamEvent) => {
+        handleBrowserStreamEvent(requestId, event);
+      },
+    );
+  } catch {
+    // If context-level binding is already present, page-level expose may throw or no-op.
+  }
   browserStreamBindingPages.add(page);
 }
 
@@ -534,35 +564,6 @@ export function buildCapturedQwenHeaders(
   });
 }
 
-/**
- * Open an isolated page in the same browser context for short-lived operations
- * (settings, models, etc.). The main chat page is never navigated away.
- */
-async function withIsolatedQwenPage<T>(
-  accountId: string,
-  fn: (page: Page) => Promise<T>,
-  targetUrl?: string,
-): Promise<T> {
-  return withAccountPage(
-    accountId,
-    async (mainPage) => {
-      const context = mainPage.context();
-      const page = await context.newPage();
-      try {
-        if (targetUrl) {
-          await page.goto(targetUrl, {
-            waitUntil: "domcontentloaded",
-            timeout: config.timeouts.navigation,
-          });
-        }
-        return await fn(page);
-      } finally {
-        await page.close().catch(() => {});
-      }
-    },
-    config.timeouts.page,
-  );
-}
 
 // Per-account stream slots: a counting semaphore capped by
 // config.concurrency.maxStreamsPerAccount (NOT a capacity-1 mutex). The browser
@@ -916,20 +917,16 @@ export async function requestQwenTextInBrowser(
       },
     );
   const recoverOnTimeout = !options.noMutexRecovery;
-  const response = options.settingsPage
-    ? await withQwenPersonalizationPage<BrowserTextResponse>(
-        accountId,
-        evaluateRequest,
-        options.timeoutMs,
-        recoverOnTimeout,
-      )
-    : await withQwenBrowserPage<BrowserTextResponse>(
-        accountId,
-        evaluateRequest,
-        undefined,
-        options.timeoutMs,
-        recoverOnTimeout,
-      );
+  // Settings and personalization requests run as same-origin in-browser fetch
+  // with appropriate Referer, keeping the page on the stable chat UI without
+  // expensive page.goto navigations that can time out under load.
+  const response = await withQwenBrowserPage<BrowserTextResponse>(
+    accountId,
+    evaluateRequest,
+    undefined,
+    options.timeoutMs,
+    recoverOnTimeout,
+  );
 
   return new Response(response.raw, {
     status: response.status,
@@ -1044,10 +1041,8 @@ async function requestQwenPersonalizationInBrowser(
   headers: Record<string, string>,
   payload?: Record<string, unknown>,
 ): Promise<{ status: number; raw: string; json: any }> {
-  // Fast, stable primary path: direct Node fetch with the captured headers
-  // (cookie, bx-v, version, sec-ch-ua, source, referer). Falls back to the
-  // browser only when unavailable (circuit breaker / WAF block / network err).
-  if (!isAuthMockEnabled()) {
+  // If browser-only fetch is disabled, try direct Node fetch as fast-path
+  if (!config.qwen.browserOnlyFetch && !isAuthMockEnabled()) {
     const direct = await requestQwenSettingsDirectFetch(
       accountId,
       method,
@@ -1767,7 +1762,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
     // Startup/idle operations should not open a visible extra tab.
     if (accountId && !isAuthMockEnabled() && isAccountBusy(accountId)) {
       try {
-        const result = await withIsolatedQwenPage(
+        const result = await withAccountPage(
           accountId,
           async (page) => {
             const response = await page.evaluate(
@@ -1799,9 +1794,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
             );
             return response;
           },
-          qwenUrl("/"),
         );
-
         if (result.status < 400) {
           nativeToolsDisabled.add(cacheKey);
           return;
@@ -2005,7 +1998,7 @@ export async function fetchQwenModels(
   // Startup/idle operations should not open a visible extra tab.
   if (accountId && !isAuthMockEnabled() && isAccountBusy(accountId)) {
     try {
-      const result = await withIsolatedQwenPage(
+      const result = await withAccountPage(
         accountId,
         async (page) => {
           const response = await page.evaluate(async (timeoutMs: number) => {
@@ -2029,9 +2022,7 @@ export async function fetchQwenModels(
           }, config.timeouts.http);
           return response;
         },
-        qwenUrl("/"),
       );
-
       if (result.status < 400) {
         const json = JSON.parse(result.body);
         if (json.data && Array.isArray(json.data)) {
@@ -2682,7 +2673,10 @@ async function createQwenStreamInternal(
     chatId: chatSessionId || null,
     parentId: actualParentId ?? "",
     chat_id: chatSessionId || null,
-    chat_mode: options?.chatMode === "temp" ? "local" : "normal",
+    chat_mode:
+      options?.chatMode === "temp" || options?.chatMode === "temp-thread"
+        ? "local"
+        : "normal",
     model: model,
     parent_id: actualParentId,
     messages: [

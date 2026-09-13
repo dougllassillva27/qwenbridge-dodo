@@ -49,7 +49,7 @@ const envSchema = z
     // temp chat (chat_mode:"local") for every request and sends the full
     // history inline (OpenAI standard). Temp chats are ephemeral and never
     // appear in the account's chat list (live-probed).
-    QWEN_CHAT_MODE: z.enum(["thread", "temp"]).default("thread"),
+    QWEN_CHAT_MODE: z.enum(["thread", "temp", "temp-thread"]).default("thread"),
     PLAYWRIGHT_HEADLESS: z.string().default("false"),
     PLAYWRIGHT_BROWSER: z
       .enum(["chromium", "chrome", "edge"])
@@ -92,7 +92,7 @@ const envSchema = z
     // Deadline for the FIRST upstream chunk on thinking models (the reasoning
     // idle of 600s is for gaps AFTER data flows; a stream that produced
     // nothing in this window is dead and should fail fast, retryable).
-    QWEN_FIRST_CHUNK_TIMEOUT: z.string().default("180000"),
+    QWEN_FIRST_CHUNK_TIMEOUT: z.string().default("60000"),
     TOTAL_REQUEST_TIMEOUT: z.string().default("600000"),
     // Mid-stream silence window for thinking models: 3 min with ZERO upstream
     // bytes is a dead stream (WAF swallow / dropped connection) — fail fast and
@@ -170,6 +170,8 @@ const envSchema = z
     QWEN_CHAT_POOL_MODELS: z.string().default("qwen3.7-plus"),
     QWEN_PERSONALIZATION_FROM_REQUEST: z.string().default("true"),
     QWEN_PERSONALIZATION_VERIFY_GET: z.string().default("true"),
+    QWEN_BROWSER_ONLY_FETCH: z.string().default("true"),
+    QWEN_MAP_OPENAI_MODELS: z.string().default("true"),
     QWEN_MAX_PROMPT_BYTES: z.string().default("0"),
     QWEN_MAX_PERSONALIZATION_BYTES: z.string().default("200000"),
     CONTEXT_METER_ENABLED: z.string().default("true"),
@@ -182,7 +184,7 @@ const envSchema = z
     // trust score and gets TMD-challenged on the next request. On by default;
     // the keeper skips accounts that are mid-stream or mutex-busy.
     SESSION_KEEP_ALIVE_ENABLED: z.string().default("true"),
-    SESSION_KEEP_ALIVE_INTERVAL_MS: z.string().default("30000"),
+    SESSION_KEEP_ALIVE_INTERVAL_MS: z.string().default("180000"),
     SESSION_KEEP_ALIVE_IDLE_MS: z.string().default("120000"),
     SESSION_KEEP_ALIVE_NAVIGATION_INTERVAL_MS: z.string().default("480000"),
     API_KEY: z.string().default(""),
@@ -380,6 +382,9 @@ export const config = {
       env.QWEN_PERSONALIZATION_FROM_REQUEST === "true",
     personalizationVerifyGet: env.QWEN_PERSONALIZATION_VERIFY_GET !== "false",
     /** "thread" (reuse upstream chat) or "temp" (new ephemeral chat per request). */
+    /** When true, all requests (personalization, models, media, chat) route exclusively through the browser page (no direct Node fetch). */
+    browserOnlyFetch: env.QWEN_BROWSER_ONLY_FETCH !== "false",
+    mapOpenAiModels: env.QWEN_MAP_OPENAI_MODELS !== "false",
     chatMode: env.QWEN_CHAT_MODE,
     maxPromptBytes: Math.max(0, parseInt(env.QWEN_MAX_PROMPT_BYTES)),
     maxPersonalizationBytes: Math.max(
@@ -431,5 +436,5 @@ export const config = {
 
 export type Config = typeof config;
 
-/** Conversation mode: thread-native reuse vs ephemeral temp chat per request. */
-export type ChatMode = "thread" | "temp";
+/** Conversation mode: thread-native reuse vs ephemeral temp chat per request vs temp-thread (ephemeral continuous session). */
+export type ChatMode = "thread" | "temp" | "temp-thread";

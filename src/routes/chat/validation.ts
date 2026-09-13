@@ -1,9 +1,3 @@
-/*
- * File: validation.ts
- * Project: QwenProxy
- * Description: Request parsing and validation for chat completions
- */
-
 import type { Context } from "hono";
 import type { OpenAIRequest, Message } from "../../utils/types.ts";
 import type { QwenFileEntry } from "../upload.ts";
@@ -23,6 +17,7 @@ import {
 } from "../../core/reasoning-effort.ts";
 
 import { TOOL_CALL_OPEN, TOOL_CALL_CLOSE } from "../../tools/toolcall-tags.ts";
+import { robustParseJSON } from "../../utils/json.ts";
 
 export interface ParsedRequest {
   body: OpenAIRequest;
@@ -75,13 +70,14 @@ export async function parseRequestBody(c: Context): Promise<ParsedRequest> {
 
   // Thinking suffixes → base model + reasoning mode
   const { baseModel, enableThinking, reasoningMode } = stripThinkingSuffix(body.model);
-  const modelId = mapClientModelToQwen(baseModel);
+  const modelId = mapClientModelToQwen(baseModel, config.qwen.mapOpenAiModels);
 
   // OpenAI `reasoning_effort` (none|minimal|low|medium|high|xhigh|max).
   // Precedence: an explicit model suffix wins — effort only acts on unsuffixed
   // models (reasoningMode "auto"). Absent/empty effort is a complete no-op.
-  // Qwen has no medium gradient, so only the low tier is meaningful: it forces
-  // Fast (thinking off). medium/high/max keep Qwen's own auto decision.
+  // - low/none/minimal  → forces Fast (thinking off)
+  // - medium            → sets Auto (Qwen decides dynamically)
+  // - high/max/xhigh    → forces Thinking (thinking on)
   // The camelCase alias is accepted too: OpenCode-style configs overlay the
   // raw `reasoningEffort` setting into the request body.
   const rawEffort = body.reasoning_effort ?? body.reasoningEffort;
@@ -228,15 +224,19 @@ async function buildPromptFromMessages(
           if (typeof args === "string") {
             try {
               parsedArgs = JSON.parse(args);
-            } catch (parseErr) {
-              // Malformed JSON: preserve raw string for model visibility
-              logger.warn("[chat] Failed to parse tool_call arguments", {
-                toolCallId: tc.id,
-                toolName: tc.function?.name,
-                error: parseErr instanceof Error ? parseErr.message : "Unknown",
-                rawArgs: args.substring(0, 200),
-              });
-              parsedArgs = { _raw: args };
+            } catch {
+              try {
+                parsedArgs = robustParseJSON(args);
+              } catch (parseErr) {
+                // Malformed JSON: preserve raw string for model visibility
+                logger.warn("[chat] Failed to parse tool_call arguments", {
+                  toolCallId: tc.id,
+                  toolName: tc.function?.name,
+                  error: parseErr instanceof Error ? parseErr.message : "Unknown",
+                  rawArgs: args.substring(0, 200),
+                });
+                parsedArgs = { _raw: args };
+              }
             }
           } else if (args && typeof args === "object") {
             parsedArgs = args;

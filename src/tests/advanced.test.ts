@@ -264,6 +264,7 @@ test("session-parent-tracking: sends only current delta using response message_i
     return new Response(stream, { status: 200 });
   });
 
+  const origSessionId = process.env.TEST_SESSION_ID;
   try {
     process.env.TEST_SESSION_ID = "test-session-parent-tracking";
     // Turn 1 - with explicit session_id to enable thread reuse
@@ -327,6 +328,11 @@ test("session-parent-tracking: sends only current delta using response message_i
       "Should send only the current user delta in thread-native mode",
     );
   } finally {
+    if (origSessionId !== undefined) {
+      process.env.TEST_SESSION_ID = origSessionId;
+    } else {
+      delete process.env.TEST_SESSION_ID;
+    }
     restore();
   }
 });
@@ -350,7 +356,7 @@ test("session-parent-tracking (stream): next turn parent is previous response_id
         );
         c.enqueue(
           new TextEncoder().encode(
-            `data: {"response_id":"${mockMessageId}","choices":[{"delta":{"phase":"answer","content":"ok"}}]}\n\n`,
+            `data: {"response_id":"${mockMessageId}","choices":[{"delta":{"phase":"answer","content":"Valid stream response content."}}]}\n\n`,
           ),
         );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
@@ -360,7 +366,9 @@ test("session-parent-tracking (stream): next turn parent is previous response_id
     return new Response(stream, { status: 200 });
   });
 
+  const origSessionId = process.env.TEST_SESSION_ID;
   try {
+    process.env.TEST_SESSION_ID = "qwen-chat-stream-parent";
     const sessionId = "test-session-parent-tracking-stream";
 
     const res1 = await app.fetch(
@@ -411,6 +419,11 @@ test("session-parent-tracking (stream): next turn parent is previous response_id
       "User: Turn 2 stream\n\n",
     );
   } finally {
+    if (origSessionId !== undefined) {
+      process.env.TEST_SESSION_ID = origSessionId;
+    } else {
+      delete process.env.TEST_SESSION_ID;
+    }
     restore();
   }
 });
@@ -429,6 +442,11 @@ test("thread-native: never includes system and tools in messages (personalizatio
         c.enqueue(
           new TextEncoder().encode(
             `data: {"response.created":{"chat_id":"qwen-chat-first-only","response_id":"${mockMessageId}"}}\n\n`,
+          ),
+        );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"${mockMessageId}","choices":[{"delta":{"phase":"answer","content":"Valid thread native response."}}]}\n\n`,
           ),
         );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
@@ -634,6 +652,11 @@ test("topic-change: same agent conversation keeps the upstream parent chain", as
             `data: {"response.created":{"chat_id":"qwen-chat-topic-reset","response_id":"${mockMessageId}"}}\n\n`,
           ),
         );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"${mockMessageId}","choices":[{"delta":{"phase":"answer","content":"Monads are monoids in the category of endofunctors."}}]}\n\n`,
+          ),
+        );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));
         c.close();
       },
@@ -779,6 +802,11 @@ test("explicit-session-id: with session_id, reuses same chat", async () => {
         c.enqueue(
           new TextEncoder().encode(
             `data: {"response.created":{"chat_id":"${chatId}","response_id":"${responseId}"}}\n\n`,
+          ),
+        );
+        c.enqueue(
+          new TextEncoder().encode(
+            `data: {"response_id":"${responseId}","choices":[{"delta":{"phase":"answer","content":"Valid explicit session response."}}]}\n\n`,
           ),
         );
         c.enqueue(new TextEncoder().encode("data: [DONE]\n\n"));

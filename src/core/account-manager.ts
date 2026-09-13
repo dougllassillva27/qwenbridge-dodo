@@ -160,6 +160,10 @@ export function isAccountHeadersReady(accountId: string): boolean {
   return headersReadyAccounts.has(accountId);
 }
 
+export function getHeadersReadyAccountIds(): string[] {
+  return Array.from(headersReadyAccounts);
+}
+
 function anyUsableAccountHeadersReady(
   accounts: QwenAccount[],
   triedSet?: Set<string>,

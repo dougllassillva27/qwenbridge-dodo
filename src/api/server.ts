@@ -343,6 +343,8 @@ app.get("/health", async (c) => {
         }
       : undefined,
     timestamp: Date.now(),
+    readyAccounts: (await import("../core/account-manager.js")).getHeadersReadyAccountIds(),
+    activeAccounts: (await import("../services/playwright.js")).getActivePlaywrightAccountIds(),
     metrics: {
       cache: await cache?.getStats(),
     },
@@ -759,6 +761,7 @@ export async function stopServer(): Promise<void> {
 
 export async function startServer(options?: {
   installSignalHandlers?: boolean;
+  showBanner?: boolean;
 }): Promise<StartedServerInfo> {
   if (server) {
     if (options?.installSignalHandlers !== false) installSignalHandlers();
@@ -995,7 +998,8 @@ export async function startServer(options?: {
 
     const endpoint = `${started.url}/v1`;
 
-    console.log(`
+    if (options?.showBanner !== false) {
+      console.log(`
 +${"-".repeat(W)}+
 |${blank()}|
 |${center("QwenProxy")}|
@@ -1011,6 +1015,7 @@ export async function startServer(options?: {
 |${blank()}|
 +${"-".repeat(W)}+
 `);
+    }
     return started;
   })();
 

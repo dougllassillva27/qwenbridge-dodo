@@ -56,11 +56,10 @@ export type PublicModel = {
 };
 
 function baseModelId(modelId: string): string {
-  // Only `-fast` is public. Strip legacy suffixes as well so a stale or
-  // mixed upstream catalog cannot create duplicate public model entries.
-  return modelId.replace(/-(?:fast|no-thinking|thinking)$/, "");
+  // Strip any reasoning suffix (-low, -medium, -high, -fast, -thinking) so the
+  // public /v1/models catalog returns strictly canonical unique base models without duplicates.
+  return modelId.replace(/-(?:low|medium|high|fast|no-thinking|thinking)$/, "");
 }
-
 /**
  * Verifica se o modelo pertence à geração 3.7 ou superior (ex: qwen3.7, qwen3.8, qwen4, etc.).
  * Modelos anteriores (3.6, 2.5, 2, 1.5, legacy não-versionados como qwen-plus/max/turbo, wan2.x) são filtrados.
@@ -91,13 +90,8 @@ export function isModel37OrAbove(modelId: string): boolean {
 
 /**
  * Expand the public reasoning variants from the selected account's live
- * catalog. The upstream list is normalized first, so this function is the
- * sole owner of synthetic variants and cannot create nested/duplicate
- * suffixes.
- *
- * Qwen's web client always has a Thinking base and a Fast mode. Publish the
- * Fast alias for every catalog model, even when older metadata does not
- * include `think_skip`.
+ * catalog. Suffixes (-fast/-thinking) and 1M variants are synthesized
+ * for high-context models.
  */
 export function expandModelVariants(
   models: PublicModel[],
