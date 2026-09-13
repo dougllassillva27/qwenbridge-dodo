@@ -166,6 +166,9 @@ const envSchema = z
 
 
     QWEN_BASE_URL: z.string().default("https://chat.qwen.ai"),
+    MODELS_FILTER: z
+      .enum(["max-1m", "all-3.7"])
+      .default("max-1m"),
     QWEN_CHAT_POOL_SIZE: z.string().default("1"),
     QWEN_CHAT_POOL_MODELS: z.string().default("qwen3.7-plus"),
     QWEN_PERSONALIZATION_FROM_REQUEST: z.string().default("true"),
@@ -372,6 +375,7 @@ export const config = {
     ),
   },
   apiKey: env.API_KEY,
+  modelsFilter: env.MODELS_FILTER as "max-1m" | "all-3.7",
   qwen: {
     baseUrl: env.QWEN_BASE_URL,
     chatPoolSize: Math.max(0, parseInt(env.QWEN_CHAT_POOL_SIZE)),

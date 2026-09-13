@@ -13,6 +13,7 @@ import {
 } from "../core/model-registry.ts";
 import { listMediaGenerationModels } from "../services/media-generation.ts";
 import { isPlaywrightInitialized } from "../services/playwright.ts";
+import { config } from "../core/config.ts";
 
 const app = new Hono();
 
@@ -46,6 +47,7 @@ function getPreferredModelsAccountId(): string | undefined {
 
 export type PublicModel = {
   id: string;
+  name?: string;
   object?: string;
   created?: number;
   owned_by?: string;
@@ -93,6 +95,13 @@ export function isModel37OrAbove(modelId: string): boolean {
  * catalog. Suffixes (-fast/-thinking) and 1M variants are synthesized
  * for high-context models.
  */
+export function isMax1mFilterActive(): boolean {
+  if (process.env.TEST_MOCK_QWEN_AUTH === "true") {
+    return process.env.MODELS_FILTER === "max-1m";
+  }
+  return (process.env.MODELS_FILTER ?? config.modelsFilter) !== "all-3.7";
+}
+
 export function expandModelVariants(
   models: PublicModel[],
   accountId?: string,
@@ -114,6 +123,53 @@ export function expandModelVariants(
         object: "model",
       });
     }
+  }
+
+  const isMax1mOnly = isMax1mFilterActive();
+
+  if (isMax1mOnly) {
+    let maxModel = baseModels.get("qwen3.8-max");
+    if (!maxModel) {
+      for (const [id, m] of baseModels.entries()) {
+        if (id.includes("3.8-max")) {
+          maxModel = m;
+          break;
+        }
+      }
+    }
+    if (!maxModel) {
+      maxModel = {
+        id: "qwen3.8-max",
+        object: "model",
+        created: 1735689600,
+        owned_by: "qwen",
+        name: "Qwen 3.8 Max",
+      };
+    }
+
+    const baseModel = { ...maxModel, id: "qwen3.8-max" };
+    const variants = new Map<string, PublicModel>();
+    variants.set(baseModel.id, baseModel);
+
+    const addVariant = (suffix: string, nameSuffix: string) => {
+      const id = `${baseModel.id}${suffix}`;
+      if (variants.has(id)) return;
+      variants.set(id, {
+        ...baseModel,
+        id,
+        name:
+          typeof baseModel.name === "string"
+            ? `${baseModel.name}${nameSuffix}`
+            : `${baseModel.id}${nameSuffix}`,
+        object: "model",
+      });
+    };
+
+    addVariant("[1M]", " [1M]");
+    addVariant("-fast[1M]", " (Fast) [1M]");
+    addVariant("-thinking[1M]", " (Thinking) [1M]");
+
+    return [...variants.values()];
   }
 
   const variants = new Map<string, PublicModel>();
@@ -196,6 +252,13 @@ export async function loadModelsWithVariants(): Promise<{
   const accountId = getPreferredModelsAccountId();
   const models = (await fetchQwenModels(accountId)) as unknown as PublicModel[];
   const expanded = expandModelVariants(models, accountId);
+
+  if (isMax1mFilterActive()) {
+    return {
+      models: expanded,
+      accountId,
+    };
+  }
 
   // Advertise media generation models so clients can discover them via
   // /v1/models, including their supported generation modalities. Annotate a
