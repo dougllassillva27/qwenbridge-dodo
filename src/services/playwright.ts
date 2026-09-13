@@ -485,12 +485,10 @@ const SESSION_PROBE_NAVIGATION_TIMEOUT_MS = 15_000;
 /** Grace period for the intercepted completion request after the send is triggered. */
 const HEADER_CAPTURE_TRIGGER_GRACE_MS = 15_000;
 /**
- * First-send grace is short: the page is cold and the bx SDK has not computed
- * its tokens yet, so a cold page almost never produces a request from the first
- * send. Fail it fast and let the retry loop reload + re-send against the warm
- * SDK instead of stalling the boot for the full 15s.
+ * First-send grace allows adequate time for Qwen Web to establish session
+ * and fire the chat completion request without premature expiration.
  */
-const FIRST_TRIGGER_GRACE_MS = 3_000;
+const FIRST_TRIGGER_GRACE_MS = 15_000;
 /**
  * Sends (the initial one plus re-triggers) header capture may spend on getting a
  * completion request that actually carries the bx headers. The in-page SDK can
@@ -1430,7 +1428,6 @@ export async function initPlaywrightForAccount(
     if (!isNaN(cx) && !isNaN(cy)) {
       launchArgs.push(`--window-position=${cx - 500},${cy - 350}`);
     }
-    launchArgs.push("--start-minimized");
 
     // [Dodo] Previne que o Chrome ignore a coordenada do launcher lendo um save-state antigo.
     const prefsPath = path.join(profilePath, "Default", "Preferences");
@@ -1693,7 +1690,6 @@ export async function validateAccountLogin(
     if (!isNaN(cx) && !isNaN(cy)) {
       launchArgs.push(`--window-position=${cx - 500},${cy - 350}`);
     }
-    launchArgs.push("--start-minimized");
 
     const prefsPath = path.join(profilePath, "Default", "Preferences");
     if (fs.existsSync(prefsPath)) {
@@ -2276,11 +2272,53 @@ export async function captureQwenHeaders(
       const deadline = Date.now() + timeoutMs;
       const remainingBudgetMs = () => deadline - Date.now();
 
+      const onAnyApiRequest = (req: any) => {
+        if (settled || headersCaptured) return;
+        try {
+          const url = req.url();
+          if (!url.includes("/api/")) return;
+          const reqHeaders = req.headers();
+          if (!reqHeaders["bx-ua"] || !reqHeaders["bx-umidtoken"]) return;
+
+          const capturedHeaders: Record<string, string> = {
+            cookie: reqHeaders["cookie"] || "",
+            "bx-ua": reqHeaders["bx-ua"] || "",
+            "bx-umidtoken": reqHeaders["bx-umidtoken"] || "",
+            "bx-v": reqHeaders["bx-v"] || "2.5.37",
+            "user-agent": reqHeaders["user-agent"] || "",
+            "x-request-id": reqHeaders["x-request-id"] || "",
+            "version": reqHeaders["version"] || "",
+            "sec-ch-ua": reqHeaders["sec-ch-ua"] || "",
+            "sec-ch-ua-mobile": reqHeaders["sec-ch-ua-mobile"] || "?0",
+            "sec-ch-ua-platform": reqHeaders["sec-ch-ua-platform"] || "",
+          };
+
+          if (hasRequiredQwenHeaders(capturedHeaders)) {
+            headersCaptured = true;
+            if (timeout) clearTimeout(timeout);
+            cache.headers = capturedHeaders;
+            if (capturedHeaders["version"]) {
+              updateQwenWebVersion(capturedHeaders["version"]);
+            }
+            markAccountHeadersReady(accountId);
+            cache.lastRefresh = Date.now();
+            cookieCaches.delete(accountId);
+            touchAccountActivity(accountId);
+            console.log(
+              `✨ [Playwright] Passive header capture succeeded from ${url.split("?")[0]} for ${accountId}`,
+            );
+            void cleanupRoute();
+            settle();
+          }
+        } catch {}
+      };
+
       cleanupRoute = async () => {
         if (!routeRegistered) return;
         routeRegistered = false;
         if (!page.isClosed()) {
           try {
+            page.off?.("request", onAnyApiRequest);
             await page.unroute("**/api/v2/chat/completions*", routeHandler);
           } catch {}
         }
@@ -2577,6 +2615,7 @@ export async function captureQwenHeaders(
       if (settled || page.isClosed()) return;
 
       const sendSelectors = [
+        ".chat-prompt-send-button button",
         ".message-input-right-button-send .send-button",
         ".chat-prompt-send-button",
         "button.send-button",
@@ -2588,16 +2627,7 @@ export async function captureQwenHeaders(
         try {
           const btn = await page.$(selector);
           if (btn && (await btn.isVisible())) {
-            await page.evaluate((sel) => {
-              const element = document.querySelector(sel) as HTMLElement;
-              if (element) {
-                element.focus();
-                element.click();
-              }
-            }, selector);
-            if (!settled && !page.isClosed()) {
-              await btn.click({ force: true, delay: 50 }).catch(() => {});
-            }
+            await btn.click({ force: true }).catch(() => {});
             clicked = true;
             break;
           }
@@ -2684,10 +2714,12 @@ export async function captureQwenHeaders(
 
     armOverallDeadline();
 
+    page.on?.("request", onAnyApiRequest);
+    routeRegistered = true;
+
     void page
       .route("**/api/v2/chat/completions*", routeHandler)
       .then(async () => {
-        routeRegistered = true;
         if (settled) {
           cleanupRoute();
           return;
@@ -3436,11 +3468,20 @@ async function closePlaywrightContextBestEffort(
       ),
     );
 
-    await withTimeout(
-      context.close(),
-      config.playwright.contextCloseTimeoutMs,
-      `Timed out closing Playwright context for ${accountId}`,
-    );
+    const browserProcess = getBrowserProcess(context);
+    try {
+      await withTimeout(
+        context.close(),
+        config.playwright.contextCloseTimeoutMs,
+        `Timed out closing Playwright context for ${accountId}`,
+      );
+    } finally {
+      if (browserProcess && !browserProcess.killed) {
+        try {
+          browserProcess.kill("SIGKILL");
+        } catch {}
+      }
+    }
   } catch (error) {
     if (!isPlaywrightAlreadyClosedError(error)) {
       console.warn(
@@ -3712,10 +3753,6 @@ export async function alignWindowPosition(
     await cdp.send("Browser.setWindowBounds", {
       windowId,
       bounds: { left, top, width, height, windowState: "normal" },
-    });
-    await cdp.send("Browser.setWindowBounds", {
-      windowId,
-      bounds: { windowState: "minimized" },
     });
     await cdp.detach();
   } catch {}
