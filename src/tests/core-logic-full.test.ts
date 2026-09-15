@@ -36,6 +36,7 @@ process.chdir(tmpDir);
 const { encrypt, decrypt, isEncrypted } = await import(
   "../core/crypto-utils.ts"
 );
+const { getEncryptionKeyPath } = await import("../core/paths.ts");
 const {
   getPromptLimitStats,
   assertPromptWithinLimits,
@@ -125,7 +126,7 @@ test("memory-usage: getHeapUsageSnapshot falls back when limit is invalid", () =
 /* ------------------------------------------------------------------ */
 
 test("crypto-utils: first encrypt creates the key file, roundtrip decrypts", () => {
-  const keyFile = path.join(tmpDir, "data", "db", ".encryption_key");
+  const keyFile = getEncryptionKeyPath();
   assert.strictEqual(fs.existsSync(keyFile), false);
 
   const ciphertext = encrypt("hello world");

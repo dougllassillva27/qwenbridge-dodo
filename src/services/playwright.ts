@@ -227,7 +227,11 @@ async function recoverStuckAccountMutex(
   // A normal request can recover the browser on the next attempt. Avoid
   // recursively scheduling another reset when the reset/close path itself was
   // the operation that timed out.
-  if (!key.startsWith("profile-reset:") && !key.startsWith("close:")) {
+  if (
+    !key.startsWith("profile-reset:") &&
+    !key.startsWith("close:") &&
+    !key.startsWith("init:")
+  ) {
     schedulePlaywrightProfileReset(accountId);
   }
 }
@@ -260,7 +264,7 @@ async function acquireAccountMutex(
 const accountContexts = new Map<string, BrowserContext>();
 const accountPages = new Map<string, Page>();
 const cachedUserAgents = new Map<string, string>();
-
+const inFlightAccountInits = new Map<string, Promise<void>>();
 let sharedBrowser: Browser | null = null;
 let sharedBrowserPromise: Promise<Browser> | null = null;
 
@@ -1388,6 +1392,7 @@ export async function initPlaywrightForAccount(
   rawAccount: QwenAccount,
   headless = true,
   browserType: BrowserType = "chromium",
+  options: { skipHeaderCapture?: boolean } = {},
 ): Promise<void> {
   const account = await resolveAccountCredentials(rawAccount);
   if (accountPages.has(account.id)) {
@@ -1396,12 +1401,19 @@ export async function initPlaywrightForAccount(
     );
     return;
   }
+  const existingInit = inFlightAccountInits.get(account.id);
+  if (existingInit) {
+    await existingInit;
+    return;
+  }
 
-  const release = await acquireAccountMutex(
-    account.id,
-    `init:${account.id.substring(0, 12)}`,
-  );
-  try {
+  const initPromise = (async () => {
+    const release = await acquireAccountMutex(
+      account.id,
+      `init:${account.id.substring(0, 12)}`,
+      Math.max(PLAYWRIGHT_MUTEX_WAIT_MS, 120_000),
+    );
+    try {
     // Double-check after acquiring lock
     if (accountPages.has(account.id)) {
       return;
@@ -1473,11 +1485,19 @@ export async function initPlaywrightForAccount(
 
     let acctContext: BrowserContext;
     try {
-      acctContext = await engine.launchPersistentContext(profilePath, launchOptions);
+      acctContext = await withTimeout(
+        engine.launchPersistentContext(profilePath, launchOptions),
+        30_000,
+        `O navegador não iniciou em 30s para a conta ${maskEmail(account.email)}. Se o QwenProxy estiver rodando em outro terminal, feche-o antes de executar este comando.`,
+      );
     } catch (launchErr: any) {
       if (launchErr?.message?.includes("Executable doesn't exist")) {
         autoInstallPlaywrightChromium();
-        acctContext = await engine.launchPersistentContext(profilePath, launchOptions);
+        acctContext = await withTimeout(
+          engine.launchPersistentContext(profilePath, launchOptions),
+          30_000,
+          `O navegador não iniciou em 30s para a conta ${maskEmail(account.email)}.`,
+        );
       } else {
         throw launchErr;
       }
@@ -1610,15 +1630,16 @@ export async function initPlaywrightForAccount(
         );
         throw validationError;
       }
-
-      // Capture headers by navigating and intercepting
-      console.log(`📡 [Playwright] Intercepting anti-bot headers for ${maskEmail(account.email)}...`);
-      await captureQwenHeaders(account.id);
-      console.log(`🪟 [Playwright] Minimizing window for ${maskEmail(account.email)}...`);
-      if (!effectiveHeadless && !isNaN(cx) && !isNaN(cy)) {
-        await alignWindowPosition(acctPage, cx - 500, cy - 350, 600, 400).catch(() => {});
-      } else {
-        await minimizeWindow(acctPage).catch(() => {});
+      if (!options.skipHeaderCapture) {
+        // Capture headers by navigating and intercepting
+        console.log(`📡 [Playwright] Intercepting anti-bot headers for ${maskEmail(account.email)}...`);
+        await captureQwenHeaders(account.id);
+        console.log(`🪟 [Playwright] Minimizing window for ${maskEmail(account.email)}...`);
+        if (!effectiveHeadless && !isNaN(cx) && !isNaN(cy)) {
+          await alignWindowPosition(acctPage, cx - 500, cy - 350, 600, 400).catch(() => {});
+        } else {
+          await minimizeWindow(acctPage).catch(() => {});
+        }
       }
 
       // Header capture may leave the UI on a generated chat page. Return the
@@ -1643,8 +1664,16 @@ export async function initPlaywrightForAccount(
       cleanupPlaywrightAccountState(account.id);
       throw error;
     }
+    } finally {
+      release();
+    }
+  })();
+
+  inFlightAccountInits.set(account.id, initPromise);
+  try {
+    await initPromise;
   } finally {
-    release();
+    inFlightAccountInits.delete(account.id);
   }
 }
 
@@ -1727,11 +1756,19 @@ export async function validateAccountLogin(
 
     let acctContext: BrowserContext;
     try {
-      acctContext = await engine.launchPersistentContext(profilePath, launchOptions);
+      acctContext = await withTimeout(
+        engine.launchPersistentContext(profilePath, launchOptions),
+        30_000,
+        `O navegador não iniciou em 30s para a conta ${maskEmail(account.email)}. Se o QwenProxy estiver rodando em outro terminal, feche-o antes de executar este comando.`,
+      );
     } catch (launchErr: any) {
       if (launchErr?.message?.includes("Executable doesn't exist")) {
         autoInstallPlaywrightChromium();
-        acctContext = await engine.launchPersistentContext(profilePath, launchOptions);
+        acctContext = await withTimeout(
+          engine.launchPersistentContext(profilePath, launchOptions),
+          30_000,
+          `O navegador não iniciou em 30s para a conta ${maskEmail(account.email)}.`,
+        );
       } else {
         throw launchErr;
       }

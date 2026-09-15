@@ -695,4 +695,26 @@ test("solveBaxiaCaptcha tries native code twice first and falls back to captchaR
   }
 });
 
+test("recoverBaxiaCaptcha does not kill browser context when page operation times out", async () => {
+  const { recoverBaxiaCaptcha } = await import("../services/captcha-coordinator.ts");
+  const { registerPlaywrightAccountForTests, unregisterPlaywrightAccountForTests } =
+    await import("../services/playwright.ts");
 
+  const accountId = "test-captcha-timeout";
+  unregisterPlaywrightAccountForTests(accountId);
+
+  const mockPage = {
+    isClosed: () => false,
+    url: () => "https://chat.qwen.ai/",
+  };
+
+  registerPlaywrightAccountForTests(accountId, mockPage as any, Date.now());
+  try {
+    const solved = await recoverBaxiaCaptcha(accountId, "test-label", {
+      challengeBody: "<html>challenge</html>",
+    });
+    assert.strictEqual(solved, false);
+  } finally {
+    unregisterPlaywrightAccountForTests(accountId);
+  }
+});
