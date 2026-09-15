@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { robustParseJSON } from "../utils/json.ts";
+import { robustParseJSON, computeMissingJsonClosingTokens } from "../utils/json.ts";
 import { logger, isToolcallDebugEnabled } from "../core/logger.js";
 import type { ParsedToolCall } from "./types";
 import type { FunctionToolDefinition } from "./types";
@@ -302,6 +302,14 @@ function advanceMarkdownCodeState(
   let delimiterLength = initialDelimiterLength;
 
   for (let i = 0; i < text.length;) {
+    // Inline code spans (1 or 2 backticks) cannot cross line breaks per CommonMark §6.1.
+    // Only fenced code blocks (3+ backticks) span multiple lines.
+    if (text[i] === "\n" && delimiterLength < 3) {
+      delimiterLength = 0;
+      i++;
+      continue;
+    }
+
     if (text[i] !== "`") {
       i++;
       continue;
@@ -320,7 +328,6 @@ function advanceMarkdownCodeState(
 
     i += runLength;
   }
-
   return delimiterLength;
 }
 
@@ -331,6 +338,13 @@ function findNextToolOpenTagOutsideMarkdownCode(
   let delimiterLength = initialDelimiterLength;
 
   for (let i = 0; i < buffer.length;) {
+    // Inline code spans (1 or 2 backticks) cannot cross line breaks per CommonMark §6.1.
+    if (buffer[i] === "\n" && delimiterLength < 3) {
+      delimiterLength = 0;
+      i++;
+      continue;
+    }
+
     if (buffer[i] === "`") {
       let runLength = 1;
       while (i + runLength < buffer.length && buffer[i + runLength] === "`") {
@@ -346,7 +360,6 @@ function findNextToolOpenTagOutsideMarkdownCode(
       i += runLength;
       continue;
     }
-
     if (delimiterLength === 0 && buffer[i] === "<") {
       const sub = buffer.substring(i);
       for (const name of getOpenNames()) {
@@ -371,6 +384,13 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
   const openNames = getOpenNames();
 
   for (let i = 0; i < buffer.length;) {
+    // Inline code spans (1 or 2 backticks) cannot cross line breaks per CommonMark §6.1.
+    if (buffer[i] === "\n" && delimiterLength < 3) {
+      delimiterLength = 0;
+      i++;
+      continue;
+    }
+
     if (buffer[i] === "`") {
       let runLength = 1;
       while (i + runLength < buffer.length && buffer[i + runLength] === "`") {
@@ -386,7 +406,6 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
       i += runLength;
       continue;
     }
-
     if (delimiterLength === 0 && buffer[i] === "<") {
       const tailLower = buffer.substring(i).toLowerCase();
       if (!tailLower.includes(">")) {
@@ -1051,6 +1070,27 @@ function isJsonPayloadTruncated(content: string): boolean {
     if (!scanJsonStructureIncomplete(candidate)) return false;
   }
   return true;
+}
+
+function getTruncationNoticeForTool(toolName: string): string {
+  const name = toolName.toLowerCase();
+  if (
+    name.includes("bash") ||
+    name.includes("sh") ||
+    name.includes("command") ||
+    name.includes("exec")
+  ) {
+    return "\n\n# [ERROR: Command was truncated by model output token limit]\necho '[ERROR: Command truncated by model output token limit]' >&2 && exit 1";
+  }
+  if (
+    name.includes("write") ||
+    name.includes("edit") ||
+    name.includes("patch") ||
+    name.includes("file")
+  ) {
+    return "\n\n/* [TRUNCATED BY UPSTREAM MODEL OUTPUT LIMIT: Incomplete content, do not treat as complete] */";
+  }
+  return "\n\n[TRUNCATED BY UPSTREAM MODEL OUTPUT LIMIT: This message was cut off mid-generation by the model output limit.]";
 }
 
 /**
@@ -1929,11 +1969,25 @@ export class StreamingToolParser {
         // buffer reaches flush and tryRecoverToolCall would otherwise skip the
         // narrow typo repairs that processToolContent runs.
         const repairedTrimmed = repairCommonMalformedToolJson(trimmed);
-        const recovered =
+        let recovered =
           this.tryRecoverToolCall(repairedTrimmed) ||
           this.tryRecoverToolCall(trimmed) ||
           this.tryRecoverIncrementalToolCall(trimmed) ||
           this.lastChanceRecoverToolCall(trimmed);
+
+        // If standard recovery failed on a truncated tool call, but we CANNOT
+        // auto-retry because prior tool calls were already emitted to the client
+        // in this turn (allToolsFailed would be false), heal the truncated JSON
+        // instead of dropping it and causing a client-side JSON SyntaxError.
+        if (!recovered && this.emittedToolCallCount > 0) {
+          recovered = this.tryHealTruncatedToolCall(trimmed);
+          if (recovered && isToolcallDebugEnabled()) {
+            logger.debug("[parser] flush: healed truncated tool call", {
+              name: recovered.name,
+              emittedSoFar: this.emittedToolCallCount,
+            });
+          }
+        }
         if (recovered) {
           if (isToolcallDebugEnabled()) {
             logger.debug("[parser] flush: recovery successful", {
@@ -2645,6 +2699,58 @@ export class StreamingToolParser {
 
     return null;
   }
+
+  /**
+   * Last-resort healing for truncated tool calls when auto-retry cannot fire
+   * (e.g. prior calls already emitted to the client, or incremental chunks
+   * already streamed). Uses robustParseJSON to close open strings/braces and
+   * emits the missing closing tokens as a delta so the client doesn't get
+   * a SyntaxError: Unexpected end of JSON input.
+   *
+   * Injects an explicit contextual truncation warning into the payload so the
+   * agent/AI is aware that the content or command was cut off by token limits,
+   * preventing dangerous half-command execution or silent file corruption.
+   */
+  private tryHealTruncatedToolCall(block: string): ParsedToolCall | null {
+    try {
+      const parsed = robustParseJSON(block);
+      if (parsed && typeof parsed === "object") {
+        const tc = this.parseToolCall(parsed);
+        if (tc && this.isDeclaredToolName(tc.name)) {
+          const notice = getTruncationNoticeForTool(tc.name);
+          const incremental = this.activeIncrementalToolCall;
+          if (
+            incremental &&
+            incremental.name === tc.name &&
+            incremental.startEmitted
+          ) {
+            const rawArgs =
+              incremental.argumentsValueStart !== null
+                ? this.buffer.substring(incremental.argumentsValueStart)
+                : "";
+            const closingTokens = computeMissingJsonClosingTokens(rawArgs, notice);
+            if (closingTokens) {
+              this.pendingToolCallDeltas.push({
+                index: incremental.index,
+                function: {
+                  arguments: closingTokens,
+                },
+              });
+              incremental.emittedArgumentsLength += closingTokens.length;
+            }
+          }
+          if (typeof tc.arguments === "object" && tc.arguments !== null) {
+            (tc.arguments as Record<string, unknown>)._truncated = true;
+            (tc.arguments as Record<string, unknown>)._truncation_warning =
+              notice.trim();
+          }
+          return tc;
+        }
+      }
+    } catch {}
+    return null;
+  }
+
 
   private parseToolContent(str: string): ParsedToolCall[] {
     const calls: ParsedToolCall[] = [];
