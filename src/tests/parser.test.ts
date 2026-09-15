@@ -1269,3 +1269,47 @@ test("StreamingToolParser: bash truncation injects exit 1 guard to prevent dange
     "truncated bash command must append exit 1 so shell fails safely instead of running incomplete command",
   );
 });
+
+test("StreamingToolParser: does not leak literal <qpx_call> block when tool name is undeclared", () => {
+  const parser = new StreamingToolParser(TOOLS);
+
+  const undeclaredBlock =
+    '<qpx_call>\n{"name": "mcp__engram__save_memory", "arguments": {"title": "Test Title", "content": "Sample content"}}\n</qpx_call>';
+
+  const result = parser.feed(undeclaredBlock);
+  const flushed = parser.flush();
+  const totalText = result.text + flushed.text;
+
+  // Raw <qpx_call> tags and content must never leak to client text
+  assert.ok(!totalText.includes("<qpx_call>"), "raw <qpx_call> must never leak in client text");
+  assert.ok(!totalText.includes("mcp__engram__save_memory"), "undeclared tool payload must not leak in text");
+  assert.strictEqual(result.toolCalls.length, 0);
+
+  // Must be registered as malformed/undeclared for proxy auto-retry
+  const malformed = parser.getMalformedToolCalls();
+  assert.strictEqual(malformed.length, 1);
+  assert.strictEqual(malformed[0].category, "undeclared");
+  assert.deepStrictEqual(malformed[0].undeclaredNames, ["mcp__engram__save_memory"]);
+});
+
+test("StreamingToolParser: does not leak undeclared tool call block in streaming mode (incrementalToolCalls: true)", () => {
+  const parser = new StreamingToolParser(TOOLS, { incrementalToolCalls: true });
+
+  const undeclaredBlock =
+    '<tool_call>\n{"name": "unknown_tool", "arguments": {"foo": "bar"}}\n</tool_call>';
+
+  const result = parser.feed(undeclaredBlock);
+  const flushed = parser.flush();
+  const totalText = result.text + flushed.text;
+
+  // In streaming mode, undeclared tool call must not leak as text before retry
+  assert.ok(!totalText.includes("<tool_call>"), "tool_call must not leak as text in streaming mode");
+  assert.ok(!totalText.includes("unknown_tool"), "unknown_tool payload must not leak in streaming mode");
+  assert.strictEqual(result.toolCalls.length, 0);
+
+  const malformed = parser.getMalformedToolCalls();
+  assert.strictEqual(malformed.length, 1);
+  assert.strictEqual(malformed[0].category, "undeclared");
+  assert.deepStrictEqual(malformed[0].undeclaredNames, ["unknown_tool"]);
+});
+

@@ -14,6 +14,7 @@ import {
   closeTagFor,
   sanitizeStrayCloses,
   stripTrailingStrayCloses,
+  isInternalToolTag,
 } from "./toolcall-tags.ts";
 
 export interface ToolCallDelta {
@@ -2287,6 +2288,33 @@ export class StreamingToolParser {
     reason: string,
     closed = true,
   ): void {
+    // If the opening tag is an internal/private tool tag (e.g. <qpx_call>)
+    // or if we are streaming with incremental deltas, NEVER emit private tool tags or
+    // malformed/undeclared blocks into result.text, as this leaks raw XML into the client
+    // before the auto-retry can heal it.
+    if (isInternalToolTag(this.currentOpenTag) || this.incrementalToolCalls) {
+      if (isToolcallDebugEnabled()) {
+        logger.debug(
+          "[parser] suppressing literal tool_call leakage (internal tag or streaming mode)",
+          {
+            reason,
+            openTag: this.currentOpenTag,
+            contentPreview: content.trim().substring(0, 300),
+            closed,
+            incrementalToolCalls: this.incrementalToolCalls,
+          },
+        );
+      }
+      if (
+        this.emittedToolCallCount === 0 &&
+        this.pendingLeadIn.trim().length > 0
+      ) {
+        result.text += this.pendingLeadIn;
+      }
+      this.pendingLeadIn = "";
+      return;
+    }
+
     const literalBlock = `${this.currentOpenTag}${content}${closed ? this.currentCloseTag : ""}`;
     if (isToolcallDebugEnabled()) {
       logger.debug("[parser] preserving literal tool_call block as text", {

@@ -140,3 +140,21 @@ export function stripTrailingStrayCloses(s: string): string {
 export function sanitizeStrayCloses(s: string): string {
   return stripTrailingStrayCloses(stripLeadingStrayCloses(s));
 }
+
+/**
+ * True when a tag name or tag literal is an internal bridge marker (such as
+ * `<qpx_call>`, `<qpx_calls>`, or the configured TOOL_CALL_OPEN) rather than a
+ * standard user/public tag like `<tool_call>`. Internal markers must never leak
+ * to the client as literal text.
+ */
+export function isInternalToolTag(tag: string): boolean {
+  if (!tag) return false;
+  const lower = tag.toLowerCase();
+  const configured = tagName(TOOL_CALL_OPEN).toLowerCase();
+  return (
+    lower.includes("qpx_call") ||
+    lower.includes("qpx_calls") ||
+    lower.includes(configured)
+  );
+}
+
