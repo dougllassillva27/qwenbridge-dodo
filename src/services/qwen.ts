@@ -53,6 +53,8 @@ export {
   updateSessionParent,
   invalidateLogicalThreadParent,
   clearAllSessionsForAccount,
+  removeSessionByChatId,
+  isChatSessionActive,
   getSessionParent,
 } from "./qwen-thread-state.ts";
 export type { LogicalThreadEntry } from "./qwen-thread-state.ts";
@@ -74,6 +76,8 @@ import {
 } from "./qwen-errors.ts";
 import {
   clearAllSessionsForAccount,
+  removeSessionByChatId,
+  isChatSessionActive,
   getSessionParent,
   updateSessionParent,
 } from "./qwen-thread-state.ts";
@@ -261,7 +265,10 @@ export function computeDynamicIdleTimeout(opts: {
 }): number {
   const payloadMB = opts.payloadSize / (1024 * 1024);
   const dynamic = opts.baseTimeoutMs + Math.ceil(payloadMB * 30_000);
-  if (opts.parallelEscape && !opts.enableThinking) {
+  // The tight 15s cap is ONLY for small auxiliary requests (e.g. title generation).
+  // Larger parallel requests (such as Zed/OMP context compaction with big history)
+  // need the full dynamic timeout so they do not time out at 15s.
+  if (opts.parallelEscape && !opts.enableThinking && opts.payloadSize < 16_384) {
     return Math.min(15_000, dynamic);
   }
   return dynamic;
@@ -857,25 +864,33 @@ export async function requestQwenTextInBrowser(
 
   const evaluateRequest = (page: Page) =>
     page.evaluate(
-      async ({ url, method, headers, body, referrer }: {
+      async ({ url, method, headers, body, referrer, timeoutMs }: {
         url: string;
         method: "GET" | "POST" | "DELETE";
         headers: Record<string, string>;
         body?: string;
         referrer?: string;
+        timeoutMs: number;
       }): Promise<BrowserTextResponse> => {
-        const response = await fetch(url, {
-          method,
-          credentials: "include",
-          headers,
-          body,
-          ...(referrer ? { referrer } : {}),
-        });
-        return {
-          status: response.status,
-          contentType: response.headers.get("content-type") || "",
-          raw: await response.text(),
-        };
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          const response = await fetch(url, {
+            method,
+            credentials: "include",
+            headers,
+            body,
+            signal: controller.signal,
+            ...(referrer ? { referrer } : {}),
+          });
+          return {
+            status: response.status,
+            contentType: response.headers.get("content-type") || "",
+            raw: await response.text(),
+          };
+        } finally {
+          clearTimeout(timeoutId);
+        }
       },
       {
         url,
@@ -883,6 +898,7 @@ export async function requestQwenTextInBrowser(
         headers: browserHeaders,
         body,
         referrer: options.referrer,
+        timeoutMs: options.timeoutMs ?? Math.min(config.timeouts.page, 20_000),
       },
     );
   const recoverOnTimeout = !options.noMutexRecovery;
@@ -1963,6 +1979,112 @@ export async function deleteAllQwenChats(accountId?: string): Promise<boolean> {
 
   clearAllSessionsForAccount(accountId || "global");
   return true;
+}
+
+export interface RemoteQwenChat {
+  id: string;
+  title: string;
+  updated_at: number | string;
+  created_at: number | string;
+}
+
+/**
+ * Deletes a single chat session by ID on Qwen Web.
+ */
+export async function deleteSingleQwenChat(
+  accountId: string | undefined,
+  chatId: string,
+): Promise<boolean> {
+  if (!chatId) return false;
+
+  if (isAuthMockEnabled()) {
+    const url = qwenUrl(`/api/v2/chats/${encodeURIComponent(chatId)}`);
+    const response = await fetch(url, {
+      method: "DELETE",
+    });
+    removeSessionByChatId(chatId);
+    return response.ok;
+  }
+
+  const requestHeaders: Record<string, string> = {
+    source: "web",
+    version: "0.2.89",
+    timezone: new Date().toString().split(" (")[0],
+    "x-request-id": crypto.randomUUID(),
+    Referer: qwenUrl(`/c/${encodeURIComponent(chatId)}`),
+  };
+
+  try {
+    const response = await requestQwenTextInBrowser(
+      accountId,
+      "DELETE",
+      `/api/v2/chats/${encodeURIComponent(chatId)}`,
+      requestHeaders,
+      undefined,
+      { referrer: qwenUrl(`/c/${encodeURIComponent(chatId)}`), noMutexRecovery: true },
+    );
+
+    const { json: parsed } = await readJsonTextResponse(response, {
+      strict: false,
+    });
+
+    const success = response.ok && parsed?.success === true && parsed?.data?.status === true;
+    if (success) {
+      removeSessionByChatId(chatId);
+    }
+    return success;
+  } catch (error) {
+    logger.debug("[Qwen] deleteSingleQwenChat failed", {
+      accountId,
+      chatId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+/**
+ * Fetch remote chat list from Qwen Web.
+ */
+export async function fetchRemoteQwenChats(
+  accountId?: string,
+): Promise<RemoteQwenChat[]> {
+  if (isAuthMockEnabled()) {
+    try {
+      const response = await fetch(qwenUrl("/api/v2/chats/?page=1&exclude_project=true"));
+      const json: any = await response.json().catch(() => null);
+      if (json?.success && Array.isArray(json.data)) {
+        return json.data;
+      }
+    } catch {}
+    return [];
+  }
+
+  const requestHeaders: Record<string, string> = {
+    version: "0.2.89",
+    timezone: new Date().toString().split(" (")[0],
+    "x-request-id": crypto.randomUUID(),
+    Referer: qwenUrl("/settings/chats"),
+  };
+
+  try {
+    const response = await requestQwenTextInBrowser(
+      accountId,
+      "GET",
+      "/api/v2/chats/?page=1&exclude_project=true",
+      requestHeaders,
+      undefined,
+      { referrer: qwenUrl("/settings/chats"), noMutexRecovery: true },
+    );
+    if (!response.ok) return [];
+    const json: any = await response.json().catch(() => null);
+    if (json?.success && Array.isArray(json.data)) {
+      return json.data;
+    }
+    return [];
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchQwenModels(
