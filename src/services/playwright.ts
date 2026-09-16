@@ -135,10 +135,27 @@ function resolveBrowserEngine(browserType: BrowserType): BrowserEngineConfig {
  * Chromium launch args tuned for multi-account proxy use.
  * Low-memory flags cap V8 old-space in renderer processes (fork-safe RAM fix).
  */
+/**
+ * Detect whether we are running inside a Docker container.
+ * When true, GPU acceleration flags are replaced with --disable-gpu to avoid
+ * SwiftShader software rendering overhead (the stealth layer already spoofs
+ * WebGL via JS injection, so real GPU is unnecessary in containers).
+ */
+function isContainerEnvironment(): boolean {
+  if (process.env.CONTAINER === "true") return true;
+  try {
+    return fs.existsSync("/.dockerenv");
+  } catch {
+    return false;
+  }
+}
+
 export function buildChromiumLaunchArgs(viewport: {
   width: number;
   height: number;
 }): string[] {
+  const inContainer = isContainerEnvironment();
+
   const args = [
     "--disable-blink-features=AutomationControlled",
     "--disable-features=IsolateOrigins,site-per-process,TranslateUI,Translate,OptimizationHints,MediaRouter",
@@ -147,9 +164,9 @@ export function buildChromiumLaunchArgs(viewport: {
     "--no-default-browser-check",
     "--no-sandbox",
     "--disable-dev-shm-usage",
-    "--enable-webgl",
-    "--ignore-gpu-blocklist",
-    "--enable-accelerated-2d-canvas",
+    ...(inContainer
+      ? ["--disable-gpu", "--disable-software-rasterizer"]
+      : ["--enable-webgl", "--ignore-gpu-blocklist", "--enable-accelerated-2d-canvas"]),
     `--window-size=${viewport.width},${viewport.height}`,
     "--disable-extensions",
     "--disable-background-networking",
@@ -547,7 +564,6 @@ function withTimeout<T>(
     }),
     new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-      timer.unref?.();
     }),
   ]);
 }

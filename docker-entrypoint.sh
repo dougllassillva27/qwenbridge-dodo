@@ -32,7 +32,7 @@ find /app/data/qwen_profiles -name "Singleton*" -delete 2>/dev/null || true
 # This provides a real 1920x1080 visual rendering surface so Chromium runs in headed mode,
 # completely bypassing Alibaba headless anti-bot detection while remaining invisible.
 export DISPLAY=:99
-Xvfb :99 -screen 0 1920x1080x24 -nolisten tcp -ac +extension GLX +render -noreset >/dev/null 2>&1 &
+Xvfb :99 -screen 0 1280x800x24 -nolisten tcp -ac +extension GLX +render -noreset >/dev/null 2>&1 &
 XVFB_PID=$!
 sleep 1
 

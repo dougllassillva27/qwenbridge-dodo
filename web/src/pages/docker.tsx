@@ -13,7 +13,7 @@ import {
   Terminal,
 } from 'lucide-react'
 import { toast } from 'sonner'
-import { api, fmtBytes } from '@/lib/api'
+import { dockerApi, fmtBytes } from '@/lib/api'
 import type { DockerContainer, DockerSystemStats } from '@/lib/api'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -199,7 +199,7 @@ export function DockerPage() {
     const labels: Record<string, string> = { up: 'Iniciando', rebuild: 'Reconstruindo', restart: 'Reiniciando', down: 'Parando' }
     setComposeLoading(action)
     try {
-      const res = await api.dockerCompose(action)
+      const res = await dockerApi.compose(action)
       if (res.ok) {
         toast.success(`${labels[action]}: todos os containers`)
         await refresh()
@@ -217,8 +217,8 @@ export function DockerPage() {
   const refresh = useCallback(async () => {
     try {
       const [cRes, sRes] = await Promise.all([
-        api.dockerContainers(),
-        api.dockerSystem(),
+        dockerApi.containers(),
+        dockerApi.system(),
       ])
       setContainers(cRes.containers ?? [])
       setSys(sRes)
@@ -243,7 +243,7 @@ export function DockerPage() {
   ) => {
     setActionLoading((p) => ({ ...p, [id]: true }))
     try {
-      await api.dockerAction(id, action)
+      await dockerApi.action(id, action)
       toast.success(
         `${action === 'start' ? 'Iniciado' : action === 'stop' ? 'Parado' : action === 'rebuild' ? 'Reconstruído' : 'Reiniciado'}: ${name}`,
       )
@@ -262,7 +262,7 @@ export function DockerPage() {
     setLogsOpen(true)
     setLogsLoading(true)
     try {
-      const res = await api.dockerLogs(id)
+      const res = await dockerApi.logs(id)
       setLogs(res.logs ?? '')
     } catch (err: any) {
       toast.error(`Erro ao buscar logs: ${err?.message ?? err}`)

@@ -25,6 +25,7 @@ RUN npx patchright install --with-deps chromium \
 COPY docker-entrypoint.sh ./
 COPY bin ./bin
 COPY src ./src
+COPY web/dist ./web/dist
 
 # Prepare persistent directories with proper non-root permissions
 RUN mkdir -p /app/data/db /app/data/qwen_profiles /tmp/playwright \

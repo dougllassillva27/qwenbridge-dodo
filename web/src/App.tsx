@@ -3,7 +3,7 @@ import { Routes, Route, Navigate, useLocation, useNavigate } from 'react-router-
 import {
   Activity, KeyRound, Layers, LogOut, Server, Settings, TerminalSquare,
   ScrollText, Database, Box, Terminal, TrendingUp, Waves, Globe,
-  Sun, Moon, Menu, Search, RefreshCw, Snowflake, Download
+  Sun, Moon, Menu, Search, RefreshCw, Snowflake, Download, Bot
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
@@ -28,6 +28,7 @@ import { PlaygroundPage } from '@/pages/playground'
 import { UsagePage } from '@/pages/usage'
 import { StreamsPage } from '@/pages/streams'
 import { PagesList } from '@/pages/pages'
+import { DockerPage } from '@/pages/docker'
 
 const NAV = [
   { path: '/overview', label: 'Visão geral', icon: Activity },
@@ -42,6 +43,8 @@ const NAV = [
   { path: '/models', label: 'Modelos', icon: Box },
   { path: '/playground', label: 'Playground', icon: Terminal },
   { path: '/usage', label: 'Uso', icon: TrendingUp },
+  { path: '/docker', label: 'Docker', icon: Server },
+  { path: '__hermes__', label: 'Hermes', icon: Bot, external: true },
 ]
 
 const ACTIONS = [
@@ -181,7 +184,26 @@ export function App() {
         <nav className="flex flex-1 flex-col gap-1 p-2">
           {NAV.map((item) => {
             const Icon = item.icon
-            const active = location.pathname === item.path || (item.path === '/overview' && location.pathname === '/')
+            const isExternal = (item as any).external
+            const active = !isExternal && (location.pathname === item.path || (item.path === '/overview' && location.pathname === '/'))
+            if (isExternal) {
+              return (
+                <a
+                  key={item.path}
+                  href="http://10.10.0.1:8787"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={cn(
+                    'flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors hover:bg-accent hover:text-accent-foreground text-muted-foreground',
+                    collapsed && 'justify-center px-2'
+                  )}
+                  title={collapsed ? item.label : 'Abre via WireGuard'}
+                >
+                  <Icon className="size-4 shrink-0" />
+                  {!collapsed && item.label}
+                </a>
+              )
+            }
             return (
               <button
                 key={item.path}
@@ -272,6 +294,7 @@ export function App() {
             <Route path="/models" element={<ErrorBoundary><ModelsPage /></ErrorBoundary>} />
             <Route path="/playground" element={<ErrorBoundary><PlaygroundPage /></ErrorBoundary>} />
             <Route path="/usage" element={<ErrorBoundary><UsagePage /></ErrorBoundary>} />
+            <Route path="/docker" element={<ErrorBoundary><DockerPage /></ErrorBoundary>} />
           </Routes>
         </div>
       </main>

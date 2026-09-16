@@ -195,6 +195,44 @@ export const api = {
   },
 }
 
+export interface DockerContainer {
+  id: string
+  name: string
+  image: string
+  state: string
+  status: string
+  ports?: string
+  created?: string
+}
+
+export interface DockerSystemStats {
+  cpu_load?: { '1m': number; '5m': number; '15m': number }
+  memory?: { total: number; used: number; percent: number }
+  disk?: { total: number; used: number; percent: number }
+  containers?: { running: number; stopped: number; total: number }
+}
+
+/* ---- Docker API (docker-api.service on /docker-api/) ---- */
+async function dockerRequest<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`/docker-api${path}`, {
+    ...init,
+    headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
+  })
+  const text = await res.text()
+  let json: any = null
+  try { json = text ? JSON.parse(text) : null } catch { /* non-JSON */ }
+  if (!res.ok) throw new ApiError(res.status, json?.error || `HTTP ${res.status}`)
+  return json as T
+}
+
+export const dockerApi = {
+  containers: () => dockerRequest<{ containers: any[] }>('/containers'),
+  system: () => dockerRequest<any>('/system'),
+  action: (id: string, action: string) => dockerRequest<{ ok: boolean; message?: string }>(`/container/${encodeURIComponent(id)}/${action}`, { method: 'POST' }),
+  logs: (id: string) => dockerRequest<{ logs: string }>(`/container/${encodeURIComponent(id)}/logs`),
+  compose: (action: string, body?: Record<string, any>) => dockerRequest<{ ok: boolean; message?: string }>('/compose', { method: 'POST', body: JSON.stringify({ action, ...body }) }),
+}
+
 export function genKey(): string {
   const rand = (n: number) => Math.random().toString(36).slice(2, 2 + n)
   return `sk-${rand(10)}${rand(10)}`

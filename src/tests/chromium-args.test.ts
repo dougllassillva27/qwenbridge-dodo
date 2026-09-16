@@ -3,15 +3,27 @@ import assert from "node:assert/strict";
 import { config } from "../core/config.ts";
 import { buildChromiumLaunchArgs } from "../services/playwright.ts";
 
-test("buildChromiumLaunchArgs includes low-memory heap cap by default", () => {
+test("buildChromiumLaunchArgs includes low-memory heap cap by default", async () => {
   assert.equal(config.playwright.lowMemoryFlags, true);
   const args = buildChromiumLaunchArgs({ width: 1280, height: 720 });
 
   assert.ok(args.includes("--disable-dev-shm-usage"));
-  assert.ok(args.includes("--enable-webgl"));
-  assert.ok(args.includes("--ignore-gpu-blocklist"));
-  assert.ok(args.includes("--enable-accelerated-2d-canvas"));
-  assert.ok(!args.includes("--disable-gpu"), "--disable-gpu is a detection signal and must not be present");
+
+  // GPU flags depend on environment: container gets --disable-gpu,
+  // desktop gets hardware acceleration flags.
+  const fs = await import("node:fs");
+  const inContainer = process.env.CONTAINER === "true" || fs.existsSync("/.dockerenv");
+  if (inContainer) {
+    assert.ok(args.includes("--disable-gpu"), "container should have --disable-gpu");
+    assert.ok(args.includes("--disable-software-rasterizer"), "container should have --disable-software-rasterizer");
+    assert.ok(!args.includes("--enable-webgl"), "container should not have --enable-webgl");
+  } else {
+    assert.ok(args.includes("--enable-webgl"));
+    assert.ok(args.includes("--ignore-gpu-blocklist"));
+    assert.ok(args.includes("--enable-accelerated-2d-canvas"));
+    assert.ok(!args.includes("--disable-gpu"), "--disable-gpu is a detection signal and must not be present on desktop");
+  }
+
   assert.ok(
     args.some((arg) =>
       arg.startsWith(

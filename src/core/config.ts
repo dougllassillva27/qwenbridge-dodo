@@ -56,13 +56,13 @@ const envSchema = z
       .default("chromium"),
     PLAYWRIGHT_INIT_BATCH_SIZE: z.string().default("1"),
     PLAYWRIGHT_CONTEXT_CLOSE_TIMEOUT_MS: z.string().default("10000"),
-    PLAYWRIGHT_IDLE_CONTEXT_TTL_MS: z.string().default("60000"),
-    PLAYWRIGHT_JS_HEAP_MB: z.string().default("256"),
+    PLAYWRIGHT_IDLE_CONTEXT_TTL_MS: z.string().default("30000"),
+    PLAYWRIGHT_JS_HEAP_MB: z.string().default("128"),
     PLAYWRIGHT_LOW_MEMORY_FLAGS: z.string().default("true"),
-    // Keep up to 2 warm contexts by default (balanced memory & failover speed):
+    // Keep up to 1 warm context by default (balanced memory & failover speed):
     // active browsers stay open for immediate use; any extra context above this
     // cap is closed once idle.
-    PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("2"),
+    PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("1"),
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
     CAPTCHA_RESOLVER_URL: z.string().default("http://127.0.0.1:50006"),
@@ -187,7 +187,7 @@ const envSchema = z
     // trust score and gets TMD-challenged on the next request. On by default;
     // the keeper skips accounts that are mid-stream or mutex-busy.
     SESSION_KEEP_ALIVE_ENABLED: z.string().default("true"),
-    SESSION_KEEP_ALIVE_INTERVAL_MS: z.string().default("180000"),
+    SESSION_KEEP_ALIVE_INTERVAL_MS: z.string().default("300000"),
     SESSION_KEEP_ALIVE_IDLE_MS: z.string().default("120000"),
     SESSION_KEEP_ALIVE_NAVIGATION_INTERVAL_MS: z.string().default("480000"),
     API_KEY: z.string().default(""),
