@@ -24,6 +24,11 @@ import { isAuthMockEnabled } from "../services/auth-playwright.js";
 import { dashboardApp } from "./dashboard.js";
 import { adminApp } from "./admin.ts";
 
+import {
+  hookServerConsoleForLogging,
+  getServerLogHistory,
+  subscribeServerLogStream,
+} from "../core/server-log-buffer.ts";
 // Module-level state (initialized in startServer)
 let cache: MemoryCache | undefined;
 let watchdog: Watchdog | undefined;
@@ -133,12 +138,23 @@ app.use("*", async (c, next) => {
     String(Math.max(0, ratelimit.tokens - 1)),
   );
   c.header("x-ratelimit-reset-tokens", "0");
+  const isProbe =
+    c.req.path === "/health" ||
+    c.req.path === "/metrics" ||
+    c.req.path === "/logs" ||
+    c.req.path.startsWith("/logs") ||
+    c.req.path.startsWith("/diagnostics") ||
+    c.req.path === "/favicon.ico";
 
-  metrics.increment("requests.total");
+  if (!isProbe) {
+    metrics.increment("requests.total");
+  }
   const start = Date.now();
   await next();
   const duration = Date.now() - start;
-  metrics.histogram("latency.request", duration);
+  if (!isProbe) {
+    metrics.histogram("latency.request", duration);
+  }
   c.header("X-Response-Time", `${duration}ms`);
   c.header("openai-processing-ms", String(duration));
 });
@@ -347,6 +363,22 @@ app.get("/health", async (c) => {
     activeAccounts: (await import("../services/playwright.js")).getActivePlaywrightAccountIds(),
     metrics: {
       cache: await cache?.getStats(),
+      requestsTotal: Number(metrics.get("requests.total")?.value ?? 0),
+      requestsErrors: Number(metrics.get("requests.errors")?.value ?? 0),
+      latencyAvgMs: (() => {
+        const hist = metrics.get("latency.request")?.value;
+        if (hist && typeof hist === "object" && (hist as any).count > 0) {
+          return Math.round((hist as any).sum / (hist as any).count);
+        }
+        return 0;
+      })(),
+      deltasCount: Number(metrics.get("requests.delta")?.value ?? 0),
+      fullReplaysCount: Number(metrics.get("requests.full")?.value ?? 0),
+      toolCallsCount: Number(metrics.get("toolcalls.total")?.value ?? 0),
+      toolCallsRecovered: Number(metrics.get("toolcalls.recovered")?.value ?? 0),
+      captchasDetected: Number(metrics.get("captcha.challenges.detected")?.value ?? 0),
+      captchasSolved: Number(metrics.get("captcha.solves.succeeded")?.value ?? 0),
+      chatsCleaned: Number(metrics.get("chats.cleaned")?.value ?? 0),
     },
   });
 });
@@ -466,9 +498,54 @@ app.get("/metrics", (c) => {
   });
 });
 
+app.get("/logs", (c) => {
+  return c.json(getServerLogHistory());
+});
+
+app.get("/logs/live", (c) => {
+  const encoder = new TextEncoder();
+  return c.body(
+    new ReadableStream({
+      start(controller) {
+        const past = getServerLogHistory();
+        for (const entry of past) {
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(entry)}\n\n`));
+          } catch {}
+        }
+
+        const unsubscribe = subscribeServerLogStream((entry) => {
+          try {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(entry)}\n\n`));
+          } catch {
+            unsubscribe();
+          }
+        });
+
+        c.req.raw.signal.addEventListener("abort", () => {
+          unsubscribe();
+        });
+      },
+    }),
+    200,
+    {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  );
+});
+
 app.onError((err, c) => {
   const requestId = c.req.header("X-Request-Id") || "unknown";
-  metrics.increment("requests.errors");
+  const isProbe =
+    c.req.path === "/health" ||
+    c.req.path === "/metrics" ||
+    c.req.path.startsWith("/diagnostics") ||
+    c.req.path === "/favicon.ico";
+  if (!isProbe) {
+    metrics.increment("requests.errors");
+  }
   logger.error("API Error", {
     requestId,
     error: err instanceof Error ? err.message : String(err),
@@ -763,6 +840,7 @@ export async function startServer(options?: {
   installSignalHandlers?: boolean;
   showBanner?: boolean;
 }): Promise<StartedServerInfo> {
+  hookServerConsoleForLogging();
   if (server) {
     if (options?.installSignalHandlers !== false) installSignalHandlers();
     return buildStartedServerInfo();
@@ -815,6 +893,10 @@ export async function startServer(options?: {
     const { startTimeSeriesSampling } =
       await import("../core/time-series.ts");
     startTimeSeriesSampling();
+
+    const { scheduleStartupChatCleanup } =
+      await import("../services/chat-cleanup.ts");
+    scheduleStartupChatCleanup();
 
     // Bind HTTP server IMMEDIATELY so Dashboard, logs and API respond in <1 second
     const serverInstance = serve({

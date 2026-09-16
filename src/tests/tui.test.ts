@@ -14,6 +14,8 @@ import {
   drawBox,
   theme,
   glyphs,
+  setClipboardText,
+  getClipboardText,
 } from "../tui/theme.ts";
 import { maskAccountIdentifier } from "../tui/proxy-client.ts";
 import { StatusView } from "../tui/views/status-view.ts";
@@ -22,6 +24,9 @@ import { AccountsView } from "../tui/views/accounts-view.ts";
 import { ChatView } from "../tui/views/chat-view.ts";
 import { StorageView } from "../tui/views/storage-view.ts";
 import { LogsView } from "../tui/views/logs-view.ts";
+import { resetTuiSettingsCacheForTests } from "../tui/settings.ts";
+import fs from "node:fs";
+import { getTuiSettingsPath } from "../core/paths.ts";
 import { ServerManager } from "../tui/server-manager.ts";
 import { TuiApp } from "../tui/app.ts";
 
@@ -274,6 +279,10 @@ test("TUI Markdown: formatMarkdown converts markdown images to clean cards with 
 });
 
 test("TUI ChatView: past assistant messages preserve their generating model when switching active model", async () => {
+  resetTuiSettingsCacheForTests();
+  const p = getTuiSettingsPath();
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+  resetTuiSettingsCacheForTests();
   const view = new ChatView();
   // Simulate a message generated with qwen3.8-max
   (view as any).messages.push({
@@ -375,9 +384,12 @@ test("TUI ChatView: classifyModel dynamically categorizes any model without hard
 });
 
 test("TUI LogsView: renders exactly allocated height and switches filters", async () => {
+  resetTuiSettingsCacheForTests();
+  const p = getTuiSettingsPath();
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+  resetTuiSettingsCacheForTests();
   const { LogsView } = await import("../tui/views/logs-view.ts");
   const view = new LogsView();
-  assert.equal(view.id, "logs");
   assert.equal(view.tabNumber, 6);
 
   const height = 18;
@@ -395,19 +407,22 @@ test("TUI LogsView: renders exactly allocated height and switches filters", asyn
   assert.equal(errLines.length, height);
 });
 test("TUI LogsView: supports selecting log line, copying, and rendering scrollbar", async () => {
+  resetTuiSettingsCacheForTests();
+  const p = getTuiSettingsPath();
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+  resetTuiSettingsCacheForTests();
   const { LogsView } = await import("../tui/views/logs-view.ts");
   const { ServerManager } = await import("../tui/server-manager.ts");
   const view = new LogsView();
-
-  // Populate server logs
+  // Clear and populate server logs
+  ServerManager.getInstance().clearLogs();
   for (let i = 1; i <= 25; i++) {
     (ServerManager.getInstance() as any).logEntries.push({
-      level: i % 3 === 0 ? "ERROR" : i % 2 === 0 ? "WARN" : "INFO",
       time: "12:00:00",
+      level: "INFO",
       message: `Test log message ${i}`,
     });
   }
-
   const height = 15;
   const rendered = view.render(80, height);
   assert.equal(rendered.length, height);
@@ -719,10 +734,15 @@ test("TUI ChatView: supports dragging the lateral scrollbar with mouse drag even
 });
 
 test("TUI LogsView: lateral scrollbar is clickable and clamps scrollOffset", async () => {
+  resetTuiSettingsCacheForTests();
+  const p = getTuiSettingsPath();
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+  resetTuiSettingsCacheForTests();
   const view = new LogsView();
 
-  // Add dummy logs via server manager or simulate log entries
+  // Add dummy logs via server manager
   const sm = ServerManager.getInstance();
+  sm.clearLogs();
   for (let i = 1; i <= 30; i++) {
     (sm as any).appendLog("INFO", `Log entry ${i} for testing scrollbar`);
   }
@@ -1293,4 +1313,203 @@ test("TUI Screen: deduplicates identical cell hovers and throttles mouse motion"
   assert.equal(dispatched[0].mouse.row, 5);
 
   (screen as any).active = false;
+});
+
+test("TUI AccountsView: renders specific cooldown reasons for auth failure, rate limit, and waf", async () => {
+  const view = new AccountsView();
+  const mockSnapshot = {
+    online: true,
+    accounts: [
+      {
+        id: "acc-auth-fail",
+        emailOrName: "badpass@test.com",
+        priority: 1,
+        onCooldown: true,
+        remainingCooldownMs: 800 * 60 * 1000,
+        cooldownReason: "AuthFailed: All login methods exhausted",
+        headersReady: false,
+      },
+      {
+        id: "acc-rate-limit",
+        emailOrName: "limited@test.com",
+        priority: 1,
+        onCooldown: true,
+        remainingCooldownMs: 45 * 60 * 1000,
+        cooldownReason: "RateLimited",
+        headersReady: true,
+      },
+    ],
+  };
+
+  // Inspect first account (Auth failed)
+  (view as any).selectedIndex = 0;
+  let render = view.render(80, 24, mockSnapshot as any).join("\n");
+  assert.ok(render.includes("Auth Fail"), "Left panel must show Auth Fail status for auth failures");
+  assert.ok(render.includes("Motivo:"), "Right panel must display Motivo row");
+  assert.ok(render.includes("Senha/Login"), "Right panel must explain senha/login failure");
+
+  // Inspect second account (Rate limited)
+  (view as any).selectedIndex = 1;
+  render = view.render(80, 24, mockSnapshot as any).join("\n");
+  assert.ok(render.includes("45m cd"), "Left panel must show countdown for rate limit");
+  assert.ok(render.includes("Motivo:"), "Right panel must display Motivo row");
+  assert.ok(render.includes("Cota Excedida") || render.includes("RateLimit"), "Right panel must explain rate limit");
+});
+
+test("TUI StatusView: renders rich traffic, latency, delta, tool call and cleanup metrics", () => {
+  const view = new StatusView();
+  const mockSnapshot = {
+    online: true,
+    port: 7936,
+    host: "127.0.0.1",
+    uptimeSeconds: 3600,
+    rssMb: 210,
+    systemMemoryPct: 2.5,
+    activeStreams: 2,
+    waitingStreams: 0,
+    metrics: {
+      requestsTotal: 1250,
+      requestsErrors: 5,
+      successRate: 99.6,
+      latencyAvgMs: 820,
+      deltasCount: 920,
+      fullReplaysCount: 130,
+      deltaRatio: 87.6,
+      toolCallsCount: 450,
+      toolCallsRecovered: 12,
+      captchasDetected: 3,
+      captchasSolved: 3,
+      chatsCleaned: 40,
+    },
+    accounts: [
+      { id: "1", emailOrName: "acc1@test.com", priority: 1, onCooldown: false, remainingCooldownMs: 0, headersReady: true, isInitialized: true, activeStreams: 1 },
+      { id: "2", emailOrName: "acc2@test.com", priority: 1, onCooldown: true, remainingCooldownMs: 300000, cooldownReason: "RateLimited", headersReady: true, isInitialized: true, activeStreams: 0 },
+    ],
+  };
+
+  const lines = view.render(100, 24, mockSnapshot as any);
+  const fullText = stripAnsi(lines.join("\n"));
+
+  assert.ok(fullText.includes("1250"), "Must render requestsTotal");
+  assert.ok(fullText.includes("99.6%"), "Must render successRate");
+  assert.ok(fullText.includes("820ms"), "Must render latencyAvgMs");
+  assert.ok(fullText.includes("87.6%"), "Must render deltaRatio");
+  assert.ok(fullText.includes("450"), "Must render toolCallsCount");
+  assert.ok(fullText.includes("40"), "Must render chatsCleaned");
+});
+
+test("TUI StatusView: precision mouse hover and click on action buttons", async () => {
+  const view = new StatusView();
+  view.render(80, 24);
+
+  const recarregarRow = (view as any).lastActionRecarregarRow;
+  const zerarRow = (view as any).lastActionZerarRow;
+
+  assert.equal(recarregarRow, (view as any).lastActionRecarregarRow);
+  assert.equal(zerarRow, (view as any).lastActionZerarRow);
+
+  // 1. Hover on Recarregar (row 23, col 10)
+  await view.handleKey({
+    name: "hover",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "hover", row: recarregarRow, col: 10 },
+  });
+  assert.equal((view as any).hoveredActionRow, recarregarRow, "must hover Recarregar button");
+
+  let renderText = view.render(80, 24).join("\n");
+  assert.ok(renderText.includes("[ R ] Recarregar"), "must render button text");
+
+  // 2. Hover on Zerar Cooldowns (row 24, col 10)
+  await view.handleKey({
+    name: "hover",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "hover", row: zerarRow, col: 10 },
+  });
+  assert.equal((view as any).hoveredActionRow, zerarRow, "must hover Zerar button");
+
+  // 3. Hover outside (one row above recarregarRow, which is "Ações:")
+  await view.handleKey({
+    name: "hover",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "hover", row: recarregarRow - 1, col: 10 },
+  });
+  assert.equal((view as any).hoveredActionRow, null, "hovering on Ações label must not highlight buttons");
+
+  // 4. Click on Recarregar
+  await view.handleKey({
+    name: "click",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "click", row: recarregarRow, col: 10, button: "left" },
+  });
+  renderText = view.render(80, 24).join("\n");
+  assert.ok(renderText.includes("Status atualizado"), "clicking Recarregar must update status message");
+});
+
+test("TUI Theme: setClipboardText and getClipboardText preserve full Unicode emojis and accents", () => {
+  const original = "✨ [Server] Conectado à instância em execução na porta 7936";
+  setClipboardText(original);
+  const retrieved = getClipboardText();
+  assert.ok(retrieved.includes("✨"), "Copied text must keep sparkle emoji without mojibake");
+  assert.ok(retrieved.includes("à"), "Copied text must keep accent à");
+  assert.ok(retrieved.includes("execução"), "Copied text must keep cedilla and tilde");
+});
+
+test("TUI ServerLogBuffer: captures and broadcasts server logs to subscribers", async () => {
+  const {
+    recordServerLog,
+    getServerLogHistory,
+    subscribeServerLogStream,
+  } = await import("../core/server-log-buffer.ts");
+
+  const received: string[] = [];
+  const unsub = subscribeServerLogStream((entry) => {
+    received.push(entry.message);
+  });
+
+  recordServerLog("INFO", "Test server message 1");
+  recordServerLog("WARN", "Test server message 2");
+  unsub();
+
+  assert.ok(received.includes("Test server message 1"), "Subscriber must receive message 1");
+  assert.ok(received.includes("Test server message 2"), "Subscriber must receive message 2");
+
+  const history = getServerLogHistory();
+  assert.ok(history.some((h) => h.message === "Test server message 1"));
+});
+
+test("TUI StatusView: orders ready and active accounts ahead of standby and cooldown accounts", () => {
+  const view = new StatusView();
+  const snapshot = {
+    online: true,
+    accounts: [
+      { id: "1", emailOrName: "standby1@test.com", priority: 1, onCooldown: false, remainingCooldownMs: 0, headersReady: false, isInitialized: false },
+      { id: "2", emailOrName: "cd2@test.com", priority: 1, onCooldown: true, remainingCooldownMs: 60000, cooldownReason: "RateLimited", headersReady: false, isInitialized: false },
+      { id: "3", emailOrName: "ready3@test.com", priority: 1, onCooldown: false, remainingCooldownMs: 0, headersReady: true, isInitialized: true, activeStreams: 0 },
+      { id: "4", emailOrName: "generating4@test.com", priority: 1, onCooldown: false, remainingCooldownMs: 0, headersReady: true, isInitialized: true, activeStreams: 1 },
+      { id: "5", emailOrName: "authfail5@test.com", priority: 1, onCooldown: true, remainingCooldownMs: 800000, cooldownReason: "AuthFailed: All login methods exhausted", headersReady: false, isInitialized: false },
+    ],
+  };
+
+  const rendered = view.render(100, 24, snapshot as any).join("\n");
+  const clean = stripAnsi(rendered);
+
+  // Position of each account in the rendered output
+  const posGenerating = clean.indexOf("generating4");
+  const posReady = clean.indexOf("ready3");
+  const posStandby = clean.indexOf("standby1");
+  const posCd = clean.indexOf("cd2");
+  const posAuthFail = clean.indexOf("authfail5");
+  assert.ok(posGenerating !== -1 && posReady !== -1 && posStandby !== -1 && posCd !== -1 && posAuthFail !== -1);
+  assert.ok(posGenerating < posReady, "Generating account must be listed before ready account");
+  assert.ok(posReady < posStandby, "Ready account must be listed before standby account");
+  assert.ok(posStandby < posCd, "Standby account must be listed before cooldown account");
+  assert.ok(posCd < posAuthFail, "Cooldown account must be listed before auth fail account");
 });

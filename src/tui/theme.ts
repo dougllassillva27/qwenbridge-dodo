@@ -47,11 +47,14 @@ export const theme = {
 
 import { execSync, spawnSync } from "node:child_process";
 
+let memoryClipboard = "";
+
 /**
  * Safely writes text to the system clipboard on Windows/macOS/Linux.
  * Also emits OSC 52 to copy inside terminal emulators supporting it.
  */
 export function setClipboardText(text: string): boolean {
+  memoryClipboard = text;
   try {
     // 1. Emit OSC 52 sequence for terminal emulators supporting it natively (only when interactive TTY)
     try {
@@ -64,8 +67,7 @@ export function setClipboardText(text: string): boolean {
     // 2. OS-level clipboard utility
     if (process.platform === "win32") {
       const p = spawnSync("clip.exe", {
-        input: text,
-        encoding: "utf-8",
+        input: Buffer.from(text, "utf16le"),
         windowsHide: true,
       });
       return p.status === 0;
@@ -90,17 +92,21 @@ export function setClipboardText(text: string): boolean {
 export function getClipboardText(): string {
   try {
     if (process.platform === "win32") {
-      return execSync("powershell -NoProfile -Command Get-Clipboard", {
-        timeout: 1000,
-        windowsHide: true,
-        stdio: ["pipe", "pipe", "ignore"],
-      })
-        .toString()
+      const res = execSync(
+        'powershell -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-Clipboard"',
+        {
+          timeout: 2000,
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "ignore"],
+        },
+      )
+        .toString("utf8")
         .replace(/\r?\n/g, "")
         .trim();
+      if (res) return res;
     }
   } catch {}
-  return "";
+  return memoryClipboard;
 }
 
 export const glyphs = {

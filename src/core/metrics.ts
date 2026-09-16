@@ -35,10 +35,14 @@ export class Metrics extends EventEmitter {
       ["requests.4xx", "counter", "Requests answered with 4xx status"],
       ["requests.5xx", "counter", "Requests answered with 5xx status"],
       ["requests.completions", "counter", "Chat completions requests"],
+      ["requests.delta", "counter", "Thread-native delta requests"],
+      ["requests.full", "counter", "Full context replay or initial requests"],
       ["latency.request", "histogram", "Request latency (ms)"],
       ["latency.completion", "histogram", "Completion latency to response start (ms)"],
-      ["toolcalls.malformed", "counter", "Malformed tool call blocks dropped by the parser"],
-
+      ["toolcalls.total", "counter", "Total tool calls processed"],
+      ["toolcalls.malformed", "counter", "Malformed tool calls detected"],
+      ["toolcalls.recovered", "counter", "Malformed tool calls recovered/healed"],
+      ["chats.cleaned", "counter", "Remote chats automatically cleaned"],
       // Stream metrics
       ["streams.active", "gauge", "Active SSE streams"],
       ["streams.errors", "counter", "Stream errors"],

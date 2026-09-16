@@ -22,6 +22,7 @@ import {
 } from "./streaming.ts";
 import { config, type ChatMode } from "../../core/config.ts";
 import { logger } from "../../core/logger.ts";
+import { metrics } from "../../core/metrics.ts";
 import { getContextMeterHeaders, type ContextMeterMode } from "../../services/context-meter.ts";
 import {
   getLogicalThreadState,
@@ -34,7 +35,6 @@ import {
 } from "./retry-policy.ts";
 import { classifyMediaModel } from "../../services/media-generation.ts";
 import { handleMediaChatCompletion } from "./media.ts";
-import { metrics } from "../../core/metrics.ts";
 import { trackModelUsage, trackUsage } from "../../core/usage-tracker.ts";
 
 
@@ -284,6 +284,11 @@ export async function chatCompletions(c: Context) {
     console.log(
       `📤 [${routeLabel}] Request | req=${reqId} | ${streamResult.activeAccountLabel} | ${body.model} | ${replayed ? parsed.messageCount : msgCount} msg(s) | ${replayed ? fullPromptForRequest.length : finalPrompt.length} chars${replayed ? " | full-replay" : ""} | chat=${streamResult.uiSessionId.substring(0, 12)}${declaredTools.length ? ` | ${declaredTools.length} tool(s)` : ""}${files.length ? ` | ${files.length} file(s)` : ""} | +${Date.now() - reqStartedAt}ms`,
     );
+    if (replayed || !ctx.existingThread) {
+      metrics.increment("requests.full");
+    } else {
+      metrics.increment("requests.delta");
+    }
 
     const onAssistantComplete: ((event: AssistantCompleteEvent) => Promise<void> | void) | undefined = undefined;
 
