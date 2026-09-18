@@ -13,24 +13,6 @@ import { loadAccounts, type QwenAccount } from "../core/accounts.ts";
 
 const requireLocal = createRequire(import.meta.url);
 
-function getActiveScreenCenter(): { x: number; y: number } | null {
-  if (process.platform !== "win32") return null;
-  try {
-    const cmd = `Add-Type -AssemblyName System.Windows.Forms; $s = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position); if (!$s) { $s = [System.Windows.Forms.Screen]::PrimaryScreen }; $cx = [int]($s.Bounds.Left + $s.Bounds.Width/2); $cy = [int]($s.Bounds.Top + $s.Bounds.Height/2); Write-Output "$cx,$cy"`;
-    const out = child_process.execFileSync(
-      "powershell.exe",
-      ["-NoProfile", "-Command", cmd],
-      { encoding: "utf-8", timeout: 3000 },
-    ).trim();
-    if (out && out.includes(",")) {
-      const [x, y] = out.split(",").map(Number);
-      if (!isNaN(x) && !isNaN(y)) {
-        return { x, y };
-      }
-    }
-  } catch {}
-  return null;
-}
 
 function autoInstallPlaywrightChromium(): void {
   const tryInstall = (mirror?: string): number | null => {
@@ -1442,32 +1424,7 @@ export async function initPlaywrightForAccount(
     const fingerprint = getFingerprintProfile(account.id);
     const { engine, channel } = resolveBrowserEngine(browserType);
 
-    // [Dodo] LAUNCHER_WINDOW_X validation and args injection (com auto-detecção de monitor ativo para .bat/terminal)
     const launchArgs = buildChromiumLaunchArgs(fingerprint.viewport);
-    let cx = parseInt(process.env.LAUNCHER_WINDOW_X as string);
-    let cy = parseInt(process.env.LAUNCHER_WINDOW_Y as string);
-    if (isNaN(cx) || isNaN(cy)) {
-      const activeScreen = getActiveScreenCenter();
-      if (activeScreen) {
-        cx = activeScreen.x;
-        cy = activeScreen.y;
-      }
-    }
-    if (!isNaN(cx) && !isNaN(cy)) {
-      launchArgs.push(`--window-position=${cx - 500},${cy - 350}`);
-    }
-
-    // [Dodo] Previne que o Chrome ignore a coordenada do launcher lendo um save-state antigo.
-    const prefsPath = path.join(profilePath, "Default", "Preferences");
-    if (fs.existsSync(prefsPath)) {
-      try {
-        const prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8"));
-        if (prefs?.browser?.window_placement) {
-          delete prefs.browser.window_placement;
-          fs.writeFileSync(prefsPath, JSON.stringify(prefs));
-        }
-      } catch {}
-    }
 
     // In Docker with Xvfb (DISPLAY active), run headed on the virtual display to emulate real user rendering
     const effectiveHeadless = process.env.DISPLAY ? false : headless;
@@ -1569,9 +1526,6 @@ export async function initPlaywrightForAccount(
         }
       }
 
-      if (!effectiveHeadless && !isNaN(cx) && !isNaN(cy)) {
-        await alignWindowPosition(acctPage, cx - 500, cy - 350, 600, 400).catch(() => {});
-      }
 
       acctPage.setDefaultTimeout(config.timeouts.page);
       acctPage.setDefaultNavigationTimeout(config.timeouts.navigation);
@@ -1650,10 +1604,8 @@ export async function initPlaywrightForAccount(
         // Capture headers by navigating and intercepting
         console.log(`📡 [Playwright] Intercepting anti-bot headers for ${maskEmail(account.email)}...`);
         await captureQwenHeaders(account.id);
-        console.log(`🪟 [Playwright] Minimizing window for ${maskEmail(account.email)}...`);
-        if (!effectiveHeadless && !isNaN(cx) && !isNaN(cy)) {
-          await alignWindowPosition(acctPage, cx - 500, cy - 350, 600, 400).catch(() => {});
-        } else {
+        if (!effectiveHeadless) {
+          console.log(`🪟 [Playwright] Minimizing window for ${maskEmail(account.email)}...`);
           await minimizeWindow(acctPage).catch(() => {});
         }
       }
@@ -1723,29 +1675,6 @@ export async function validateAccountLogin(
     const effectiveHeadless = process.env.DISPLAY ? false : headless;
 
     const launchArgs = buildChromiumLaunchArgs(fingerprint.viewport);
-    let cx = parseInt(process.env.LAUNCHER_WINDOW_X as string);
-    let cy = parseInt(process.env.LAUNCHER_WINDOW_Y as string);
-    if (isNaN(cx) || isNaN(cy)) {
-      const activeScreen = getActiveScreenCenter();
-      if (activeScreen) {
-        cx = activeScreen.x;
-        cy = activeScreen.y;
-      }
-    }
-    if (!isNaN(cx) && !isNaN(cy)) {
-      launchArgs.push(`--window-position=${cx - 500},${cy - 350}`);
-    }
-
-    const prefsPath = path.join(profilePath, "Default", "Preferences");
-    if (fs.existsSync(prefsPath)) {
-      try {
-        const prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8"));
-        if (prefs?.browser?.window_placement) {
-          delete prefs.browser.window_placement;
-          fs.writeFileSync(prefsPath, JSON.stringify(prefs));
-        }
-      } catch {}
-    }
 
     cleanChromiumSingletonLocks(profilePath);
 
@@ -1814,10 +1743,7 @@ export async function validateAccountLogin(
         existingPages.find((p) => p.url().startsWith(qwenOrigin())) ??
         existingPages[0] ??
         (await acctContext.newPage());
-
-      if (!effectiveHeadless && !isNaN(cx) && !isNaN(cy)) {
-        await alignWindowPosition(acctPage, cx - 500, cy - 350, 600, 400).catch(() => {});
-      } else if (!effectiveHeadless) {
+      if (!effectiveHeadless) {
         await minimizeWindow(acctPage).catch(() => {});
       }
 
@@ -3801,26 +3727,7 @@ export async function getTokenDiagnostics(
     },
   };
 }
-// [Dodo] Funções CDP para gerenciar o estado e posição física da janela
-export async function alignWindowPosition(
-  page: any,
-  left: number,
-  top: number,
-  width: number = 600,
-  height: number = 400,
-): Promise<void> {
-  try {
-    const cdp = await page.context().newCDPSession(page);
-    const { windowId } = await cdp.send("Browser.getWindowForTarget");
-    // O Chromium frequentemente ignora a flag --window-position e --window-size na inicialização 
-    // se o Perfil Persistente salvou o local antigo. Forçamos o reposicionamento e redimensionamento físico via CDP.
-    await cdp.send("Browser.setWindowBounds", {
-      windowId,
-      bounds: { left, top, width, height, windowState: "normal" },
-    });
-    await cdp.detach();
-  } catch {}
-}
+// [Dodo] Funções CDP para gerenciar o estado da janela
 export async function minimizeWindow(page: any): Promise<void> {
   try {
     const cdp = await page.context().newCDPSession(page);

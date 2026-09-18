@@ -30,7 +30,7 @@ const CATEGORIES = [
   { id: 'models', label: 'Modelos', icon: Sparkles },
   { id: 'media', label: 'Mídia & Arquivos', icon: Film },
   { id: 'web', label: 'Painéis Web', icon: Globe },
-  { id: 'metrics', label: 'Métricas & Launcher', icon: Activity },
+  { id: 'metrics', label: 'Métricas & Integrações', icon: Activity },
   { id: 'probes', label: 'Probes & Conectividade', icon: Server },
 ]
 
@@ -174,17 +174,17 @@ const ENDPOINTS: Endpoint[] = [
     category: 'web',
     tag: 'Interface Web',
     isWebPage: true,
-    description: 'Dashboard leve em HTML estático integrado diretamente ao servidor para monitoramento rápido sem necessidade de autenticação.',
+    description: 'Página de entrada com redirecionamento automático para este painel de administração (/admin).',
   },
 
-  // Métricas & Launcher
+  // Métricas & Integrações
   {
     method: 'GET',
     path: '/metrics/accounts',
-    title: 'Métricas de Contas (Proxy Launcher)',
+    title: 'Métricas de Contas (JSON)',
     category: 'metrics',
-    tag: 'Dodo Launcher',
-    description: 'Endpoint JSON consumido pelo aplicativo Desktop Proxy Launcher (Tauri) com o estado de cada conta, status de cooldown, memória RAM e streams ativos.',
+    tag: 'Integração Externa',
+    description: 'Endpoint JSON com o estado de cada conta, status de cooldown, memória RAM e streams ativos para monitoramento externo.',
     sampleCurl: `curl -X GET http://127.0.0.1:50002/metrics/accounts`,
   },
   {
@@ -192,7 +192,7 @@ const ENDPOINTS: Endpoint[] = [
     path: '/accounts',
     title: 'Alias /accounts',
     category: 'metrics',
-    tag: 'Dodo Launcher',
+    tag: 'Integração Externa',
     description: 'Alias direto para `/metrics/accounts` com cabeçalhos CORS abertos para integração simplificada com ferramentas externas.',
   },
   {
