@@ -5,7 +5,7 @@
 import { Screen, type KeyEvent } from "./screen.ts";
 import type { TuiView, ProxyStatusSnapshot } from "./types.ts";
 import { theme, glyphs, drawBox, stringWidth } from "./theme.ts";
-import { fetchProxyStatus } from "./proxy-client.ts";
+import { fetchProxyStatus, fetchLiveModels, getCachedLiveModels } from "./proxy-client.ts";
 import { ServerManager } from "./server-manager.ts";
 import fs from "node:fs";
 import path from "node:path";
@@ -26,6 +26,7 @@ import { SyncView } from "./views/sync-view.ts";
 import { StorageView } from "./views/storage-view.ts";
 import { AccountsView } from "./views/accounts-view.ts";
 import { LogsView } from "./views/logs-view.ts";
+import { setRuntimeChatMode } from "../core/config.ts";
 import { loadTuiSettings, saveTuiSettings } from "./settings.ts";
 export class TuiApp {
   private screen: Screen;
@@ -39,6 +40,10 @@ export class TuiApp {
   private renderScheduled = false;
   constructor(initialTab?: number) {
     this.screen = new Screen();
+    const saved = loadTuiSettings();
+    if (saved.chat?.mode) {
+      setRuntimeChatMode(saved.chat.mode);
+    }
 
     this.views = [
       new StatusView(),
@@ -49,16 +54,10 @@ export class TuiApp {
       new LogsView(),
     ];
 
-    let resolvedTab = initialTab;
-    if (!resolvedTab || isNaN(resolvedTab)) {
-      const saved = loadTuiSettings();
-      if (saved.lastTab && saved.lastTab >= 1 && saved.lastTab <= 6) {
-        resolvedTab = saved.lastTab;
-      } else {
-        resolvedTab = 1;
-      }
+    let resolvedTab = initialTab ?? (saved.lastTab && saved.lastTab >= 1 && saved.lastTab <= 6 ? saved.lastTab : 1);
+    if (isNaN(resolvedTab)) {
+      resolvedTab = 1;
     }
-
     const tabIdx = Math.max(0, Math.min(this.views.length - 1, resolvedTab - 1));
     this.activeViewIndex = tabIdx;
   }
@@ -129,10 +128,28 @@ export class TuiApp {
     } catch {}
 
     // Background polling every 1s for live status updates and model catalog synchronization
+    let pollCount = 0;
     this.pollInterval = setInterval(async () => {
       if (!this.isRunning) return;
+      pollCount++;
       try {
         this.statusSnapshot = await fetchProxyStatus();
+
+        // Sync live models catalog when server is running:
+        // Try every 5s until first successful catalog load, then refresh periodically every 30s
+        const hasLiveModels = getCachedLiveModels() !== null;
+        const shouldSync = !hasLiveModels ? pollCount % 5 === 1 : pollCount % 30 === 1;
+        if (shouldSync) {
+          const models = await fetchLiveModels(hasLiveModels);
+          if (models.length > 0) {
+            for (const view of this.views) {
+              if ("refreshModels" in view && typeof (view as any).refreshModels === "function") {
+                void (view as any).refreshModels();
+              }
+            }
+          }
+        }
+
         this.requestRender();
       } catch {}
     }, 1000);

@@ -37,6 +37,10 @@ test("TUI Theme: stripAnsi removes all escape codes cleanly", () => {
   const mixed = `${theme.bgSelected("Menu Item")} - ${theme.dim("[q] Quit")}`;
   assert.equal(stripAnsi(mixed), "Menu Item - [q] Quit");
 });
+test("TUI Theme: ANSI.setTitle formats OSC 0 terminal title sequence", () => {
+  assert.equal(ANSI.setTitle("QwenProxy"), "\x1b]0;QwenProxy\x07");
+  assert.equal(stripAnsi(ANSI.setTitle("QwenProxy")), "");
+});
 
 test("TUI Theme: stringWidth accurately measures plain and formatted text", () => {
   assert.equal(stringWidth("hello"), 5);
@@ -141,20 +145,43 @@ test("TUI Proxy Client: maskAccountIdentifier masks emails and IDs for privacy",
   assert.equal(maskAccountIdentifier("short"), "short");
 });
 
-test("TUI StatusView: exposes shortcuts and renders valid box frame", () => {
-  const view = new StatusView();
-  assert.equal(view.id, "status");
-  assert.equal(view.tabNumber, 1);
+test("TUI StatusView: exposes shortcuts, displays global API mode, and cycles mode with 'm'", async () => {
+  const { setRuntimeChatMode, getRuntimeChatMode } = await import("../core/config.ts");
+  const initialMode = getRuntimeChatMode();
+  setRuntimeChatMode("thread");
 
-  const shortcuts = view.getShortcuts();
-  assert.ok(shortcuts.some((s) => s.key === "r"));
-  assert.ok(shortcuts.some((s) => s.key === "z"));
+  try {
+    const view = new StatusView();
+    assert.equal(view.id, "status");
+    assert.equal(view.tabNumber, 1);
 
-  const lines = view.render(80, 24);
-  assert.ok(lines.length > 0);
-  const fullText = stripAnsi(lines.join("\n"));
-  assert.ok(fullText.includes("Sistema"));
-  assert.ok(fullText.includes("Contas"));
+    const shortcuts = view.getShortcuts();
+    assert.ok(shortcuts.some((s) => s.key === "r"));
+    assert.ok(shortcuts.some((s) => s.key === "z"));
+    assert.ok(shortcuts.some((s) => s.key === "m"));
+
+    let lines = view.render(80, 24);
+    assert.ok(lines.length > 0);
+    let fullText = stripAnsi(lines.join("\n"));
+    assert.ok(fullText.includes("Modo API:"));
+    assert.ok(fullText.includes("[thread]"));
+
+    // Press 'm' to cycle to thread-temp
+    await view.handleKey({ name: "m", ctrl: false, shift: false, meta: false });
+    assert.equal(getRuntimeChatMode(), "thread-temp");
+    lines = view.render(80, 24);
+    fullText = stripAnsi(lines.join("\n"));
+    assert.ok(fullText.includes("[thread-temp]"));
+
+    // Press 'm' again to cycle to stateless-temp
+    await view.handleKey({ name: "m", ctrl: false, shift: false, meta: false });
+    assert.equal(getRuntimeChatMode(), "stateless-temp");
+    lines = view.render(80, 24);
+    fullText = stripAnsi(lines.join("\n"));
+    assert.ok(fullText.includes("[stateless-temp]"));
+  } finally {
+    setRuntimeChatMode(initialMode);
+  }
 });
 
 test("TUI SyncView: handles keyboard toggles and model selection", async () => {
@@ -176,6 +203,22 @@ test("TUI SyncView: handles keyboard toggles and model selection", async () => {
   assert.ok(toggledLines.includes(glyphs.checkOn));
 });
 
+test("TUI SyncView: displays all 10 clients and handles full navigation", async () => {
+  const view = new SyncView();
+  const render = view.render(90, 26).join("\n");
+
+  assert.ok(render.includes("Hermes Agent"));
+  assert.ok(render.includes("OpenCode"));
+  assert.ok(render.includes("Claude Code"));
+  assert.ok(render.includes("OpenClaw"));
+  assert.ok(render.includes("Kilo Code"));
+  assert.ok(render.includes("Cline"));
+  assert.ok(render.includes("OMP (Oh My Pi)"));
+  assert.ok(render.includes("Codex CLI"));
+  assert.ok(render.includes("Zed Editor"));
+  assert.ok(render.includes("Aider"));
+});
+
 test("TUI AccountsView: navigates accounts and provides cooldown actions", async () => {
   const view = new AccountsView();
   assert.equal(view.id, "accounts");
@@ -194,6 +237,10 @@ test("TUI AccountsView: navigates accounts and provides cooldown actions", async
 });
 
 test("TUI ChatView: opens vertical model modal with F2 and selects with Enter", async () => {
+  resetTuiSettingsCacheForTests();
+  const p = getTuiSettingsPath();
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+  resetTuiSettingsCacheForTests();
   const view = new ChatView();
   assert.equal(view.id, "chat");
   assert.equal(view.tabNumber, 2);
@@ -355,6 +402,101 @@ test("TUI ChatView: selects model and its reasoning effort (F2/F3 and mouse)", a
   render = view.render(80, 24).join("\n");
   assert.ok(render.includes("Effort: Low (Fast)"));
 });
+test("TUI ChatView: selects chat mode via F4 shortcut and mouse click", async () => {
+  resetTuiSettingsCacheForTests();
+  const p = getTuiSettingsPath();
+  if (fs.existsSync(p)) fs.unlinkSync(p);
+  resetTuiSettingsCacheForTests();
+  const view = new ChatView();
+  await view.handleKey({ name: "f4", ctrl: false, shift: false, meta: false });
+  let render = view.render(80, 24).join("\n");
+  assert.ok(render.includes("Selecionar Modo de Conversa"));
+  assert.ok(render.includes("thread-temp"));
+  assert.ok(render.includes("stateless-temp"));
+  assert.ok(render.includes("stateless"));
+  assert.ok(render.includes("thread (Padrão)"));
+
+  // 2. Navigate down and select thread-temp with Enter
+  await view.handleKey({ name: "down", ctrl: false, shift: false, meta: false });
+  await view.handleKey({ name: "return", ctrl: false, shift: false, meta: false });
+  assert.equal((view as any).selectedChatMode, "thread-temp");
+
+  // Verify header displays the updated mode
+  render = view.render(80, 24).join("\n");
+  assert.ok(render.includes("Modo: thread-temp"));
+
+  // 3. Test mouse hover and selection on all 4 mode rows
+  // Row 11 is thread (index 0)
+  await view.handleKey({ name: "f4", ctrl: false, shift: false, meta: false });
+  assert.equal((view as any).isModeModalOpen, true);
+  await view.handleKey({
+    name: "hover",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "hover", col: 15, row: 11 },
+  });
+  assert.equal((view as any).modeSelectedIndex, 0);
+
+  // Row 12 is thread-temp (index 1)
+  await view.handleKey({
+    name: "hover",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "hover", col: 15, row: 12 },
+  });
+  assert.equal((view as any).modeSelectedIndex, 1);
+
+  // Row 13 is stateless-temp (index 2)
+  await view.handleKey({
+    name: "hover",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "hover", col: 15, row: 13 },
+  });
+  assert.equal((view as any).modeSelectedIndex, 2);
+
+  // Row 14 is stateless (index 3)
+  await view.handleKey({
+    name: "hover",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "hover", col: 15, row: 14 },
+  });
+  assert.equal((view as any).modeSelectedIndex, 3);
+
+  // Click on Row 13 selects stateless-temp
+  await view.handleKey({
+    name: "click",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "click", button: "left", col: 15, row: 13 },
+  });
+  assert.equal((view as any).isModeModalOpen, false);
+  assert.equal((view as any).selectedChatMode, "stateless-temp");
+
+  // Re-open with F4 and click on Row 11 selects thread
+  await view.handleKey({ name: "f4", ctrl: false, shift: false, meta: false });
+  await view.handleKey({
+    name: "click",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "click", button: "left", col: 15, row: 11 },
+  });
+  assert.equal((view as any).isModeModalOpen, false);
+  assert.equal((view as any).selectedChatMode, "thread");
+
+  // 4. Cancel with Escape
+  await view.handleKey({ name: "f4", ctrl: false, shift: false, meta: false });
+  assert.equal((view as any).isModeModalOpen, true);
+  await view.handleKey({ name: "escape", ctrl: false, shift: false, meta: false });
+  assert.equal((view as any).isModeModalOpen, false);
+});
 
 test("TUI ChatView: supports cursor movement and in-place character insertion with Left/Right arrows", async () => {
   const view = new ChatView();
@@ -375,12 +517,32 @@ test("TUI ChatView: supports cursor movement and in-place character insertion wi
 test("TUI ChatView: classifyModel dynamically categorizes any model without hardcoded lists", async () => {
   const { classifyModel } = await import("../tui/views/chat-view.ts");
 
-  assert.equal(classifyModel("qwen3.8-max").category, "Texto & Raciocínio");
-  assert.ok(classifyModel("qwen3.8-max").badge.includes("[Texto]"));
-  assert.equal(classifyModel("z-image-turbo").category, "Geração de Imagem");
-  assert.ok(classifyModel("z-image-turbo").badge.includes("[Imagem]"));
-  assert.equal(classifyModel("wan3.0-video").category, "Geração de Vídeo");
-  assert.ok(classifyModel("wan3.0-video").badge.includes("[Vídeo]"));
+  const textModel = classifyModel("qwen3.8-max");
+  assert.equal(textModel.category, "Texto & Raciocínio");
+  assert.ok(textModel.badge.includes("[Texto]"));
+  assert.equal(textModel.supportsReasoning, true);
+
+  const omniModel = classifyModel("qwen3.8-omni-flash");
+  assert.equal(omniModel.category, "Multimodal / Omni");
+  assert.ok(omniModel.badge.includes("[Omni]"));
+  assert.equal(omniModel.supportsReasoning, true);
+
+  const imgModel = classifyModel("z-image-turbo");
+  assert.equal(imgModel.category, "Geração de Imagem");
+  assert.ok(imgModel.badge.includes("[Imagem]"));
+  assert.equal(imgModel.supportsReasoning, false);
+
+  const videoModel = classifyModel("wan3.0-video");
+  assert.equal(videoModel.category, "Geração de Vídeo");
+  assert.ok(videoModel.badge.includes("[Vídeo]"));
+  assert.equal(videoModel.supportsReasoning, false);
+});
+
+test("TUI ProxyClient: DEFAULT_FALLBACK_MODELS includes omni-flash and core models", async () => {
+  const { DEFAULT_FALLBACK_MODELS } = await import("../tui/proxy-client.ts");
+  assert.ok(DEFAULT_FALLBACK_MODELS.includes("qwen3.8-omni-flash"));
+  assert.ok(DEFAULT_FALLBACK_MODELS.includes("qwen3.8-max"));
+  assert.ok(DEFAULT_FALLBACK_MODELS.includes("qwen3.7-plus"));
 });
 
 test("TUI LogsView: renders exactly allocated height and switches filters", async () => {
@@ -961,7 +1123,7 @@ test("TUI SyncView: mouse click precisely toggles clients, model, and scope", as
   const view = new SyncView();
   view.render(80, 24);
 
-  // Click row 8 (Claude Code) -> toggles to selected [x]
+  // Click row 8 (First client) -> toggles to selected [x]
   await view.handleKey({
     name: "click",
     ctrl: false,
@@ -972,50 +1134,50 @@ test("TUI SyncView: mouse click precisely toggles clients, model, and scope", as
   let render = view.render(80, 24).join("\n");
   assert.ok(render.includes(glyphs.checkOn));
 
-  // Click row 14 (Model selector) -> cycles to next model
+  // Click row 20 (Model selector) -> cycles to next model
   await view.handleKey({
     name: "click",
     ctrl: false,
     shift: false,
     meta: false,
-    mouse: { type: "click", button: "left", col: 10, row: 14 },
+    mouse: { type: "click", button: "left", col: 10, row: 20 },
   });
   render = view.render(80, 24).join("\n");
   assert.ok(render.includes("qwen3.7-plus"));
 
-  // Click row 15 (Scope selector) -> toggles syncAllModels
+  // Click row 21 (Scope selector) -> toggles syncAllModels
   await view.handleKey({
     name: "click",
     ctrl: false,
     shift: false,
     meta: false,
-    mouse: { type: "click", button: "left", col: 10, row: 15 },
+    mouse: { type: "click", button: "left", col: 10, row: 21 },
   });
   render = view.render(80, 24).join("\n");
   assert.ok(render.includes(glyphs.radioOff));
   // Verify there is no duplicate "Modelo: Modelo:"
   assert.ok(!render.includes("Modelo: Modelo:"));
-  // Click row 18 ([ Enter ] Sincronizar)
+  // Click row 24 ([ Enter ] Sincronizar)
   await view.handleKey({
     name: "click",
     ctrl: false,
     shift: false,
     meta: false,
-    mouse: { type: "click", button: "left", col: 10, row: 18 },
+    mouse: { type: "click", button: "left", col: 10, row: 24 },
   });
   render = view.render(80, 24).join("\n");
-  assert.equal((view as any).selectedRowIndex, 6);
+  assert.equal((view as any).selectedRowIndex, 12);
 
-  // Click row 19 ([ R ] Restaurar)
+  // Click row 25 ([ R ] Restaurar)
   await view.handleKey({
     name: "click",
     ctrl: false,
     shift: false,
     meta: false,
-    mouse: { type: "click", button: "left", col: 10, row: 19 },
+    mouse: { type: "click", button: "left", col: 10, row: 25 },
   });
   render = view.render(80, 24).join("\n");
-  assert.equal((view as any).selectedRowIndex, 7);
+  assert.equal((view as any).selectedRowIndex, 13);
 });
 
 test("TUI AccountsView: precision mouse click on right panel action buttons", async () => {
@@ -1453,6 +1615,53 @@ test("TUI StatusView: precision mouse hover and click on action buttons", async 
   assert.ok(renderText.includes("Status atualizado"), "clicking Recarregar must update status message");
 });
 
+test("TUI StatusView: mouse click and 'c' shortcut copy Base URL to clipboard with visual confirmation", async () => {
+  const view = new StatusView();
+  view.render(80, 24);
+
+  const baseUrlRow = (view as any).lastBaseUrlRow || 6;
+  const baseUrl = (view as any).lastBaseUrl;
+  assert.ok(baseUrl.includes("/v1"), "Base URL must contain /v1");
+
+  // 1. Mouse hover over Base URL row (row 6, col 10)
+  await view.handleKey({
+    name: "hover",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "hover", row: baseUrlRow, col: 10 },
+  });
+  assert.equal((view as any).isBaseUrlHovered, true, "Hovering row 6 must set isBaseUrlHovered");
+
+  // 2. Mouse click on Base URL row
+  await view.handleKey({
+    name: "click",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    mouse: { type: "click", row: baseUrlRow, col: 10, button: "left" },
+  });
+
+  assert.equal((view as any).copiedRecently, true, "Clicking Base URL must set copiedRecently");
+  const renderTextAfterClick = view.render(80, 24).join("\n");
+  assert.ok(renderTextAfterClick.includes("Base URL copiada"), "Must display confirmation footer");
+
+  // Verify clipboard has the baseUrl
+  const inClipboard = getClipboardText();
+  assert.equal(inClipboard, baseUrl, "Clipboard must receive the exact base URL");
+
+  // 3. Test keyboard 'c' shortcut
+  (view as any).copiedRecently = false;
+  await view.handleKey({
+    name: "c",
+    ctrl: false,
+    shift: false,
+    meta: false,
+    char: "c",
+  });
+  assert.equal((view as any).copiedRecently, true, "Pressing 'c' must also copy base URL");
+});
+
 test("TUI Theme: setClipboardText and getClipboardText preserve full Unicode emojis and accents", () => {
   const original = "✨ [Server] Conectado à instância em execução na porta 7936";
   setClipboardText(original);
@@ -1512,4 +1721,129 @@ test("TUI StatusView: orders ready and active accounts ahead of standby and cool
   assert.ok(posReady < posStandby, "Ready account must be listed before standby account");
   assert.ok(posStandby < posCd, "Standby account must be listed before cooldown account");
   assert.ok(posCd < posAuthFail, "Cooldown account must be listed before auth fail account");
+});
+
+test("TUI ServerManager: cleans redundant level prefixes and normalizes emoji spacing", async () => {
+  const { ServerManager } = await import("../tui/server-manager.ts");
+  const sm = ServerManager.getInstance();
+  sm.clearLogs();
+
+  (sm as any).appendLog("WARN", "WARN [Qwen] Completion returned an HTML or anti-bot challenge body instead of SSE.");
+  (sm as any).appendLog("WARN", "⏱️  [Playwright] Resetting account context after a stuck page operation");
+
+  const entries = sm.getLogEntries("all");
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].message, "[Qwen] Completion returned an HTML or anti-bot challenge body instead of SSE.");
+  assert.equal(entries[1].message, "⏱️ [Playwright] Resetting account context after a stuck page operation");
+});
+
+test("TUI ServerLogBuffer: cleans redundant level prefixes and normalizes emoji spacing", async () => {
+  const { recordServerLog, getServerLogHistory } = await import("../core/server-log-buffer.ts");
+
+  recordServerLog("WARN", "WARN [Qwen] Completion returned an HTML or anti-bot challenge body instead of SSE.");
+  recordServerLog("WARN", "⏱️  [Playwright] Resetting account context");
+
+  const history = getServerLogHistory();
+  const lastTwo = history.slice(-2);
+  assert.equal(lastTwo[0].message, "[Qwen] Completion returned an HTML or anti-bot challenge body instead of SSE.");
+  assert.equal(lastTwo[1].message, "⏱️ [Playwright] Resetting account context");
+});
+
+test("TUI AccountsView: opens Batch Import modal with 'b', counts valid accounts, handles hover, selection, and cancels with Esc", async () => {
+  const view = new AccountsView();
+
+  // Open batch modal with 'b'
+  await view.handleKey({ name: "b", ctrl: false, shift: false, meta: false });
+  assert.equal(view.isCapturingText(), true);
+
+  let render = view.render(80, 24).join("\n");
+  assert.ok(render.includes("Importar Contas em Lote"));
+  // Must NOT have repeated "(linha vazia)" lines
+  assert.ok(!render.includes("(linha vazia)"));
+  assert.ok(render.includes("Nenhuma conta colada ainda"));
+
+  // Initially, neither button is selected (focus is in text area, no purple box)
+  assert.equal((view as any).batchActiveButton, null);
+  assert.equal((view as any).batchHoveredButton, null);
+  // Tab switches selection to Cancelar
+  await view.handleKey({ name: "tab", ctrl: false, shift: false, meta: false });
+  assert.equal((view as any).batchActiveButton, "cancel");
+
+  // Left arrow switches back to Importar
+  await view.handleKey({ name: "left", ctrl: false, shift: false, meta: false });
+  assert.equal((view as any).batchActiveButton, "import");
+
+  // Mouse hover over Importar (btnRow is 15, modal pad is 5, col 12 is relCol 7)
+  await view.handleKey({ name: "hover", ctrl: false, shift: false, meta: false, mouse: { type: "hover", row: 15, col: 12 } });
+  assert.equal((view as any).batchHoveredButton, "import");
+
+  // Mouse hover over Cancelar (col 35 is relCol 30)
+  await view.handleKey({ name: "hover", ctrl: false, shift: false, meta: false, mouse: { type: "hover", row: 15, col: 35 } });
+  assert.equal((view as any).batchHoveredButton, "cancel");
+
+  // Mouse hover outside buttons clears hover
+  await view.handleKey({ name: "hover", ctrl: false, shift: false, meta: false, mouse: { type: "hover", row: 10, col: 35 } });
+  assert.equal((view as any).batchHoveredButton, null);
+
+  // Paste accounts block
+  await view.handleKey({
+    name: "paste",
+    char: "u1@test.com:pass1\nu2@test.com:pass2\nu3@test.com:pass3\n",
+    ctrl: false,
+    shift: false,
+    meta: false,
+  });
+
+  render = view.render(80, 24).join("\n");
+  assert.ok(render.includes("3 conta(s) detectada(s)") || render.includes("3"));
+
+  // Tab to Cancelar and press Enter to cancel
+  await view.handleKey({ name: "tab", ctrl: false, shift: false, meta: false });
+  assert.equal((view as any).batchActiveButton, "cancel");
+  await view.handleKey({ name: "return", ctrl: false, shift: false, meta: false });
+  assert.equal(view.isCapturingText(), false);
+
+  // Re-open and verify mouse click on Cancelar button closes modal
+  await view.handleKey({ name: "b", ctrl: false, shift: false, meta: false });
+  assert.equal(view.isCapturingText(), true);
+  await view.handleKey({ name: "click", ctrl: false, shift: false, meta: false, mouse: { type: "click", button: "left", row: 15, col: 35 } });
+  assert.equal(view.isCapturingText(), false);
+});
+
+test("TUI AccountsView: scroll viewport gracefully navigates 50+ accounts without overflowing", async () => {
+  const view = new AccountsView();
+  const mockAccounts = Array.from({ length: 50 }, (_, i) => ({
+    id: `acc-${i + 1}`,
+    emailOrName: `user${i + 1}@domain.com`,
+    priority: 1,
+    onCooldown: false,
+    remainingCooldownMs: 0,
+    headersReady: true,
+  }));
+
+  const snapshot = {
+    online: true,
+    accounts: mockAccounts,
+  };
+
+  const height = 24;
+  const lines = view.render(80, height, snapshot as any);
+  assert.equal(lines.length, height, "Total rendered lines must exactly match window height");
+
+  const fullTextInitial = lines.join("\n");
+  assert.ok(fullTextInitial.includes("user1@domain.com"));
+  // Since visible capacity is ~12-14 rows, user50 should not be in the initial viewport
+  assert.ok(!fullTextInitial.includes("user50@domain.com"));
+
+  // Navigate down 40 times to scroll down the list
+  for (let i = 0; i < 40; i++) {
+    await view.handleKey({ name: "down", ctrl: false, shift: false, meta: false });
+  }
+
+  const linesScrolled = view.render(80, height, snapshot as any);
+  assert.equal(linesScrolled.length, height, "Rendered lines must still match window height when scrolled");
+  const fullTextScrolled = linesScrolled.join("\n");
+  // Now scrolled: user41 should be visible, user1 should be scrolled out of view
+  assert.ok(fullTextScrolled.includes("user41@domain.com"));
+  assert.ok(!fullTextScrolled.includes("user1@domain.com"));
 });

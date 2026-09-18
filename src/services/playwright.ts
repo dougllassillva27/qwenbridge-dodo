@@ -2676,7 +2676,10 @@ export async function withAccountPage<T>(
       return result;
     } catch (error) {
       const message = getErrorMessage(error);
-      if (message.includes("Playwright page operation timed out")) {
+      if (
+        recoverOnTimeout &&
+        message.includes("Playwright page operation timed out")
+      ) {
         console.warn(
           `⏱️  [Playwright] Resetting account context after a stuck page operation: ${accountId}`,
         );
@@ -3337,6 +3340,14 @@ export async function closeAllPlaywright(): Promise<void> {
 
 export function isPlaywrightInitialized(accountId: string): boolean {
   return accountPages.has(accountId);
+}
+
+export function isAccountRecentlyActive(
+  accountId: string,
+  maxIdleMs = 300_000,
+): boolean {
+  const last = lastAccountActivity.get(accountId) ?? 0;
+  return last > 0 && Date.now() - last < maxIdleMs;
 }
 
 /**
