@@ -13,7 +13,7 @@ import {
 import { buildQwenRequestHeaders } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { uploadLargePromptAsFile } from "../routes/upload.ts";
-import { config, type ChatMode } from "../core/config.ts";
+import { config, type ChatMode, isLocalChatMode } from "../core/config.ts";
 import { logger } from "../core/logger.ts";
 import { estimateTokenCount } from "../utils/context-truncation.ts";
 import type {
@@ -2777,10 +2777,7 @@ async function createQwenStreamInternal(
     chatId: chatSessionId || null,
     parentId: actualParentId ?? "",
     chat_id: chatSessionId || null,
-    chat_mode:
-      options?.chatMode === "temp" || options?.chatMode === "temp-thread"
-        ? "local"
-        : "normal",
+    chat_mode: isLocalChatMode(options?.chatMode) ? "local" : "normal",
     model: model,
     parent_id: actualParentId,
     messages: [
@@ -3013,19 +3010,6 @@ async function createQwenStreamInternal(
         const preview = await readResponsePreview(response);
         const htmlBody = isHtmlResponseBody(preview);
         const antiBotChallenge = isWafChallengeResponse(preview);
-        logger.warn(
-          htmlBody || isHtmlResponseContentType(responseContentType)
-            ? "[Qwen] Completion returned HTML instead of SSE"
-            : "[Qwen] Completion returned a non-SSE body",
-          {
-            accountId: accountId ?? "global",
-            chatId: chatSessionId ?? "new",
-            status: response.status,
-            contentType: responseContentType,
-            antiBotChallenge,
-            previewBytes: Buffer.byteLength(preview, "utf8"),
-          },
-        );
 
         if (
           antiBotChallenge &&
@@ -3046,6 +3030,19 @@ async function createQwenStreamInternal(
           continue;
         }
 
+        logger.warn(
+          htmlBody || isHtmlResponseContentType(responseContentType)
+            ? "[Qwen] Completion returned HTML instead of SSE"
+            : "[Qwen] Completion returned a non-SSE body",
+          {
+            accountId: accountId ?? "global",
+            chatId: chatSessionId ?? "new",
+            status: response.status,
+            contentType: responseContentType,
+            antiBotChallenge,
+            previewBytes: Buffer.byteLength(preview, "utf8"),
+          },
+        );
         throw withCreatedChatMetadata(
           new QwenUpstreamError(
             antiBotChallenge
@@ -3090,16 +3087,6 @@ async function createQwenStreamInternal(
         const htmlResponse = isHtmlResponseBody(errText);
         const antiBotChallenge = isWafChallengeResponse(errText);
         if (antiBotChallenge || htmlResponse) {
-          logger.warn(
-            "[Qwen] Completion returned an HTML or anti-bot challenge body instead of SSE.",
-            {
-              accountId: accountId ?? "global",
-              chatId: chatSessionId ?? "new",
-              antiBotChallenge,
-              previewBytes: Buffer.byteLength(errText, "utf8"),
-            },
-          );
-
           if (
             antiBotChallenge &&
             (await retryAfterCaptchaRecovery(
@@ -3119,6 +3106,15 @@ async function createQwenStreamInternal(
             continue;
           }
 
+          logger.warn(
+            "[Qwen] Completion returned an HTML or anti-bot challenge body instead of SSE.",
+            {
+              accountId: accountId ?? "global",
+              chatId: chatSessionId ?? "new",
+              antiBotChallenge,
+              previewBytes: Buffer.byteLength(errText, "utf8"),
+            },
+          );
           throw withCreatedChatMetadata(
             new QwenUpstreamError(
               antiBotChallenge
