@@ -31,6 +31,8 @@ export interface AcquireAccountLeaseOptions {
   label?: string;
   /** AbortController registered with the lease; aborted on session-level replacement. */
   leaseAbortController?: AbortController;
+  /** Parallel-escape lease (own chat): excluded from the active/unemitted session check. */
+  parallelEscape?: boolean;
 }
 
 interface ActiveLeaseInfo {
@@ -56,6 +58,7 @@ interface QueueEntry {
   label: string;
   /** Preserved so latest-wins can abort queued-then-granted leases. */
   leaseAbortController?: AbortController;
+  parallelEscape?: boolean;
 }
 
 interface AccountSlot {
@@ -176,7 +179,7 @@ function releaseSlot(accountId: string): void {
         `🚦 [Server] Stream slot granted | account=${accountId} | waited ${Date.now() - entry.enqueuedAt}ms | ${slot.queue.length} still queued`,
       );
     }
-    entry.resolve(createLease(accountId, entry.label, entry.leaseAbortController));
+    entry.resolve(createLease(accountId, entry.label, entry.leaseAbortController, entry.parallelEscape));
     return; // one at a time to preserve ordering
   }
 
@@ -306,7 +309,7 @@ export function acquireAccountLease(
 
   // Fast path: capacity available
   if (slot.activeLeases.length < config.concurrency.maxStreamsPerAccount) {
-    return Promise.resolve(createLease(accountId, label, options?.leaseAbortController));
+    return Promise.resolve(createLease(accountId, label, options?.leaseAbortController, options?.parallelEscape));
   }
 
   const hasExplicitTimeout =
@@ -326,6 +329,7 @@ export function acquireAccountLease(
       enqueuedAt: Date.now(),
       label,
       leaseAbortController: options?.leaseAbortController,
+      parallelEscape: options?.parallelEscape,
     };
 
     const removeSelf = () => {
@@ -498,6 +502,23 @@ export function hasUnemittedSessionStream(label: string): boolean {
         });
         return true;
       }
+    }
+  }
+  return false;
+}
+
+/**
+ * True when the session has ANY active lease (emitted or not) across any account.
+ * Used to detect concurrent requests (e.g. subagents sharing conversation prefix)
+ * without explicit session keys, routing them to parallelEscape instead of
+ * destroying in-flight streams.
+ */
+export function hasActiveSessionLease(label: string): boolean {
+  for (const slot of slots.values()) {
+    for (const lease of slot.activeLeases) {
+      if (lease.label !== label) continue;
+      if (lease.parallelEscape) continue;
+      return true;
     }
   }
   return false;

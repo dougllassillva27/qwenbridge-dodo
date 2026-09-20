@@ -182,6 +182,39 @@ export function buildChromiumLaunchArgs(viewport: {
   return args;
 }
 
+function getLauncherScreenOffset(): { x: number; y: number } | null {
+  try {
+    const screenFile = path.resolve(process.cwd(), "data", ".launcher_screen.json");
+    if (fs.existsSync(screenFile)) {
+      const content = fs.readFileSync(screenFile, "utf-8");
+      const parsed = JSON.parse(content);
+      if (typeof parsed.x === "number" && typeof parsed.y === "number") {
+        return { x: parsed.x, y: parsed.y };
+      }
+    }
+  } catch {}
+
+  const cx = parseInt(process.env.LAUNCHER_WINDOW_X as string, 10);
+  const cy = parseInt(process.env.LAUNCHER_WINDOW_Y as string, 10);
+  if (!isNaN(cx) && !isNaN(cy)) {
+    return { x: cx, y: cy };
+  }
+  return null;
+}
+
+function clearWindowPlacementPreferences(profilePath: string): void {
+  const prefsPath = path.join(profilePath, "Default", "Preferences");
+  if (fs.existsSync(prefsPath)) {
+    try {
+      const prefs = JSON.parse(fs.readFileSync(prefsPath, "utf-8"));
+      if (prefs?.browser?.window_placement) {
+        delete prefs.browser.window_placement;
+        fs.writeFileSync(prefsPath, JSON.stringify(prefs));
+      }
+    } catch {}
+  }
+}
+
 // Per-account mutexes for browser access. maxHoldMs = 60s: a page operation
 // legitimately takes a few seconds per step, but one exceeding 60s is a stuck
 // browser op (closed context / WAF page swallow) and the account should return
@@ -247,6 +280,7 @@ async function acquireAccountMutex(
   } catch (error) {
     if (
       recoverOnTimeout &&
+      timeoutMs >= 15_000 &&
       error instanceof Error &&
       error.message.startsWith("Mutex[playwright:") &&
       error.message.includes("acquire timeout")
@@ -1425,6 +1459,11 @@ export async function initPlaywrightForAccount(
     const { engine, channel } = resolveBrowserEngine(browserType);
 
     const launchArgs = buildChromiumLaunchArgs(fingerprint.viewport);
+    const screenOffset = getLauncherScreenOffset();
+    if (screenOffset) {
+      clearWindowPlacementPreferences(profilePath);
+      launchArgs.push(`--window-position=${screenOffset.x - 500},${screenOffset.y - 350}`);
+    }
 
     // In Docker with Xvfb (DISPLAY active), run headed on the virtual display to emulate real user rendering
     const effectiveHeadless = process.env.DISPLAY ? false : headless;
@@ -1524,6 +1563,10 @@ export async function initPlaywrightForAccount(
         if (extraPage !== acctPage && extraPage.url() === "about:blank") {
           await extraPage.close({ runBeforeUnload: false }).catch(() => {});
         }
+      }
+
+      if (!effectiveHeadless && screenOffset) {
+        await alignWindowPosition(acctPage, screenOffset.x - 500, screenOffset.y - 350, 600, 400).catch(() => {});
       }
 
 
@@ -1675,6 +1718,11 @@ export async function validateAccountLogin(
     const effectiveHeadless = process.env.DISPLAY ? false : headless;
 
     const launchArgs = buildChromiumLaunchArgs(fingerprint.viewport);
+    const screenOffset = getLauncherScreenOffset();
+    if (screenOffset) {
+      clearWindowPlacementPreferences(profilePath);
+      launchArgs.push(`--window-position=${screenOffset.x - 500},${screenOffset.y - 350}`);
+    }
 
     cleanChromiumSingletonLocks(profilePath);
 
@@ -1743,7 +1791,9 @@ export async function validateAccountLogin(
         existingPages.find((p) => p.url().startsWith(qwenOrigin())) ??
         existingPages[0] ??
         (await acctContext.newPage());
-      if (!effectiveHeadless) {
+      if (!effectiveHeadless && screenOffset) {
+        await alignWindowPosition(acctPage, screenOffset.x - 500, screenOffset.y - 350, 600, 400).catch(() => {});
+      } else if (!effectiveHeadless) {
         await minimizeWindow(acctPage).catch(() => {});
       }
 
@@ -3460,7 +3510,11 @@ async function closePlaywrightContextBestEffort(
     } finally {
       if (browserProcess && !browserProcess.killed) {
         try {
-          browserProcess.kill("SIGKILL");
+          if (process.platform === "win32" && (browserProcess as any)?.pid) {
+            child_process.spawn("taskkill", ["/pid", String((browserProcess as any).pid), "/T", "/F"], { stdio: "ignore" });
+          } else {
+            browserProcess.kill("SIGKILL");
+          }
         } catch {}
       }
     }
@@ -3515,6 +3569,10 @@ export function isPlaywrightAlreadyClosedError(error: unknown): boolean {
     message.includes("session closed") ||
     message.includes("Session closed") ||
     message.includes("Network.setCacheDisabled") ||
+    message.includes("Timed out closing Playwright context") ||
+    message.includes("Timed out closing page") ||
+    message.includes("storageState timed out") ||
+    message.includes("Internal server error, session closed") ||
     message.includes("Protocol error")
   );
 }
@@ -3727,7 +3785,25 @@ export async function getTokenDiagnostics(
     },
   };
 }
-// [Dodo] Funções CDP para gerenciar o estado da janela
+// [Dodo] Funções CDP para gerenciar o posicionamento e estado da janela
+export async function alignWindowPosition(
+  page: any,
+  left: number,
+  top: number,
+  width: number = 600,
+  height: number = 400,
+): Promise<void> {
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    const { windowId } = await cdp.send("Browser.getWindowForTarget");
+    await cdp.send("Browser.setWindowBounds", {
+      windowId,
+      bounds: { left, top, width, height, windowState: "normal" },
+    });
+    await cdp.detach();
+  } catch {}
+}
+
 export async function minimizeWindow(page: any): Promise<void> {
   try {
     const cdp = await page.context().newCDPSession(page);

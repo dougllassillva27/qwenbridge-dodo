@@ -84,8 +84,8 @@ const MAX_ANTI_BOT_ROTATIONS = 1;
  * a stuck account page (closed context / WAF) can otherwise hold each browser
  * op for 60s and keep the personalization mutex blocked for minutes.
  */
-export const PERSONALIZATION_SYNC_DEADLINE_MS = 45_000;
-export const COLD_ACCOUNT_PERSONALIZATION_SYNC_DEADLINE_MS = 60_000;
+export const PERSONALIZATION_SYNC_DEADLINE_MS = 15_000;
+export const COLD_ACCOUNT_PERSONALIZATION_SYNC_DEADLINE_MS = 25_000;
 
 export function computePersonalizationDeadlineMs(
 	accountId: string | undefined,

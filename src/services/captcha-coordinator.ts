@@ -132,7 +132,7 @@ export async function recoverBaxiaCaptcha(
       accountId,
       (page) => solveChallengeOnPage(page, challengeUrl, undefined, accountId),
       solverOperationTimeoutMs,
-      Math.min(config.timeouts.page, 5_000),
+      Math.max(config.timeouts.page, 15_000),
       false,
     );
 

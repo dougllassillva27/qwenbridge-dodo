@@ -80,8 +80,17 @@ export function classifyError(err: unknown): QwenProxyError {
   // Client disconnected before the stream could be created. This is not a
   // server fault: the request has no listener anymore. Classify it as a silent
   // abort (499) so callers neither emit a 500 nor count it as an error.
-  if (err instanceof Error && err.message.includes("client aborted")) {
-    return new ClientAbortedError(err.message);
+  if (err instanceof Error) {
+    const msgLower = err.message.toLowerCase();
+    if (
+      msgLower.includes("client aborted") ||
+      msgLower.includes("premature close") ||
+      msgLower.includes("prematurely closed") ||
+      msgLower.includes("the operation was aborted") ||
+      err.name === "AbortError"
+    ) {
+      return new ClientAbortedError(err.message);
+    }
   }
 
   // Capacity saturation on the bridge's own account pool: this is a "try again

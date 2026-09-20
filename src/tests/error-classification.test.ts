@@ -41,6 +41,21 @@ test("A: typed ClientAbortedError stays ClientAbortedError", () => {
   assert.ok(classified instanceof ClientAbortedError);
 });
 
+test("A: 'Client connection prematurely closed.' classifies as ClientAbortedError (silent 499)", () => {
+  const err = new Error("Client connection prematurely closed.");
+  const classified = classifyError(err);
+  assert.ok(classified instanceof ClientAbortedError);
+  assert.strictEqual(classified.statusCode, 499);
+});
+
+test("A: AbortError classifies as ClientAbortedError (silent 499)", () => {
+  const err = new Error("The operation was aborted");
+  err.name = "AbortError";
+  const classified = classifyError(err);
+  assert.ok(classified instanceof ClientAbortedError);
+  assert.strictEqual(classified.statusCode, 499);
+});
+
 // --- Bug B: an error carrying upstreamStatus=429 must classify as
 // UpstreamRateLimit (429), not fall through to InternalError (500).
 test("B: error with upstreamStatus=429 classifies as UpstreamRateLimit, not 500", () => {

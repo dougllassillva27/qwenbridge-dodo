@@ -2,6 +2,7 @@ import crypto from "crypto";
 import { Hono, type Context } from "hono";
 import { stream as honoStream } from "hono/streaming";
 import { config } from "../../core/config.ts";
+import { logger } from "../../core/logger.ts";
 import { validateAnthropicRequest } from "./validation.ts";
 import {
   translateAnthropicToOpenAI,
@@ -12,6 +13,24 @@ import {
 } from "./translate.ts";
 import type { AnthropicRequest, OpenAIResponse } from "./types.ts";
 import { estimateTokenCount } from "../../utils/context-truncation.ts";
+
+function isClientPrematureCloseOrAbort(error: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  if (!error) return false;
+  const msg = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  const name = error instanceof Error ? error.name : "";
+  return (
+    name === "AbortError" ||
+    msg.includes("client aborted") ||
+    msg.includes("premature close") ||
+    msg.includes("prematurely closed") ||
+    msg.includes("the operation was aborted") ||
+    (msg.includes("fetch failed") && (signal?.aborted || msg.includes("abort"))) ||
+    msg.includes("econnreset") ||
+    msg.includes("epipe") ||
+    msg.includes("socket hang up")
+  );
+}
 
 const app = new Hono();
 
@@ -173,6 +192,10 @@ app.post("/v1/messages", async (c) => {
 
           if (!response.ok) {
             clearInterval(heartbeatInterval);
+            if (response.status === 499 || c.req.raw.signal.aborted) {
+              logger.debug("[Anthropic] Request aborted by client (499)", { requestId });
+              return;
+            }
             const errText = await response.text().catch(() => "");
             console.error(`[Anthropic] Upstream error: ${response.status} ${errText}`);
             await write(
@@ -243,6 +266,10 @@ app.post("/v1/messages", async (c) => {
             `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
           );
         } catch (error: any) {
+          if (isClientPrematureCloseOrAbort(error, c.req.raw.signal)) {
+            logger.debug("[Anthropic] Client stream aborted / closed prematurely", { requestId });
+            return;
+          }
           console.error("❌ [Anthropic] Stream error:", error?.message || error);
           try {
             await write(
@@ -263,6 +290,10 @@ app.post("/v1/messages", async (c) => {
       const response = await dispatchToChat(false);
 
       if (!response.ok) {
+        if (response.status === 499 || c.req.raw.signal.aborted) {
+          logger.debug("[Anthropic] Non-stream request aborted by client (499)", { requestId });
+          return new Response(null, { status: 499 });
+        }
         const errorJson = await response.json().catch(() => null);
         const errorText = errorJson?.error?.message || `HTTP ${response.status}`;
         console.error(`[Anthropic] Upstream error: ${response.status} ${errorText}`);
@@ -291,6 +322,13 @@ app.post("/v1/messages", async (c) => {
       return c.json(anthropicResponse);
     }
   } catch (error: any) {
+    if (isClientPrematureCloseOrAbort(error, c.req.raw.signal)) {
+      logger.debug("[Anthropic] Request aborted by client", {
+        requestId,
+        error: error?.message || String(error),
+      });
+      return new Response(null, { status: 499 });
+    }
     console.error("❌ [Anthropic] Error:", error);
     return anthropicError(
       c,

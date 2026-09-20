@@ -13,6 +13,7 @@ import { acquireUpstreamStream, acquireChatLock } from "./account.ts";
 import {
   abortLeaseBySessionLabel,
   hasUnemittedSessionStream,
+  hasActiveSessionLease,
 } from "../../core/account-concurrency.ts";
 import {
   processNonStreamingResponse,
@@ -213,16 +214,27 @@ export async function chatCompletions(c: Context) {
     // chat's lock for minutes.
     let parallelEscape = false;
     if (ctx.allowThreadReuse && ctx.sessionId) {
-      const superseded = abortLeaseBySessionLabel(ctx.sessionId, {
-        onlyIfEmitted: true,
-      });
+      // Only explicit conversation keys (e.g. OpenAI session_id/conversation_id)
+      // represent a single user intentionally superseding an in-flight turn.
+      // Implicit sessions (e.g. Anthropic /v1/messages or auto-derived threads)
+      // frequently carry concurrent subagents sharing initial message history:
+      // superseding them would kill parallel subagent streams mid-flight.
+      const canSupersede = ctx.hasExplicitConversationKey;
+      const superseded = canSupersede
+        ? abortLeaseBySessionLabel(ctx.sessionId, { onlyIfEmitted: true })
+        : false;
+
       const existingThread = getLogicalThreadState(ctx.sessionId);
       const chatId = existingThread?.chatSessionId;
-      // Escape ONLY when an unemitted stream is actually active (a lease
-      // exists but was protected). No active lease (normal next turn) takes
-      // the regular path.
-      parallelEscape =
-        !!chatId && !superseded && hasUnemittedSessionStream(ctx.sessionId);
+
+      // Escape to own chat if:
+      // 1. An unemitted stream is active (protected from supersede)
+      // 2. OR this is an implicit session (subagent) and ANY stream is already active on this session
+      const hasActiveSession =
+        hasUnemittedSessionStream(ctx.sessionId) ||
+        (!canSupersede && hasActiveSessionLease(ctx.sessionId));
+
+      parallelEscape = !!chatId && !superseded && hasActiveSession;
       if (parallelEscape && logger.isLevelEnabled("info")) {
         console.log(
           `🔀 [Chat] Parallel escape | req=${reqId} | session=${ctx.sessionId} | chat=${chatId?.substring(0, 12)} | own chat`,

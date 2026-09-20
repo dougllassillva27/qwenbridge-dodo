@@ -14,6 +14,7 @@ import {
 } from "../routes/chat/retry-policy.ts";
 import {
   getQwenErrorCode,
+  PersonalizationSyncError,
   QwenNetworkError,
   QwenUpstreamError,
   RetryableQwenStreamError,
@@ -302,6 +303,32 @@ test("classifyRetryAction: superseded request (client aborted) is silent, not re
   assert.equal(variant.retryable, false);
   assert.equal(variant.switchAccount, false);
   assert.equal(variant.reason, "client_abort");
+});
+
+test("classifyRetryAction: PersonalizationSyncError with 401 sets AuthExpired cooldown", () => {
+  const authErr = new PersonalizationSyncError(
+    "401 Unauthorized for account byebye07: session expired or login invalid",
+  );
+  const action = classifyRetryAction(authErr);
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.forceNewChat, true);
+  assert.equal(action.reason, "personalization_sync_failed");
+  assert.equal(action.accountCooldownMs, 300_000);
+  assert.equal(action.accountCooldownReason, "AuthExpired");
+});
+
+test("classifyRetryAction: PersonalizationSyncError with timeout sets PersonalizationTimeout cooldown", () => {
+  const timeoutErr = new PersonalizationSyncError(
+    "personalization sync not confirmed for byebye03: sync timed out after 15000ms",
+  );
+  const action = classifyRetryAction(timeoutErr);
+  assert.equal(action.retryable, true);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.forceNewChat, true);
+  assert.equal(action.reason, "personalization_sync_failed");
+  assert.equal(action.accountCooldownMs, 60_000);
+  assert.equal(action.accountCooldownReason, "PersonalizationTimeout");
 });
 
 test("classifyRetryAction: bare AbortError (idle/upstream) stays retryable", () => {

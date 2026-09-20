@@ -472,10 +472,31 @@ export function classifyRetryAction(
   // unconfirmed sync means this account cannot serve the request as-is —
   // rotate to another account (each attempt re-syncs on its own account).
   if (err instanceof PersonalizationSyncError) {
+    const msgLower = err.message.toLowerCase();
+    const isAuth =
+      msgLower.includes("401") ||
+      msgLower.includes("unauthorized") ||
+      msgLower.includes("não autorizado") ||
+      msgLower.includes("unauthenticated");
+    const isTimeout =
+      msgLower.includes("timed out") ||
+      msgLower.includes("page unavailable") ||
+      msgLower.includes("context or browser has been closed");
+
     return makeRetryAction("personalization_sync_failed", {
       switchAccount: true,
       forceNewChat: true,
       retryAfterMs: baseDelayMs,
+      accountCooldownMs: isAuth
+        ? 300_000
+        : isTimeout
+          ? 60_000
+          : undefined,
+      accountCooldownReason: isAuth
+        ? "AuthExpired"
+        : isTimeout
+          ? "PersonalizationTimeout"
+          : undefined,
     });
   }
 

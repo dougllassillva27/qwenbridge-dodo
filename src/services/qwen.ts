@@ -70,6 +70,7 @@ export {
 import {
   isRetryableFetchErrorMessage,
   RetryableQwenStreamError,
+  PersonalizationSyncError,
   QwenUpstreamError,
   QwenSessionExpiredError,
   QwenUpstreamUnavailableError,
@@ -1652,11 +1653,23 @@ export async function syncQwenRequestPersonalization(
     }
   }
 
-  // Layer 3: Check final result — non-fatal on failure
+  // Layer 3: Check final result
   if (json?.success === false) {
+    const isStillUnauthorized =
+      json?.data?.code === "Unauthorized" ||
+      json?.data?.code === "unauthorized" ||
+      (typeof json?.data?.details === "string" &&
+        json.data.details.includes("401"));
+
     console.warn(
-      `[Qwen] Personalization sync failed (non-fatal) | account=${cacheKey} | response=${raw.slice(0, 200)}`,
+      `[Qwen] Personalization sync failed (${isStillUnauthorized ? "unauthorized" : "non-fatal"}) | account=${cacheKey} | response=${raw.slice(0, 200)}`,
     );
+
+    if (isStillUnauthorized) {
+      throw new PersonalizationSyncError(
+        `401 Unauthorized for account ${cacheKey}: session expired or login invalid`,
+      );
+    }
     return false;
   }
 
