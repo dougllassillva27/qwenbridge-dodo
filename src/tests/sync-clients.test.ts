@@ -102,8 +102,9 @@ test("sync Claude Code: preserves existing settings, adds QwenProxy env, and res
   assert.equal(updated.env.ANTHROPIC_AUTH_TOKEN, "test-token");
   assert.equal(updated.env.ANTHROPIC_MODEL, "qwen3.8-max");
   assert.equal(updated.env.CLAUDE_CODE_MAX_CONTEXT_TOKENS, "1000000");
+  assert.equal(updated.env.CLAUDE_CODE_DISABLE_ARTIFACT, "1");
+  assert.equal(updated.enableArtifact, false);
   assert.equal(updated.model, "qwen3.8-max");
-
   // Restore
   const restored = restoreClaudeCode(filePath, res.backupPath);
   assert.equal(restored.success, true);
@@ -466,5 +467,115 @@ test("inspectClientSyncStatus correctly determines installed and synced states",
   const opencodeExternal = inspectClientSyncStatus("opencode", opencodePath);
   assert.equal(opencodeExternal.installed, true);
   assert.equal(opencodeExternal.synced, false);
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("restoreAllClients: merges state across multiple syncAllClients and supports selective rollback", () => {
+  const tmp = createTempDir();
+  const claudePath = path.join(tmp, "claude-settings.json");
+  const codexPath = path.join(tmp, "codex-config.toml");
+  const stateFilePath = path.join(tmp, "sync-state.json");
+
+  fs.writeFileSync(claudePath, JSON.stringify({ env: { ANTHROPIC_MODEL: "claude-3-opus" } }), "utf-8");
+  fs.writeFileSync(codexPath, `model = "gemini-flash"\nmodel_provider = "custom"\n`, "utf-8");
+
+  // Sync 1: Claude Code only
+  syncAllClients({
+    targets: ["claude-code"],
+    customPaths: { claudeCode: claudePath, codex: codexPath } as any,
+    stateFilePath,
+  });
+
+  // Sync 2: Codex only (must merge into stateFilePath, not overwrite Claude!)
+  syncAllClients({
+    targets: ["codex"],
+    customPaths: { claudeCode: claudePath, codex: codexPath } as any,
+    stateFilePath,
+  });
+
+  const state = JSON.parse(fs.readFileSync(stateFilePath, "utf-8"));
+  assert.ok(state.clients.claudeCode, "State must retain claudeCode");
+  assert.ok(state.clients.codex, "State must retain codex");
+
+  // Selective Restore: Codex only
+  const resCodex = restoreAllClients({
+    targets: ["codex"],
+    stateFilePath,
+  });
+  assert.equal(resCodex.restoredCount, 1);
+  assert.equal(inspectClientSyncStatus("codex", codexPath).synced, false);
+  assert.equal(inspectClientSyncStatus("claude-code", claudePath).synced, true);
+
+  // State file must still have claudeCode
+  const stateAfterSelective = JSON.parse(fs.readFileSync(stateFilePath, "utf-8"));
+  assert.ok(stateAfterSelective.clients.claudeCode, "Claude must remain in state");
+  assert.equal(stateAfterSelective.clients.codex, undefined, "Codex must be removed from state");
+
+  // Restore remaining
+  const resRemaining = restoreAllClients({ stateFilePath });
+  assert.equal(resRemaining.restoredCount, 1);
+  assert.equal(inspectClientSyncStatus("claude-code", claudePath).synced, false);
+  assert.equal(fs.existsSync(stateFilePath), false, "State file unlinked when all restored");
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("sync Claude Code: supports custom model and removes 1M Context suffix for minimalist display", () => {
+  const tmp = createTempDir();
+  const filePath = path.join(tmp, "settings.json");
+
+  const res = syncClaudeCode({
+    filePath,
+    apiKey: "test-token",
+    baseUrl: "http://127.0.0.1:7936",
+    model: "qwen3.8-omni-flash",
+  });
+  assert.equal(res.success, true);
+
+  const updated = JSON.parse(fs.readFileSync(filePath, "utf-8"));
+  assert.equal(updated.env.ANTHROPIC_MODEL, "qwen3.8-omni-flash");
+  assert.equal(updated.env.ANTHROPIC_CUSTOM_MODEL_OPTION, "qwen3.8-omni-flash");
+  assert.equal(updated.env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, "Qwen 3.8 Omni Flash");
+  assert.equal(updated.env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION, "QwenProxy qwen3.8-omni-flash");
+  assert.ok(!updated.env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME.includes("1M Context"));
+  assert.ok(!updated.env.ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION.includes("1M context window"));
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test("syncAllClients: respects custom model parameter across multiple clients", () => {
+  const tmp = createTempDir();
+  const claudePath = path.join(tmp, ".claude", "settings.json");
+  const codexPath = path.join(tmp, ".codex", "config.toml");
+  const openCodePath = path.join(tmp, ".opencode", "config.json");
+
+  const syncResult = syncAllClients({
+    model: "qwen3.8-omni-flash",
+    targets: ["claude-code", "codex", "opencode"],
+    customPaths: {
+      claudeCode: claudePath,
+      codex: codexPath,
+      openCode: openCodePath,
+    },
+  });
+
+  assert.equal(syncResult.clients.claudeCode?.success, true);
+  assert.equal(syncResult.clients.codex?.success, true);
+  assert.equal(syncResult.clients.openCode?.success, true);
+
+  // Verify Claude Code
+  const claudeData = JSON.parse(fs.readFileSync(claudePath, "utf-8"));
+  assert.equal(claudeData.env.ANTHROPIC_MODEL, "qwen3.8-omni-flash");
+  assert.equal(claudeData.env.ANTHROPIC_CUSTOM_MODEL_OPTION_NAME, "Qwen 3.8 Omni Flash");
+
+  // Verify Codex
+  const codexContent = fs.readFileSync(codexPath, "utf-8");
+  assert.ok(codexContent.includes('model = "qwen3.8-omni-flash"'));
+
+  // Verify OpenCode
+  const openCodeData = JSON.parse(fs.readFileSync(openCodePath, "utf-8"));
+  assert.ok(openCodeData.provider.qwenproxy.models["qwen3.8-omni-flash"]);
+  assert.equal(openCodeData.provider.qwenproxy.models["qwen3.8-omni-flash"].name, "Qwen 3.8 Omni Flash");
+
   fs.rmSync(tmp, { recursive: true, force: true });
 });

@@ -1703,6 +1703,12 @@ export class StreamingToolParser {
       result.text += literalBlock;
     }
 
+    // Count undeclared/malformed tool calls toward the per-turn cap.
+    // Without this, the model can generate unlimited undeclared tool calls
+    // (e.g. Qwen-native WebSearch/WebFetch) that bypass the cap entirely,
+    // causing infinite generation until TOTAL_REQUEST_TIMEOUT (10 min).
+    this.emittedToolCallCount++;
+
     this.advanceMarkdownState(literalBlock);
     this.pendingLeadIn = "";
   }
@@ -2043,18 +2049,23 @@ export class StreamingToolParser {
             recoveryAttempts: truncRecoveryAttempts,
           });
           logger.warn(
-            "[parser] Dropping unrecoverable unclosed tool call at end of stream",
-            {
-              toolName,
-              category: "truncated",
-              contentLength: trimmed.length,
-              content: trimmed.substring(0, 2000),
-              failureReason:
-                "stream ended before tool_call closing tag; content too incomplete to reconstruct",
-              recoveryAttempts: truncRecoveryAttempts,
-              emittedToolCallsSoFar: this.emittedToolCallCount,
-            },
+            `[parser] Dropping unrecoverable unclosed tool call (${toolName || "unknown"}) at end of stream: stream ended before closing tag (${trimmed.length} chars)`,
           );
+          if (isToolcallDebugEnabled()) {
+            logger.debug(
+              "[parser] Unclosed tool call payload details",
+              {
+                toolName,
+                category: "truncated",
+                contentLength: trimmed.length,
+                content: trimmed.substring(0, 2000),
+                failureReason:
+                  "stream ended before tool_call closing tag; content too incomplete to reconstruct",
+                recoveryAttempts: truncRecoveryAttempts,
+                emittedToolCallsSoFar: this.emittedToolCallCount,
+              },
+            );
+          }
           if (
             this.emittedToolCallCount === 0 &&
             this.pendingLeadIn.trim().length > 0
@@ -2442,18 +2453,24 @@ export class StreamingToolParser {
       recoveryAttempts,
     });
 
-    logger.warn(
-      `[parser] Dropping malformed tool call (${t.length} chars): ${t.substring(0, 80).replace(/\n/g, " ")}...`,
-      {
-        toolName: droppedToolName,
-        category: "malformed",
-        contentLength: t.length,
-        content: t.substring(0, 2000),
-        failureReason: "all recovery stages failed to produce valid JSON",
-        recoveryAttempts,
-        declaredTools: [...this.declaredToolNames].slice(0, 10),
-      },
-    );
+    if (isToolcallDebugEnabled()) {
+      logger.warn(
+        `[parser] Dropping malformed tool call (${t.length} chars): ${t.substring(0, 80).replace(/\n/g, " ")}...`,
+        {
+          toolName: droppedToolName,
+          category: "malformed",
+          contentLength: t.length,
+          content: t.substring(0, 2000),
+          failureReason: "all recovery stages failed to produce valid JSON",
+          recoveryAttempts,
+          declaredTools: [...this.declaredToolNames].slice(0, 10),
+        },
+      );
+    } else {
+      logger.warn(
+        `[parser] Dropping malformed tool call (${t.length} chars)${droppedToolName ? ` [${droppedToolName}]` : ""}: ${t.substring(0, 80).replace(/\n/g, " ")}...`,
+      );
+    }
     if (
       this.emittedToolCallCount === 0 &&
       this.pendingLeadIn.trim().length > 0
@@ -3007,8 +3024,24 @@ export class StreamingToolParser {
   private parseToolCall(parsed: any): ParsedToolCall | null {
     if (!parsed || typeof parsed !== "object") return null;
 
-    const name =
+    let name =
       parsed.name || parsed.function?.name || parsed.tool_name || parsed.tool;
+    if (!name || typeof name !== "string" || name.length === 0) {
+      const candidateArgs =
+        parsed.arguments ||
+        parsed.function?.arguments ||
+        parsed.args ||
+        parsed.parameters ||
+        parsed.input ||
+        parsed;
+      const parsedCandidateArgs =
+        typeof candidateArgs === "string"
+          ? parseJsonishString(candidateArgs) ?? {}
+          : typeof candidateArgs === "object" && candidateArgs !== null
+            ? candidateArgs
+            : {};
+      name = inferToolNameFromParameters(parsedCandidateArgs, this.tools);
+    }
     if (!name || typeof name !== "string" || name.length === 0) return null;
 
     // Drop hallucinated tool calls where the model split a value vertically

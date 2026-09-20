@@ -6,14 +6,13 @@
 import { config } from "../core/config.ts";
 import { startServer, stopServer } from "../api/server.ts";
 import { stripAnsi } from "./theme.ts";
-export type ServerLifecycleState = "offline" | "warming" | "online" | "error";
 
+export type ServerLifecycleState = "offline" | "warming" | "online" | "error";
 export interface ServerLogEntry {
   time: string;
   level: "INFO" | "WARN" | "ERROR";
   message: string;
 }
-
 export class ServerManager {
   private static instance: ServerManager | null = null;
 
@@ -127,19 +126,18 @@ export class ServerManager {
       }
 
       this.logEntries.push({ time, level, message: line });
-      if (this.logEntries.length > 500) {
+      if (this.logEntries.length > 2000) {
         this.logEntries.shift();
       }
 
       const levelTag = level === "ERROR" ? "[ERR]" : level === "WARN" ? "[WARN]" : "";
       const formatted = `[${time}] ${levelTag ? levelTag + " " : ""}${line}`;
       this.logBuffer.push(formatted);
-      if (this.logBuffer.length > 500) {
+      if (this.logBuffer.length > 2000) {
         this.logBuffer.shift();
       }
     }
   }
-
   public interceptLogs(): void {
     if (this.intercepted) return;
     this.intercepted = true;
