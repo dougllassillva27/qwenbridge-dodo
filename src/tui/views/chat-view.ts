@@ -341,8 +341,9 @@ export class ChatView implements TuiView {
     if (this.isEffortModalOpen) {
       if (key.name === "hover" && key.mouse) {
         const { row } = key.mouse;
-        if (row >= 9 && row < 9 + this.availableEfforts.length) {
-          const hoverIdx = row - 9;
+        const startRow = 12;
+        if (row >= startRow && row < startRow + this.availableEfforts.length) {
+          const hoverIdx = row - startRow;
           if (this.effortSelectedIndex !== hoverIdx) {
             this.effortSelectedIndex = hoverIdx;
             this.onNeedsRender?.();
@@ -352,8 +353,10 @@ export class ChatView implements TuiView {
       }
       if (key.name === "click" && key.mouse) {
         const { row } = key.mouse;
-        if (row >= 9 && row < 9 + this.availableEfforts.length) {
-          this.selectedEffort = this.availableEfforts[row - 9].id;
+        const startRow = 12;
+        if (row >= startRow && row < startRow + this.availableEfforts.length) {
+          const chosenIdx = row - startRow;
+          this.selectedEffort = this.availableEfforts[chosenIdx].id;
           this.isEffortModalOpen = false;
           const currentM = this.availableModels[this.selectedModelIndex];
           saveTuiSettings({
@@ -362,7 +365,7 @@ export class ChatView implements TuiView {
               effort: this.selectedEffort,
             },
           });
-          this.statusNote = `Modelo: ${currentM} | Effort: ${this.availableEfforts[row - 9].label}`;
+          this.statusNote = `Modelo: ${currentM} | Effort: ${this.availableEfforts[chosenIdx].label}`;
           this.onNeedsRender?.();
           return true;
         }
@@ -410,7 +413,7 @@ export class ChatView implements TuiView {
     if (this.isModeModalOpen) {
       if (key.name === "hover" && key.mouse) {
         const { row } = key.mouse;
-        const startRow = 11;
+        const startRow = 12;
         if (row >= startRow && row < startRow + this.availableModes.length) {
           const hoverIdx = row - startRow;
           if (this.modeSelectedIndex !== hoverIdx) {
@@ -422,9 +425,10 @@ export class ChatView implements TuiView {
       }
       if (key.name === "click" && key.mouse) {
         const { row } = key.mouse;
-        const startRow = 11;
+        const startRow = 12;
         if (row >= startRow && row < startRow + this.availableModes.length) {
-          this.selectedChatMode = this.availableModes[row - startRow].id;
+          const chosenIdx = row - startRow;
+          this.selectedChatMode = this.availableModes[chosenIdx].id;
           this.isModeModalOpen = false;
           setRuntimeChatMode(this.selectedChatMode);
           saveTuiSettings({
@@ -1091,47 +1095,42 @@ export class ChatView implements TuiView {
         }
       }
       for (const msg of this.messages) {
-        chatContent.push("");
         if (msg.role === "user") {
-          const userLines = msg.content.split(/\r?\n/);
-          for (let u = 0; u < userLines.length; u++) {
-            if (u === 0) {
-              chatContent.push(`  ${theme.blue(glyphs.pointer + " Você:")} ${theme.white(userLines[u])}`);
-            } else {
-              chatContent.push(`    ${theme.white(userLines[u])}`);
-            }
+          chatContent.push("");
+          const cardW = Math.max(20, innerChatW - 4);
+          const userLines = wrapContentLine(msg.content, cardW - 4);
+
+          // Top padding inside user card (gives height and breathability)
+          chatContent.push(`  ${theme.cyan("▌")}${theme.bgUserCard(" ".repeat(cardW))}`);
+
+          // Content lines with distinct lighter background
+          for (const u of userLines) {
+            chatContent.push(
+              `  ${theme.cyan("▌")}${theme.bgUserCard("   " + pad(theme.bold(theme.white(u)), cardW - 3))}`,
+            );
           }
+
+          // Bottom padding inside user card
+          chatContent.push(`  ${theme.cyan("▌")}${theme.bgUserCard(" ".repeat(cardW))}`);
+          chatContent.push("");
         } else {
           const messageModel = msg.model || currentModel;
-          chatContent.push(`  ${theme.green(glyphs.bullet + " Qwen (" + messageModel + "):")}`);
-          // 1. Dedicated Thinking (Reasoning) Container - Opaque, Dimmed, and Cached
+
+          // 1. OpenCode-style Thinking (Reasoning): Clean, indented, dimmed and unboxed
           if (msg.reasoning && msg.reasoning.trim().length > 0) {
-            const thinkWidth = Math.max(20, innerChatW - 4);
-            let thinkLines: string[];
-            if (msg.cachedWidth === innerChatW && msg.cachedReasoningBox) {
-              thinkLines = msg.cachedReasoningBox;
+            chatContent.push("");
+            const isStillThinking = this.isGenerating && !msg.content && this.messages.indexOf(msg) === this.messages.length - 1;
+            const spinner = this.spinnerFrames[this.spinnerIndex] || "⠋";
+
+            if (isStillThinking) {
+              chatContent.push(`    ${theme.yellow(`🧠 ${spinner} Raciocinando...`)}`);
             } else {
-              const rLines = formatReasoning(msg.reasoning, thinkWidth - 4).map((l) => ` ${l}`);
-              if (this.isGenerating && !msg.content && this.messages.indexOf(msg) === this.messages.length - 1) {
-                const spinner = this.spinnerFrames[this.spinnerIndex] || "⠋";
-                rLines.push("");
-                rLines.push(` ${theme.yellow(`${spinner} Raciocinando...`)}`);
-              }
-              thinkLines = drawBox({
-                title: "🧠 Raciocínio",
-                width: thinkWidth,
-                borderColor: theme.borderInactive,
-                titleColor: theme.muted,
-                content: rLines,
-              });
-              if (!this.isGenerating) {
-                msg.cachedReasoningBox = thinkLines;
-                msg.cachedWidth = innerChatW;
-              }
+              chatContent.push(`    ${theme.yellow("🧠 Raciocínio:")}`);
             }
 
-            for (const line of thinkLines) {
-              chatContent.push(`  ${line}`);
+            const rLines = formatReasoning(msg.reasoning, innerChatW - 8);
+            for (const r of rLines) {
+              chatContent.push(`      ${r}`);
             }
             chatContent.push("");
           }
@@ -1156,11 +1155,18 @@ export class ChatView implements TuiView {
             chatContent.push(`    ${theme.yellow(`${spinner} Pensando...`)}`);
           }
 
-          if (msg.totalTimeMs) {
+          // 3. OpenCode-style execution badge with model and timing metadata
+          const isDoneGenerating = !this.isGenerating || this.messages.indexOf(msg) !== this.messages.length - 1;
+          if (isDoneGenerating && (msg.content || msg.reasoning)) {
+            const timingStr = msg.totalTimeMs
+              ? ` ${theme.dim("·")} ${theme.dim(`${(msg.totalTimeMs / 1000).toFixed(2)}s`)}${msg.ttfbMs ? ` ${theme.dim(`(TTFB ${msg.ttfbMs}ms)`)}` : ""}`
+              : "";
+            chatContent.push("");
             chatContent.push(
-              `    ${theme.dim(`[TTFB: ${msg.ttfbMs}ms | Total: ${(msg.totalTimeMs / 1000).toFixed(2)}s]`)}`,
+              `    ${theme.cyan("▣")} ${theme.bold("Qwen")} ${theme.dim("·")} ${theme.cyan(messageModel)}${timingStr}`,
             );
           }
+          chatContent.push("");
         }
       }
 
@@ -1262,13 +1268,18 @@ export class ChatView implements TuiView {
       ? `${spinner} Gerando... (Esc para cancelar)`
       : actionLabel;
 
+    const defaultFooter = `${currentModel} · ${isReasoning ? `Effort: ${this.selectedEffort}` : currentInfo.category} · Modo: ${this.selectedChatMode}`;
+    const inputFooter = this.statusNote
+      ? stripAnsi(this.statusNote)
+      : defaultFooter;
+
     const inputBox = drawBox({
       title: inputTitle,
       width,
       height: 3,
       borderColor: this.isGenerating ? theme.yellow : theme.borderActive,
       titleColor: this.isGenerating ? theme.yellow : theme.cyan,
-      footer: this.statusNote ? stripAnsi(this.statusNote) : undefined,
+      footer: inputFooter,
       content: inputContent,
     });
     totalLines.push(...inputBox);

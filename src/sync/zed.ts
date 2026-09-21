@@ -64,58 +64,18 @@ function parseJsonWithComments(raw: string): Record<string, any> {
   return JSON.parse(cleaned);
 }
 
-function buildZedAvailableModels(primaryModel: string = "qwen3.8-max"): any[] {
-  const models = [
-    {
-      name: primaryModel,
-      max_tokens: 1000000,
-      max_output_tokens: 131072,
-      max_completion_tokens: 131072,
-      capabilities: {
-        tools: true,
-        images: true,
-        parallel_tool_calls: true,
-        prompt_cache_key: true,
-        chat_completions: true,
-        interleaved_reasoning: true,
-      },
-    },
-    {
-      name: `${primaryModel}-thinking`,
-      max_tokens: 1000000,
-      max_output_tokens: 131072,
-      max_completion_tokens: 131072,
-      capabilities: {
-        tools: true,
-        images: true,
-        parallel_tool_calls: true,
-        prompt_cache_key: true,
-        chat_completions: true,
-        interleaved_reasoning: true,
-      },
-    },
-    {
-      name: `${primaryModel}-fast`,
-      max_tokens: 1000000,
-      max_output_tokens: 131072,
-      max_completion_tokens: 131072,
-      capabilities: {
-        tools: true,
-        images: true,
-        parallel_tool_calls: true,
-        prompt_cache_key: true,
-        chat_completions: true,
-        interleaved_reasoning: true,
-      },
-    },
-  ];
+function buildZedAvailableModels(primaryModel: string = "qwen3.8-max", models?: string[]): any[] {
+  const modelList = Array.from(
+    new Set([primaryModel, ...(models && models.length > 0 ? models : [primaryModel, "qwen3.7-plus"])].filter(Boolean)),
+  );
+  const zedModels: any[] = [];
 
-  if (primaryModel !== "qwen3.7-plus") {
-    models.push({
-      name: "qwen3.7-plus",
+  for (const m of modelList) {
+    zedModels.push({
+      name: m,
       max_tokens: 1000000,
-      max_output_tokens: 65536,
-      max_completion_tokens: 65536,
+      max_output_tokens: 131072,
+      max_completion_tokens: 131072,
       capabilities: {
         tools: true,
         images: true,
@@ -125,13 +85,45 @@ function buildZedAvailableModels(primaryModel: string = "qwen3.8-max"): any[] {
         interleaved_reasoning: true,
       },
     });
+    if (m === primaryModel) {
+      zedModels.push(
+        {
+          name: `${m}-thinking`,
+          max_tokens: 1000000,
+          max_output_tokens: 131072,
+          max_completion_tokens: 131072,
+          capabilities: {
+            tools: true,
+            images: true,
+            parallel_tool_calls: true,
+            prompt_cache_key: true,
+            chat_completions: true,
+            interleaved_reasoning: true,
+          },
+        },
+        {
+          name: `${m}-fast`,
+          max_tokens: 1000000,
+          max_output_tokens: 131072,
+          max_completion_tokens: 131072,
+          capabilities: {
+            tools: true,
+            images: true,
+            parallel_tool_calls: true,
+            prompt_cache_key: true,
+            chat_completions: true,
+            interleaved_reasoning: true,
+          },
+        },
+      );
+    }
   }
-
-  return models;
+  return zedModels;
 }
 
+
 export function syncZed(options: SyncOptions): ClientSyncResult {
-  const { filePath, baseUrl, model = "qwen3.8-max", setActive = true } = options;
+  const { filePath, baseUrl, model = "qwen3.8-max", models, setActive = true } = options;
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
 
@@ -153,7 +145,7 @@ export function syncZed(options: SyncOptions): ClientSyncResult {
 
     openaiCompatible.QwenProxy = {
       api_url: baseUrl,
-      available_models: buildZedAvailableModels(model),
+      available_models: buildZedAvailableModels(model, models),
     };
 
     const updatedSettings: Record<string, any> = {
@@ -198,13 +190,37 @@ export function syncZed(options: SyncOptions): ClientSyncResult {
 }
 
 export function restoreZed(filePath: string, backupPath?: string): ClientSyncResult {
-  const restored = restoreFromBackup(filePath, backupPath);
+  const restoredFromBackup = restoreFromBackup(filePath, backupPath);
+
+  let manuallyCleaned = false;
+  if (fs.existsSync(filePath)) {
+    try {
+      let content = fs.readFileSync(filePath, "utf-8");
+      if (content.includes("127.0.0.1:7936") || content.includes("qwen3.8-max")) {
+        const data = parseJsonWithComments(content);
+        if (data.language_models?.openai?.api_url?.includes("7936")) {
+          delete data.language_models.openai;
+          if (Object.keys(data.language_models).length === 0) {
+            delete data.language_models;
+          }
+          fs.writeFileSync(filePath, JSON.stringify(data, null, 2) + "\n", "utf-8");
+          manuallyCleaned = true;
+        }
+      }
+    } catch {}
+  }
+
+  const success = restoredFromBackup || manuallyCleaned;
   return {
     client: "zed",
     filePath,
     backupPath,
-    success: restored,
-    action: restored ? "restored" : "failed",
-    message: restored ? "Restored Zed settings from backup" : "Backup file not found",
+    success,
+    action: success ? "restored" : "failed",
+    message: success
+      ? restoredFromBackup
+        ? "Restored Zed settings from backup"
+        : "Removed QwenProxy configuration from Zed settings"
+      : "Backup file not found",
   };
 }

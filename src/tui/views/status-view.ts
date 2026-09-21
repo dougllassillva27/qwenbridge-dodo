@@ -7,7 +7,7 @@ import type { KeyEvent } from "../screen.ts";
 import { theme, glyphs, drawBox, pad, truncate, setClipboardText } from "../theme.ts";
 import { fetchProxyStatus, resetAllCooldowns, formatUptime } from "../proxy-client.ts";
 import { ServerManager } from "../server-manager.ts";
-import { getRuntimeChatMode, cycleNextChatMode } from "../../core/config.ts";
+import { config, getRuntimeChatMode, cycleNextChatMode } from "../../core/config.ts";
 import { saveTuiSettings } from "../settings.ts";
 
 export function renderProgressBar(
@@ -64,7 +64,7 @@ export class StatusView implements TuiView {
   private isBaseUrlHovered = false;
   private copiedRecently = false;
   private copiedTimeout: NodeJS.Timeout | null = null;
-  private lastBaseUrl = "http://127.0.0.1:7936/v1";
+  private lastBaseUrl = `http://127.0.0.1:${config.server.port || 7936}/v1`;
   private lastBaseUrlRow = 6;
   private lastModoApiRow = 7;
   private lastLeftW = 38;
@@ -235,7 +235,7 @@ export class StatusView implements TuiView {
 
     const uptimeSecs = data?.uptimeSeconds || Math.floor(process.uptime());
     const uptimeStr = formatUptime(uptimeSecs);
-    const baseUrl = `http://${data?.host || "127.0.0.1"}:${data?.port || 7936}/v1`;
+    const baseUrl = `http://${data?.host || "127.0.0.1"}:${data?.port || config.server.port || 7936}/v1`;
     this.lastBaseUrl = baseUrl;
     this.lastBaseUrlRow = 6;
     this.lastModoApiRow = 7;
@@ -271,16 +271,11 @@ export class StatusView implements TuiView {
     if (data?.waitingStreams && data.waitingStreams > 0) {
       connsStr += theme.peach(` (${data.waitingStreams} na fila)`);
     }
-    const fitsBadge = innerLeftW >= 15 + baseUrl.length + 11;
     let urlDisplay: string;
     if (this.copiedRecently) {
-      urlDisplay = fitsBadge
-        ? `${theme.bold(theme.green(baseUrl))} ${theme.bold(theme.green("✓ Copiado!"))}`
-        : theme.bold(theme.green(baseUrl));
+      urlDisplay = theme.bold(theme.green(baseUrl));
     } else if (this.isBaseUrlHovered) {
-      urlDisplay = fitsBadge
-        ? `${theme.bgHover(` ${theme.bold(theme.white(baseUrl))} `)} ${theme.cyan("📋 Copiar")}`
-        : theme.bgHover(` ${theme.bold(theme.white(baseUrl))} `);
+      urlDisplay = theme.bold(theme.underline(theme.cyan(baseUrl)));
     } else {
       urlDisplay = theme.cyan(baseUrl);
     }

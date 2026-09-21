@@ -187,14 +187,14 @@ const envSchema = z
     QWEN_BROWSER_ONLY_FETCH: z.string().default("true"),
     QWEN_MAP_OPENAI_MODELS: z.string().default("true"),
     QWEN_MAX_PROMPT_BYTES: z.string().default("0"),
-    QWEN_MAX_PERSONALIZATION_BYTES: z.string().default("200000"),
+    QWEN_MAX_PERSONALIZATION_BYTES: z.string().default("500000"),
     CONTEXT_METER_ENABLED: z.string().default("true"),
     CONTEXT_METER_WINDOW_TOKENS: z.string().default("0"),
     CONTEXT_METER_REPORT_USAGE: z.string().default("true"),
     DELETE_ALL_CHATS_ON_SHUTDOWN: z.string().default("false"),
     AUTO_CLEAN_CHATS_ON_STARTUP: z.string().default("true"),
     AUTO_CLEAN_ORPHAN_CHATS: z.string().default("true"),
-    AUTO_CLEAN_CHAT_MAX_AGE_HOURS: z.string().default("24"),
+    AUTO_CLEAN_CHAT_MAX_AGE_HOURS: z.string().default("168"),
     // The Baxia WAF scores live page behavior (pointer/scroll events, open
     // session) — an account whose page sits frozen for minutes returns a low
     // trust score and gets TMD-challenged on the next request. On by default;
@@ -413,7 +413,7 @@ export const config = {
     autoCleanOrphanChats: env.AUTO_CLEAN_ORPHAN_CHATS !== "false",
     autoCleanChatMaxAgeHours: Math.max(
       1,
-      parseInt(env.AUTO_CLEAN_CHAT_MAX_AGE_HOURS) || 24,
+      parseInt(env.AUTO_CLEAN_CHAT_MAX_AGE_HOURS) || 168,
     ),
     sendBxUa: env.QWEN_SEND_BX_UA === "true",
     /** Deployed web bundle version sent as the `version` API header. */

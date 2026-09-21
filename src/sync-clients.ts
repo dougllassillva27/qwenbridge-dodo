@@ -19,6 +19,7 @@ function parseArgs() {
     host?: string;
     setActive: boolean;
     targets: SyncClientName[];
+    model?: string;
   } = {
     restore: false,
     list: false,
@@ -43,6 +44,8 @@ function parseArgs() {
       options.host = args[++i];
     } else if (arg === "--no-active") {
       options.setActive = false;
+    } else if ((arg === "--model" || arg === "-m") && args[i + 1]) {
+      options.model = args[++i];
     } else if (arg === "--client" && args[i + 1]) {
       const normalized = normalizeClientName(args[++i]);
       if (normalized) options.targets.push(normalized);
@@ -73,11 +76,12 @@ Exemplos:
   npm run sync zed            # Sincroniza apenas o Zed Editor
   npm run sync aider          # Sincroniza apenas o Aider
   npm run sync claude codex   # Sincroniza múltiplos clientes específicos
-  npm run sync -- --list      # Lista status de detecção de todos os 10 clientes
-  npm run sync -- --restore   # Restaura as configurações originais (rollback)
+  npm run sync --list         # Lista status de detecção de todos os 10 clientes (ou qpx sync --list)
+  npm run sync --restore      # Restaura as configurações originais (ou qpx sync --restore)
 
 Opções:
   --client <nome>    Nome do cliente (hermes, opencode, claude, openclaw, kilo, cline, omp, codex, zed, aider)
+  --model <modelo>   Modelo padrão a configurar (padrão: qwen3.8-max)
   --api-key <chave>  Sobrescrever chave de API (padrão: lê do .env ou usa sk-qwenproxy-local)
   --port <porta>     Sobrescrever porta do servidor (padrão: lê do .env ou usa 7936)
   --host <host>      Sobrescrever host do servidor (padrão: 127.0.0.1)
@@ -165,6 +169,7 @@ async function main() {
     host: options.host,
     setActive: options.setActive,
     targets: options.targets.length > 0 ? options.targets : undefined,
+    model: options.model,
   });
 
   console.log(`🔑 Chave API:   ${result.apiKey}`);
@@ -193,8 +198,7 @@ async function main() {
   console.log("--------------------------------------------------");
   console.log(`✨ ${count} cliente(s) sincronizado(s) com zero perda de outras configs/provedores!`);
   console.log("💡 Para desfazer e restaurar a qualquer momento:");
-  console.log("   npm run sync -- --restore");
-  console.log("==================================================\n");
+  console.log("   qpx sync --restore (ou npm run sync --restore)");
 }
 
 main().catch((err) => {

@@ -46,4 +46,5 @@ docs/
 *.bat
 *.ps1
 manager.ps1
+.serena/
 message*.txt

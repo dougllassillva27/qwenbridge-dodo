@@ -10,6 +10,7 @@ import type {
   ClientSyncResult,
   SyncAllOptions,
   SyncClientName,
+  SyncRecord,
   SyncStateFile,
 } from "./types.ts";
 import { syncClaudeCode, restoreClaudeCode } from "./claude-code.ts";
@@ -23,6 +24,28 @@ import { syncCline, restoreCline } from "./cline.ts";
 import { syncZed, restoreZed } from "./zed.ts";
 import { syncAider, restoreAider } from "./aider.ts";
 
+export {
+  syncClaudeCode,
+  restoreClaudeCode,
+  syncCodex,
+  restoreCodex,
+  syncOpenCode,
+  restoreOpenCode,
+  syncOmp,
+  restoreOmp,
+  syncHermes,
+  restoreHermes,
+  syncOpenClaw,
+  restoreOpenClaw,
+  syncKilo,
+  restoreKilo,
+  syncCline,
+  restoreCline,
+  syncZed,
+  restoreZed,
+  syncAider,
+  restoreAider,
+};
 export function resolveApiKey(overrideKey?: string, configKey?: string): string {
   if (overrideKey && overrideKey.trim().length > 0) {
     return overrideKey.trim();
@@ -442,6 +465,9 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
   const apiKey = resolveApiKey(options.apiKey, config.apiKey);
   const { anthropicBaseUrl, openaiBaseUrl } = resolveBaseUrls(port, host);
   const stateFilePath = options.stateFilePath || getDefaultStateFilePath();
+  const selectedModel = options.model || "qwen3.8-max";
+  const allModels = options.models && options.models.length > 0 ? options.models : undefined;
+  const syncModels = options.syncAllModels !== false && allModels ? allModels : [selectedModel];
 
   const results: SyncAllResult = {
     apiKey,
@@ -463,6 +489,7 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       filePath: paths.claudeCode,
       apiKey,
       baseUrl: anthropicBaseUrl,
+      model: selectedModel,
     });
     results.clients.claudeCode = claudeRes;
     if (claudeRes.success && claudeRes.backupPath) {
@@ -483,6 +510,7 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       apiKey,
       baseUrl: openaiBaseUrl,
       setActive: options.setActive ?? true,
+      model: selectedModel,
     });
     results.clients.codex = codexRes;
     if (codexRes.success && codexRes.backupPath) {
@@ -502,6 +530,8 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       filePath: paths.openCode,
       apiKey,
       baseUrl: openaiBaseUrl,
+      model: selectedModel,
+      models: syncModels,
     });
     results.clients.openCode = openCodeRes;
     if (openCodeRes.success && openCodeRes.backupPath) {
@@ -521,6 +551,8 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       filePath: paths.omp,
       apiKey,
       baseUrl: openaiBaseUrl,
+      model: selectedModel,
+      models: syncModels,
     });
     results.clients.omp = ompRes;
     if (ompRes.success && ompRes.backupPath) {
@@ -540,6 +572,7 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       filePath: paths.hermes,
       apiKey,
       baseUrl: openaiBaseUrl,
+      model: selectedModel,
     });
     results.clients.hermes = hermesRes;
     if (hermesRes.success && hermesRes.backupPath) {
@@ -559,6 +592,8 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       filePath: paths.openClaw,
       apiKey,
       baseUrl: openaiBaseUrl,
+      model: selectedModel,
+      models: syncModels,
     });
     results.clients.openClaw = openClawRes;
     if (openClawRes.success && openClawRes.backupPath) {
@@ -579,6 +614,8 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       apiKey,
       baseUrl: openaiBaseUrl,
       setActive: options.setActive ?? true,
+      model: selectedModel,
+      models: syncModels,
     });
     results.clients.kilo = kiloRes;
     if (kiloRes.success && kiloRes.backupPath) {
@@ -598,6 +635,7 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       filePath: paths.cline,
       apiKey,
       baseUrl: openaiBaseUrl,
+      model: selectedModel,
     });
     results.clients.cline = clineRes;
     if (clineRes.success && clineRes.backupPath) {
@@ -618,6 +656,8 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       apiKey,
       baseUrl: openaiBaseUrl,
       setActive: options.setActive ?? true,
+      model: selectedModel,
+      models: syncModels,
     });
     results.clients.zed = zedRes;
     if (zedRes.success && zedRes.backupPath) {
@@ -637,6 +677,7 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       filePath: paths.aider,
       apiKey,
       baseUrl: openaiBaseUrl,
+      model: selectedModel,
     });
     results.clients.aider = aiderRes;
     if (aiderRes.success && aiderRes.backupPath) {
@@ -649,16 +690,29 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
     }
   }
 
-  // Persist sync state
+  // Persist sync state (merge with existing state if present)
   try {
     fs.mkdirSync(path.dirname(stateFilePath), { recursive: true });
+    let existingClients: SyncStateFile["clients"] = {};
+    if (fs.existsSync(stateFilePath)) {
+      try {
+        const raw = fs.readFileSync(stateFilePath, "utf-8");
+        const parsed = JSON.parse(raw);
+        if (parsed?.clients && typeof parsed.clients === "object") {
+          existingClients = parsed.clients;
+        }
+      } catch {}
+    }
     const stateContent: SyncStateFile = {
       version: 1,
       updatedAt: new Date().toISOString(),
       apiKey,
       port,
       host,
-      clients: stateRecords,
+      clients: {
+        ...existingClients,
+        ...stateRecords,
+      },
     };
     fs.writeFileSync(stateFilePath, JSON.stringify(stateContent, null, 2) + "\n", "utf-8");
   } catch (err) {
@@ -673,87 +727,79 @@ export interface RestoreAllResult {
   details: ClientSyncResult[];
 }
 
-export function restoreAllClients(options: { stateFilePath?: string } = {}): RestoreAllResult {
+export interface RestoreAllOptions {
+  stateFilePath?: string;
+  targets?: SyncClientName[];
+}
+
+export function restoreAllClients(options: RestoreAllOptions = {}): RestoreAllResult {
+  const defaultPaths = getDefaultPaths();
   const stateFilePath = options.stateFilePath || getDefaultStateFilePath();
   const details: ClientSyncResult[] = [];
   let restoredCount = 0;
 
-  if (!fs.existsSync(stateFilePath)) {
-    return { restoredCount: 0, details };
+  let state: SyncStateFile | null = null;
+  if (fs.existsSync(stateFilePath)) {
+    try {
+      const raw = fs.readFileSync(stateFilePath, "utf-8");
+      state = JSON.parse(raw);
+    } catch {}
   }
 
-  try {
-    const raw = fs.readFileSync(stateFilePath, "utf-8");
-    const state: SyncStateFile = JSON.parse(raw);
+  const shouldRestore = (client: SyncClientName) => {
+    if (!options.targets || options.targets.length === 0) return true;
+    return options.targets.includes(client);
+  };
 
-    if (state.clients.claudeCode?.backupPath) {
-      const res = restoreClaudeCode(state.clients.claudeCode.filePath, state.clients.claudeCode.backupPath);
+  const restoreClientsList: Array<{
+    id: SyncClientName;
+    stateKey: keyof SyncStateFile["clients"];
+    defaultPath: string;
+    stateRecord?: SyncRecord;
+    restoreFn: (filePath: string, backupPath?: string) => ClientSyncResult;
+  }> = [
+    { id: "claude-code", stateKey: "claudeCode", defaultPath: defaultPaths.claudeCode, stateRecord: state?.clients?.claudeCode, restoreFn: restoreClaudeCode },
+    { id: "codex", stateKey: "codex", defaultPath: defaultPaths.codex, stateRecord: state?.clients?.codex, restoreFn: restoreCodex },
+    { id: "opencode", stateKey: "openCode", defaultPath: defaultPaths.openCode, stateRecord: state?.clients?.openCode, restoreFn: restoreOpenCode },
+    { id: "omp", stateKey: "omp", defaultPath: defaultPaths.omp, stateRecord: state?.clients?.omp, restoreFn: restoreOmp },
+    { id: "hermes", stateKey: "hermes", defaultPath: defaultPaths.hermes, stateRecord: state?.clients?.hermes, restoreFn: restoreHermes },
+    { id: "openclaw", stateKey: "openClaw", defaultPath: defaultPaths.openClaw, stateRecord: state?.clients?.openClaw, restoreFn: restoreOpenClaw },
+    { id: "kilo", stateKey: "kilo", defaultPath: defaultPaths.kilo, stateRecord: state?.clients?.kilo, restoreFn: restoreKilo },
+    { id: "cline", stateKey: "cline", defaultPath: defaultPaths.cline, stateRecord: state?.clients?.cline, restoreFn: restoreCline },
+    { id: "zed", stateKey: "zed", defaultPath: defaultPaths.zed, stateRecord: state?.clients?.zed, restoreFn: restoreZed },
+    { id: "aider", stateKey: "aider", defaultPath: defaultPaths.aider, stateRecord: state?.clients?.aider, restoreFn: restoreAider },
+  ];
+
+  for (const c of restoreClientsList) {
+    if (!shouldRestore(c.id)) continue;
+    const filePath = c.stateRecord?.filePath || c.defaultPath;
+    const backupPath = c.stateRecord?.backupPath;
+
+    const canAttempt = options.stateFilePath
+      ? Boolean(c.stateRecord)
+      : Boolean(c.stateRecord || fs.existsSync(filePath));
+
+    if (canAttempt) {
+      const res = c.restoreFn(filePath, backupPath);
       details.push(res);
-      if (res.success) restoredCount++;
+      if (res.success) {
+        restoredCount++;
+        if (state?.clients) {
+          delete state.clients[c.stateKey];
+          delete (state.clients as any)[c.id];
+        }
+      }
     }
-
-    if (state.clients.codex?.backupPath) {
-      const res = restoreCodex(state.clients.codex.filePath, state.clients.codex.backupPath);
-      details.push(res);
-      if (res.success) restoredCount++;
-    }
-
-    if (state.clients.openCode?.backupPath) {
-      const res = restoreOpenCode(state.clients.openCode.filePath, state.clients.openCode.backupPath);
-      details.push(res);
-      if (res.success) restoredCount++;
-    }
-
-    if (state.clients.omp?.backupPath) {
-      const res = restoreOmp(state.clients.omp.filePath, state.clients.omp.backupPath);
-      details.push(res);
-      if (res.success) restoredCount++;
-    }
-
-    if (state.clients.hermes?.backupPath) {
-      const res = restoreHermes(state.clients.hermes.filePath, state.clients.hermes.backupPath);
-      details.push(res);
-      if (res.success) restoredCount++;
-    }
-
-    if (state.clients.openClaw?.backupPath) {
-      const res = restoreOpenClaw(state.clients.openClaw.filePath, state.clients.openClaw.backupPath);
-      details.push(res);
-      if (res.success) restoredCount++;
-    }
-
-    if (state.clients.kilo?.backupPath) {
-      const res = restoreKilo(state.clients.kilo.filePath, state.clients.kilo.backupPath);
-      details.push(res);
-      if (res.success) restoredCount++;
-    }
-
-    if (state.clients.cline?.backupPath) {
-      const res = restoreCline(state.clients.cline.filePath, state.clients.cline.backupPath);
-      details.push(res);
-      if (res.success) restoredCount++;
-    }
-
-    if (state.clients.zed?.backupPath) {
-      const res = restoreZed(state.clients.zed.filePath, state.clients.zed.backupPath);
-      details.push(res);
-      if (res.success) restoredCount++;
-    }
-
-    if (state.clients.aider?.backupPath) {
-      const res = restoreAider(state.clients.aider.filePath, state.clients.aider.backupPath);
-      details.push(res);
-      if (res.success) restoredCount++;
-    }
-
-    // Remove state file after successful restoration
+  }
+  // Update or delete state file
+  if (stateFilePath && fs.existsSync(stateFilePath)) {
     try {
-      fs.unlinkSync(stateFilePath);
-    } catch {
-      // Ignore
-    }
-  } catch (err) {
-    console.error("Error reading sync state file:", err);
+      if (state && state.clients && Object.keys(state.clients).length > 0) {
+        fs.writeFileSync(stateFilePath, JSON.stringify(state, null, 2) + "\n", "utf-8");
+      } else {
+        fs.unlinkSync(stateFilePath);
+      }
+    } catch {}
   }
 
   return { restoredCount, details };
