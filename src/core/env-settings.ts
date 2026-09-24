@@ -11,6 +11,7 @@ const ENV_FILE = process.env.QWENPROXY_ENV_FILE || path.resolve('.env')
 
 const BOOLEAN_KEYS = new Set([
   'HEADLESS',
+  'HEADED_RECOVERY',
   'LOG_CONSOLE',
   'QWEN_GUEST_MODE_ONLY',
   'SINGLE_ACCOUNT_MODE',

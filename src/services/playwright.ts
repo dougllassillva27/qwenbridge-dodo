@@ -80,12 +80,44 @@ import { setFingerprintRotationListener } from "../core/account-isolation.ts";
 import { subtlePageActivity } from "./human-behavior.ts";
 import { solveBaxiaCaptcha } from "./captcha-solver.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
-import { setWafContextResetListener } from "../core/waf-isolation.ts";
+import { setWafContextResetListener, setWafHeadedRecoveryListener } from "../core/waf-isolation.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 
 setFingerprintRotationListener(async (accountId: string) => {
   await closePlaywrightForAccount(accountId).catch(() => {});
+});
+
+setWafHeadedRecoveryListener((accountId: string, cooldownMs: number) => {
+  markAccountForHeadedRecovery(accountId);
+
+  // Schedule a proactive re-init in headed mode once the quarantine expires.
+  // This ensures the automated solver retries immediately with real GPU
+  // rendering, without waiting for the next user request to trigger init.
+  const delayMs = cooldownMs + 3_000; // small buffer for cooldown to fully clear
+  setTimeout(async () => {
+    if (!headedRecoveryAccounts.has(accountId)) return; // already recovered
+    if (accountPages.has(accountId)) return; // already re-initialized
+
+    try {
+      const { getAccountCredentials } = await import("../core/accounts.ts");
+      const creds = getAccountCredentials(accountId);
+      if (!creds) return;
+
+      console.log(
+        `👁️ [Playwright] Proactive headed re-init for ${maskEmail(creds.email)} after quarantine cooldown.`,
+      );
+      await initPlaywrightForAccount(
+        creds,
+        config.playwright.headless,
+        config.playwright.browser,
+      );
+    } catch (err: any) {
+      console.warn(
+        `[Playwright] Proactive headed re-init failed for ${accountId}: ${err?.message}`,
+      );
+    }
+  }, delayMs).unref();
 });
 
 type ContextInitHook = (context: BrowserContext) => Promise<void> | void;
@@ -314,6 +346,33 @@ const accountContexts = new Map<string, BrowserContext>();
 const accountPages = new Map<string, Page>();
 const cachedUserAgents = new Map<string, string>();
 const inFlightAccountInits = new Map<string, Promise<void>>();
+
+// Per-account flag: when true, the next initPlaywrightForAccount opens headed
+// mode regardless of config.playwright.headless, so the automated captcha
+// solver retries with real GPU rendering (better anti-bot evasion). A proactive
+// re-init is scheduled after the quarantine cooldown expires. If even headed
+// mode fails, the visible browser window serves as a last-resort for manual
+// operator intervention.
+const headedRecoveryAccounts = new Set<string>();
+
+/** Mark an account for headed recovery on its next browser initialization. */
+export function markAccountForHeadedRecovery(accountId: string): void {
+  headedRecoveryAccounts.add(accountId);
+  console.warn(
+    `👁️ [Playwright] Account ${accountId} marked for headed recovery — next init will open a visible browser.`,
+  );
+}
+
+/** Clear the headed recovery flag after successful recovery. */
+export function clearHeadedRecovery(accountId: string): void {
+  headedRecoveryAccounts.delete(accountId);
+}
+
+/** Check if an account needs headed recovery. */
+export function needsHeadedRecovery(accountId: string): boolean {
+  return headedRecoveryAccounts.has(accountId);
+}
+
 let sharedBrowser: Browser | null = null;
 let sharedBrowserPromise: Promise<Browser> | null = null;
 
@@ -1478,12 +1537,36 @@ export async function initPlaywrightForAccount(
       launchArgs.push(`--window-position=${screenOffset.x - 500},${screenOffset.y - 350}`);
     }
 
-    // In Docker with Xvfb (DISPLAY active), run headed on the virtual display to emulate real user rendering
-    const effectiveHeadless = process.env.DISPLAY ? false : headless;
+    // In Docker with Xvfb (DISPLAY active), run headed on the virtual display to emulate real user rendering.
+    // When an account is flagged for headed recovery (unsolvable anti-bot challenge),
+    // force headed mode so the operator can intervene manually.
+    const forceHeaded = headedRecoveryAccounts.has(account.id);
+    const effectiveHeadless = forceHeaded
+      ? false
+      : !!process.env.DISPLAY
+        ? false
+        : headless;
+
+    if (effectiveHeadless) {
+      // Force explicit headless flag for Windows/Chrome combinations that might ignore the option object
+      launchArgs.push(channel === "chrome" ? "--headless=new" : "--headless");
+    }
+
+    if (forceHeaded) {
+      console.warn(
+        `👁️ [Playwright] Opening HEADED browser for ${maskEmail(account.email)} — manual anti-bot recovery needed.`,
+      );
+    }
 
     console.log(
       `🌐 [Playwright] Launching browser | account=${maskEmail(account.email)} | headless=${effectiveHeadless} | browser=${browserType}`,
     );
+
+    if (process.env.LOG_LEVEL === "true" || process.env.LOG_LEVEL === "debug") {
+      console.log(`[DEBUG-HEADLESS] forceHeaded=${forceHeaded}, effectiveHeadless=${effectiveHeadless}`);
+      console.log(`[DEBUG-HEADLESS] channel=${channel}, headless option passed=${effectiveHeadless}`);
+      console.log(`[DEBUG-HEADLESS] launchArgs:`, launchArgs.filter(a => a.includes('headless')));
+    }
 
     cleanChromiumSingletonLocks(profilePath);
 
@@ -1680,6 +1763,15 @@ export async function initPlaywrightForAccount(
         } catch {
           // Non-fatal: the next normal operation will navigate back.
         }
+      }
+
+      // If this account was in headed recovery mode and initialization succeeded,
+      // clear the flag so the next restart returns to headless.
+      if (headedRecoveryAccounts.has(account.id)) {
+        headedRecoveryAccounts.delete(account.id);
+        console.log(
+          `✅ [Playwright] Headed recovery completed for ${maskEmail(account.email)} — next init will use configured headless mode.`,
+        );
       }
 
       touchAccountActivity(account.id);

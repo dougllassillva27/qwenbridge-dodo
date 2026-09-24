@@ -36,6 +36,21 @@ export interface WafBlockResult {
 type ContextResetListener = (accountId: string) => void | Promise<void>;
 let contextResetListener: ContextResetListener | null = null;
 
+type HeadedRecoveryListener = (accountId: string, cooldownMs: number) => void;
+let headedRecoveryListener: HeadedRecoveryListener | null = null;
+
+/**
+ * Register the hook that flags an account for headed browser recovery.
+ * Called when consecutive hard blocks exceed the threshold, indicating
+ * the automated solver cannot resolve the challenge. The Playwright layer
+ * uses `cooldownMs` to schedule a proactive re-init in headed mode once
+ * the quarantine expires, so the automated solver retries with a real
+ * GPU/rendering environment without waiting for the next user request.
+ */
+export function setWafHeadedRecoveryListener(fn: HeadedRecoveryListener | null): void {
+  headedRecoveryListener = fn;
+}
+
 /**
  * Register the hook that physically resets an account's browser context after
  * a fingerprint rotation. Injected by the Playwright layer so this module
@@ -83,6 +98,16 @@ export function recordWafHardBlock(accountId: string): WafBlockResult {
   logger.warn(
     `[WafIsolation] Hard WAF block on ${accountId}: fingerprint rotated (streak ${state.consecutiveHardBlocks}), quarantined ${Math.round(cooldownMs / 1000)}s`,
   );
+
+  // After 2+ consecutive hard blocks, the automated solver is clearly failing.
+  // Flag the account for headed browser recovery so the next initialization
+  // opens a visible window where the solver retries with real GPU rendering.
+  if (state.consecutiveHardBlocks >= 2 && headedRecoveryListener && config.playwright.headedRecovery) {
+    headedRecoveryListener(accountId, cooldownMs);
+    logger.warn(
+      `[WafIsolation] Account ${accountId} flagged for headed recovery after ${state.consecutiveHardBlocks} consecutive hard blocks.`,
+    );
+  }
 
   if (contextResetListener) {
     // Best-effort: the next use re-initializes the context with the rotated

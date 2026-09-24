@@ -75,6 +75,7 @@ const envSchema = z
     // cap is closed once idle.
     PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("1"),
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
+    PLAYWRIGHT_HEADED_RECOVERY: z.string().default("true"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
     CAPTCHA_RESOLVER_URL: z.string().default("http://127.0.0.1:50006"),
     CAPTCHA_RESOLVER_URLS: z.string().optional(),
@@ -243,6 +244,7 @@ export const config = {
     lowMemoryFlags: env.PLAYWRIGHT_LOW_MEMORY_FLAGS !== "false",
     maxActiveContexts: Math.max(0, parseInt(env.PLAYWRIGHT_MAX_ACTIVE_CONTEXTS)),
     prepareAllOnStartup: env.PLAYWRIGHT_PREPARE_ALL_ON_STARTUP === "true",
+    headedRecovery: env.PLAYWRIGHT_HEADED_RECOVERY !== "false",
   },
   captcha: {
     enabled: env.CAPTCHA_SOLVER_ENABLED === "true",

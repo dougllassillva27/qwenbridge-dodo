@@ -80,7 +80,6 @@ process.on('unhandledRejection', async (reason: unknown) => {
   }
   console.error('❌ [Process] Unhandled Rejection:', reason);
 });
-import { startServer } from './api/server.js'
 const isTui = process.argv.includes('--tui') || process.env.QWEN_TUI === 'true'
 
 if (isTui) {
@@ -88,6 +87,7 @@ if (isTui) {
   const app = new TuiApp()
   await app.start()
 } else {
+  const { startServer } = await import('./api/server.ts')
   startServer().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error)
     // Expected configuration errors are already formatted with an emoji and
