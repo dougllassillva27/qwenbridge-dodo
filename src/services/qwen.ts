@@ -808,6 +808,7 @@ function getBrowserFetchHeaders(
   headers: Record<string, string>,
 ): Record<string, string> {
   const browserAllowedHeaders = new Set([
+    "authorization",
     "accept",
     "content-type",
     "bx-ua",
@@ -982,12 +983,12 @@ export async function requestQwenSettingsDirectFetch(
     // passes the WAF.
     let json: any = null;
     let okShape = false;
-    if (contentType.includes("html") || !response.ok) {
+    if (contentType.includes("html")) {
       okShape = false;
     } else {
       try {
         json = JSON.parse(raw);
-        okShape = json && typeof json === "object" && json.success === true;
+        okShape = json && typeof json === "object" && "success" in json;
       } catch {
         okShape = false;
       }
@@ -1664,10 +1665,10 @@ export async function syncQwenRequestPersonalization(
 
   if (isUnauthorized) {
     console.warn(
-      `[Qwen] Personalization 401 — refreshing session with re-auth and retrying | account=${cacheKey}`,
+      `[Qwen] Personalization 401 — refreshing session and retrying | account=${cacheKey}`,
     );
     try {
-      const { headers: freshHeaders } = await getQwenHeaders(true, accountId, true);
+      const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
       requestHeaders = buildCapturedQwenHeaders(freshHeaders, {
         referer: qwenUrl("/settings/personalization"),
       });

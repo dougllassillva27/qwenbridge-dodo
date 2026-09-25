@@ -51,11 +51,26 @@ export interface BuildQwenHeadersOptions {
   extra?: Record<string, string>;
 }
 
+export function extractBearerToken(cookie?: string): string | null {
+  if (!cookie || typeof cookie !== "string") return null;
+  const match = cookie.match(/(?:^|;\s*)token=([^;]+)/);
+  if (!match || !match[1]) return null;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
 export function buildQwenRequestHeaders(
   opts: BuildQwenHeadersOptions,
 ): Record<string, string> {
+  const bearerToken = extractBearerToken(opts.cookie);
   const headers: Record<string, string> = {
     ...(opts.extra ?? {}),
+    ...(bearerToken && !opts.extra?.Authorization && !opts.extra?.authorization
+      ? { Authorization: `Bearer ${bearerToken}` }
+      : {}),
     Accept: "application/json",
     "Accept-Language":
       opts.extra?.["Accept-Language"] ||

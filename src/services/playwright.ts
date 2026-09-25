@@ -1241,11 +1241,15 @@ async function tryLightweightCookieRefresh(
   if (!hasRequiredQwenHeaders(cache.headers)) return false;
 
   try {
-    const cookies = await withTimeout(
-      page.context().cookies(),
+    const rawCookies = await withTimeout(
+      page.context().cookies([qwenUrl("/")]),
       config.timeouts.page,
       `Cookie refresh timed out for ${accountId}`,
     );
+    const cookies =
+      Array.isArray(rawCookies) && rawCookies.length > 0
+        ? rawCookies
+        : await page.context().cookies();
     const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
     cookieCaches.set(accountId, { cookie: cookieStr, timestamp: Date.now() });
     return true;
@@ -1269,11 +1273,15 @@ export async function getCookies(accountId: string): Promise<string> {
   try {
     const context = page.context();
     if (!context || typeof context.cookies !== "function") return "";
-    const cookies = await withTimeout(
-      context.cookies(),
+    const rawCookies = await withTimeout(
+      context.cookies([qwenUrl("/")]),
       config.timeouts.page,
       `Cookie retrieval timed out for ${accountId}`,
     );
+    const cookies =
+      Array.isArray(rawCookies) && rawCookies.length > 0
+        ? rawCookies
+        : await context.cookies();
     const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
     cookieCaches.set(accountId, { cookie: cookieStr, timestamp: now });
     return cookieStr;
@@ -2564,7 +2572,7 @@ export async function captureQwenHeaders(
         if (settled || headersCaptured) return;
         try {
           const url = req.url();
-          if (!url.includes("/api/")) return;
+          if (!url.startsWith(qwenOrigin()) || !url.includes("/api/")) return;
           const reqHeaders = req.headers();
           if (!reqHeaders["bx-ua"] || !reqHeaders["bx-umidtoken"]) return;
 
@@ -2581,7 +2589,10 @@ export async function captureQwenHeaders(
             "sec-ch-ua-platform": reqHeaders["sec-ch-ua-platform"] || "",
           };
 
-          if (hasRequiredQwenHeaders(capturedHeaders)) {
+          if (
+            hasRequiredQwenHeaders(capturedHeaders) &&
+            hasValidAuthToken(capturedHeaders.cookie)
+          ) {
             headersCaptured = true;
             if (timeout) clearTimeout(timeout);
             cache.headers = capturedHeaders;
@@ -3116,11 +3127,14 @@ async function getCookieSnapshot(
   if (!context) return null;
 
   try {
-    return await withTimeout(
-      context.cookies(),
+    const rawCookies = await withTimeout(
+      context.cookies([qwenUrl("/")]),
       config.timeouts.page,
       `Cookie snapshot timed out for ${accountId}`,
     );
+    return Array.isArray(rawCookies) && rawCookies.length > 0
+      ? rawCookies
+      : await context.cookies();
   } catch {
     return null;
   }
@@ -3815,7 +3829,7 @@ export async function keepAlivePlaywrightAccount(
         `💓 [SessionKeeper] Account ${accountId} token expires within 45m; proactively renewing session...`,
       );
       try {
-        await refreshHeadersInternal(accountId, config.timeouts.headers, true);
+        await refreshHeadersInternal(accountId, config.timeouts.headers, false);
         lastKeepAliveNavigation.set(accountId, now);
         touchAccountActivity(accountId);
         return true;
