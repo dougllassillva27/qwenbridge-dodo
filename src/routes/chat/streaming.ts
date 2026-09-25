@@ -18,7 +18,7 @@ import {
   setToolCapNotice,
 } from "../../services/qwen.ts";
 import { acquireUpstreamStream } from "./account.ts";
-import { markAccountRateLimited } from "../../core/account-manager.ts";
+import { markAccountRateLimited, computeQuotaCooldownMs } from "../../core/account-manager.ts";
 import {
   clearTemporaryBusy,
   markAccountTemporarilyBusy,
@@ -443,6 +443,20 @@ export async function processNonStreamingResponse(
               chunk.response_id === targetResponseId)
           ) {
             const delta = chunk.choices[0].delta;
+
+            if (delta.extra?.update_member || chunk.update_member) {
+              throw toRetryableStreamError(
+                "membership_limit",
+                "Qwen upstream membership limit reached (update_member); rotating account",
+                {
+                  switchAccount: true,
+                  forceNewChat: true,
+                  reason: "membership_limit",
+                  accountCooldownMs: computeQuotaCooldownMs(Date.now()),
+                  accountCooldownReason: "MembershipLimit",
+                },
+              );
+            }
 
             if (isThinkingPhase(delta.phase)) {
               isThinkingChunk = true;
@@ -1062,6 +1076,11 @@ export async function processStreamingResponse(
 
       // Release the lease immediately. The stop request below is best-effort
       // and must never hold the account slot or block the next tool turn.
+      if (onStreamComplete) {
+        try {
+          onStreamComplete();
+        } catch {}
+      }
       retryContext.releaseAccountLease?.();
       retryContext.releaseAccountLease = null;
       removeStream(completionId);
@@ -1905,6 +1924,20 @@ export async function processStreamingResponse(
                 chunk.response_id === targetResponseId)
             ) {
               const delta = chunk.choices[0].delta;
+
+              if (delta.extra?.update_member || chunk.update_member) {
+                throw toRetryableStreamError(
+                  "membership_limit",
+                  "Qwen upstream membership limit reached (update_member); rotating account",
+                  {
+                    switchAccount: true,
+                    forceNewChat: true,
+                    reason: "membership_limit",
+                    accountCooldownMs: computeQuotaCooldownMs(Date.now()),
+                    accountCooldownReason: "MembershipLimit",
+                  },
+                );
+              }
 
               // Qwen streams may end with a {"status":"finished",
               // "phase":"answer"} delta and NO trailing [DONE]. Treat it as
@@ -2965,11 +2998,17 @@ export async function processStreamingResponse(
       }
 
       // Release locks now that the stream is fully done
-      if (onStreamComplete) onStreamComplete();
+      if (onStreamComplete) {
+        try {
+          onStreamComplete();
+        } catch {}
+      }
 
       // Release account lease from transparent retry if active
       if (retryContext.releaseAccountLease) {
-        retryContext.releaseAccountLease();
+        try {
+          retryContext.releaseAccountLease();
+        } catch {}
         retryContext.releaseAccountLease = null;
       }
     }

@@ -25,7 +25,7 @@ const envSchema = z
         return port >= 1 && port <= 65535;
       }, "PORT must be between 1 and 65535")
       .default("50002"),
-    HOST: z.string().default("0.0.0.0"),
+    HOST: z.string().default("127.0.0.1"),
     INTERNAL_HOST: z.string().default("127.0.0.1"),
     USER_AGENT: z
       .string()
@@ -98,7 +98,7 @@ const envSchema = z
     CHAT_TIMEOUT: z.string().default("180000"),
     NAVIGATION_TIMEOUT: z.string().default("60000"),
     PAGE_TIMEOUT: z.string().default("60000"),
-    HEADERS_TIMEOUT: z.string().default("90000"),
+    HEADERS_TIMEOUT: z.string().default("120000"),
     TIME_TO_FIRST_BYTE: z.string().default("60000"),
     IDLE_STREAM_TIMEOUT: z.string().default("60000"),
     // Deadline for the FIRST upstream chunk on thinking models (the reasoning

@@ -82,7 +82,9 @@ flowchart TD
 
 ### Autenticação
 
-Se `API_KEY` estiver definido, as rotas `/v1/*` (e `/metrics`) exigem uma das formas:
+Em loopback, a autenticação é opcional e o token legado
+`sk-qwenproxy-local` continua aceito. Se uma `API_KEY` real estiver definida,
+as rotas protegidas exigem uma das formas:
 
 - `Authorization: Bearer <API_KEY>` (OpenAI / Responses)
 - `x-api-key: <API_KEY>` (clients bearer-style)
@@ -298,6 +300,12 @@ O QwenProxy inicializa o servidor de alta performance em segundo plano e abre a 
 
 ### 3. Adicionar Contas Qwen
 
+> 🌐 **Onde criar as contas?**  
+> Crie suas contas gratuitas diretamente no portal oficial do Qwen: **[https://chat.qwen.ai](https://chat.qwen.ai)**  
+> 1. Acesse **[chat.qwen.ai](https://chat.qwen.ai)** e clique no botão **Sign up** (Cadastrar-se).
+> 2. Cadastre-se com seu e-mail e defina uma senha (ou use login via Google).
+> 3. *Dica de Ouro:* Crie de 3 a 10 contas gratuitas. O QwenProxy rotaciona automaticamente entre elas quando a cota diária de uma atinge o limite, garantindo uso contínuo e sem pausas no seu fluxo de desenvolvimento!
+
 Na TUI, você pode gerenciar suas contas na aba **`[5] Contas`** de duas formas simples:
 
 - **Importação em Lote (`B`):** Pressione a tecla **`B`** (ou clique em `[ B ] Em Lote`). Cole suas contas de uma só vez (aceita formato `email:senha`, formato bruto do `.env` com vírgulas ou copiado de planilhas). O sistema calcula a contagem em tempo real, valida duplicatas e grava tudo no SQLite criptografado em milissegundos.
@@ -483,11 +491,12 @@ npm run typecheck  # tipos
 ### Rede e segurança
 
 
-| Variável  | Default   | Descrição                        |
-| --------- | --------- | -------------------------------- |
-| `PORT`    | `7936`    | Porta HTTP (padrão QWEN: 7936). Configurável via .env |
-| `HOST`    | `0.0.0.0` | Bind host. Local: `127.0.0.1`    |
-| `API_KEY` | vazio     | Protege `/v1/*` com Bearer token |
+| Variável     | Default     | Descrição |
+| ------------ | ----------- | --------- |
+| `PORT`       | `7936`      | Porta HTTP (padrão QWEN: 7936). Configurável via .env |
+| `HOST`       | `127.0.0.1` | Bind host. Fora de loopback exige uma chave forte |
+| `API_KEY`    | vazio       | Opcional em loopback; protege as rotas com Bearer token |
+| `CORS_ORIGIN`| vazio       | Sem valor, permite apenas origens web de loopback |
 
 
 ### Contas e sessão
