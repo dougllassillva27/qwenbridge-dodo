@@ -4,6 +4,7 @@
  */
 
 import { config } from "../core/config.ts";
+import { localApiAuthHeaders } from "../core/local-auth.ts";
 import { startServer, stopServer } from "../api/server.ts";
 import { stripAnsi } from "./theme.ts";
 
@@ -230,6 +231,7 @@ export class ServerManager {
       const timeout = setTimeout(() => controller.abort(), 600);
       const resp = await fetch(`http://${cleanHost}:${port}/health`, {
         signal: controller.signal,
+        headers: localApiAuthHeaders(),
       });
       clearTimeout(timeout);
       if (resp.ok) {
@@ -280,8 +282,14 @@ export class ServerManager {
     }
     this.restoreLogs();
     try {
+      await stopServer();
       this.state = "offline";
     } catch {}
+  }
+
+  public async restart(): Promise<void> {
+    await this.stop();
+    await this.ensureStarted();
   }
 
   public startRemoteLogStream(host: string, port: number): void {
@@ -295,7 +303,7 @@ export class ServerManager {
       try {
         const resp = await fetch(`http://${host}:${port}/logs/live`, {
           signal: abort.signal,
-          headers: { Accept: "text/event-stream" },
+          headers: { Accept: "text/event-stream", ...localApiAuthHeaders() },
         });
         if (!resp.ok || !resp.body) return;
         const reader = resp.body.getReader();

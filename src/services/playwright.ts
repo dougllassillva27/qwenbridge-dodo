@@ -81,6 +81,7 @@ import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { setWafContextResetListener } from "../core/waf-isolation.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
+import { parseJwtExpiry, isTokenExpiringSoon } from "../utils/jwt.ts";
 
 type ContextInitHook = (context: BrowserContext) => Promise<void> | void;
 const contextInitHooks: ContextInitHook[] = [];
@@ -350,7 +351,37 @@ export async function isPageLoggedIn(
       .evaluate(async () => {
         try {
           const res = await fetch("/api/v1/auths/", { method: "GET" });
-          return res.status === 200;
+          if (res.status !== 200) return false;
+          const json: any = await res.json().catch(() => null);
+          if (!json) return false;
+          if (json.success === false) return false;
+          if (
+            json.code &&
+            json.code !== 200 &&
+            json.code !== "200" &&
+            json.code !== 0 &&
+            json.code !== "0"
+          ) {
+            return false;
+          }
+          const user = json.data?.user || json.data || json;
+          if (!user || typeof user !== "object") return false;
+          if (user.is_guest === true || user.is_login === false) return false;
+          const hasIdentity = Boolean(
+            user.id ||
+              user.user_id ||
+              user.userId ||
+              user.email ||
+              user.name ||
+              json.data?.token ||
+              json.token ||
+              user.token,
+          );
+          if (!hasIdentity) return false;
+
+          // If an authenticated user object is confirmed with a real user identity,
+          // the session is 100% valid and verified by upstream.
+          return true;
         } catch {
           return false;
         }
@@ -479,7 +510,7 @@ const HEADER_CAPTURE_TRIGGER_GRACE_MS = 15_000;
  * send. Fail it fast and let the retry loop reload + re-send against the warm
  * SDK instead of stalling the boot for the full 15s.
  */
-const FIRST_TRIGGER_GRACE_MS = 3_000;
+const FIRST_TRIGGER_GRACE_MS = 8_000;
 /**
  * Sends (the initial one plus re-triggers) header capture may spend on getting a
  * completion request that actually carries the bx headers. The in-page SDK can
@@ -1062,16 +1093,22 @@ export async function getCookies(accountId: string): Promise<string> {
   }
 
   const page = accountPages.get(accountId);
-  if (!page) return "";
+  if (!page || typeof page.context !== "function") return "";
 
-  const cookies = await withTimeout(
-    page.context().cookies(),
-    config.timeouts.page,
-    `Cookie retrieval timed out for ${accountId}`,
-  );
-  const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
-  cookieCaches.set(accountId, { cookie: cookieStr, timestamp: now });
-  return cookieStr;
+  try {
+    const context = page.context();
+    if (!context || typeof context.cookies !== "function") return "";
+    const cookies = await withTimeout(
+      context.cookies(),
+      config.timeouts.page,
+      `Cookie retrieval timed out for ${accountId}`,
+    );
+    const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+    cookieCaches.set(accountId, { cookie: cookieStr, timestamp: now });
+    return cookieStr;
+  } catch {
+    return "";
+  }
 }
 
 export async function getBasicHeaders(accountId: string): Promise<{
@@ -1456,14 +1493,17 @@ export async function initPlaywrightForAccount(
             waitUntil: "domcontentloaded",
             timeout: config.timeouts.navigation,
           });
-          const loggedIn = await isPageLoggedIn(acctPage);
+          await sleep(1500);
+          const currentUrl = acctPage.url();
+          const isAuthUrl = currentUrl.includes("/auth") || currentUrl.includes("/login");
+          const loggedIn = !isAuthUrl && (await isPageLoggedIn(acctPage, 4_000));
           if (!loggedIn) {
             if (account.email && account.password) {
-              console.warn(
-                `⚠️  [Playwright] Session expired for ${maskEmail(account.email)}, re-authenticating...`,
+              console.log(
+                `[Playwright] Session expired or guest state detected for ${maskEmail(account.email)}, re-authenticating...`,
               );
               const ok = await loginToQwen(account.id, account.email, account.password);
-              if (!ok) {
+              if (!ok || !(await isPageLoggedIn(acctPage, 4_000))) {
                 validationError = new Error(
                   `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
                 );
@@ -1495,6 +1535,7 @@ export async function initPlaywrightForAccount(
         throw validationError;
       }
       if (!options.skipHeaderCapture) {
+        (acctPage as any).__qwenChatHomeLoaded = true;
         await captureQwenHeaders(account.id);
       }
 
@@ -1649,14 +1690,22 @@ export async function validateAccountLogin(
             waitUntil: "domcontentloaded",
             timeout: config.timeouts.navigation,
           });
-          loggedIn = await isPageLoggedIn(acctPage);
-          if (!loggedIn && account.email && account.password) {
-            accountPages.set(account.id, acctPage);
-            try {
-              loggedIn = await loginToQwen(account.id, account.email, account.password);
-            } finally {
-              accountPages.delete(account.id);
+          await sleep(1500);
+          const currentUrl = acctPage.url();
+          const isAuthUrl = currentUrl.includes("/auth") || currentUrl.includes("/login");
+          if (isAuthUrl) {
+            if (account.email && account.password) {
+              accountPages.set(account.id, acctPage);
+              try {
+                loggedIn = await loginToQwen(account.id, account.email, account.password);
+              } finally {
+                accountPages.delete(account.id);
+              }
+            } else {
+              loggedIn = false;
             }
+          } else {
+            loggedIn = true;
           }
         } catch {
           loggedIn = false;
@@ -1841,73 +1890,138 @@ async function loginViaApi(
       .digest("hex");
     const signinUrl = qwenUrl("/api/v2/auths/signin");
 
-    const requestId = crypto.randomUUID();
-    const result = await page.evaluate(
-      async ({ email, password, signinUrl, requestId }) => {
-        try {
-          const response = await fetch(signinUrl, {
-            method: "POST",
-            signal: AbortSignal.timeout(10_000),
-            headers: {
-              accept: "application/json, text/plain, */*",
-              "content-type": "application/json",
-              source: "web",
-              timezone: new Date().toString().split(" (")[0],
-              "x-request-id": requestId,
-            },
-            body: JSON.stringify({ email, password, login_type: "email" }),
-          });
-          const data = await response.json().catch(() => null);
-          return { ok: response.ok, status: response.status, data };
-        } catch (e: any) {
-          return { ok: false, error: e.message };
-        }
-      },
-      { email, password: hashedPassword, signinUrl, requestId },
-    );
+    let signinSuccess = false;
+    let data: any = null;
 
-    if (result.data) {
-      if (result.data.success === true) {
-        await page.goto(qwenUrl("/"), {
-          waitUntil: "domcontentloaded",
-          timeout: config.timeouts.navigation,
+    if (page.request && typeof page.request.post === "function") {
+      try {
+        const response = await page.request.post(signinUrl, {
+          data: {
+            email,
+            password: hashedPassword,
+            login_type: "email",
+          },
+          headers: {
+            "content-type": "application/json",
+            accept: "application/json, text/plain, */*",
+            referer: qwenUrl("/auth"),
+            origin: qwenOrigin(),
+          },
+          timeout: 10_000,
         });
-        const loggedIn = !page.url().includes("auth") && !page.url().includes("login");
-        if (loggedIn) {
-          return { success: true };
-        }
-      } else if (result.data.success === false) {
-        const code = result.data?.data?.code || result.data?.code;
-        const details =
-          result.data?.data?.details || result.data?.details || result.data?.message;
-        const classified = classifyQwenAuthError(code, details);
-        return {
-          success: false,
-          permanentFailure: classified.isPermanent,
-          reason: classified.reason,
-        };
+        data = await response.json().catch(() => null);
+        signinSuccess = Boolean(data && (data.success === true || data.token));
+      } catch {}
+    }
+
+    if (!signinSuccess && !data) {
+      // Fallback to in-page evaluate fetch if page.request was unavailable
+      const requestId = crypto.randomUUID();
+      const evalRes = await page
+        .evaluate(
+          async ({ email, password, signinUrl, requestId }) => {
+            try {
+              const response = await fetch(signinUrl, {
+                method: "POST",
+                signal: AbortSignal.timeout(10_000),
+                credentials: "include",
+                headers: {
+                  accept: "application/json, text/plain, */*",
+                  "content-type": "application/json",
+                  source: "web",
+                  timezone: new Date().toString().split(" (")[0],
+                  "x-request-id": requestId,
+                },
+                body: JSON.stringify({ email, password, login_type: "email" }),
+              });
+              const json = await response.json().catch(() => null);
+              return { ok: response.ok, status: response.status, data: json };
+            } catch (e: any) {
+              return { ok: false, error: e.message };
+            }
+          },
+          { email, password: hashedPassword, signinUrl, requestId },
+        )
+        .catch(() => null);
+
+      if (evalRes?.data) {
+        data = evalRes.data;
+        signinSuccess = Boolean(data && (data.success === true || data.token));
       }
     }
 
-    if (result.ok) {
-      await page.goto(qwenUrl("/"), {
-        waitUntil: "domcontentloaded",
-        timeout: config.timeouts.navigation,
-      });
-      const loggedIn = !page.url().includes("auth") && !page.url().includes("login");
+    if (data?.success === false) {
+      const code = data?.data?.code || data?.code;
+      const details = data?.data?.details || data?.details || data?.message;
+      const classified = classifyQwenAuthError(code, details);
       return {
-        success: loggedIn,
-        reason: loggedIn ? undefined : "Redirecionado de volta para /auth após signin",
+        success: false,
+        permanentFailure: classified.isPermanent,
+        reason: classified.reason,
       };
+    }
+
+    if (signinSuccess) {
+      const token = data?.data?.token || data?.token;
+      if (token) {
+        try {
+          await page.context().addCookies([
+            {
+              name: "token",
+              value: token,
+              domain: ".qwen.ai",
+              path: "/",
+              expires: Math.floor(Date.now() / 1000) + 31536000,
+              httpOnly: false,
+              secure: true,
+              sameSite: "Lax",
+            },
+          ]);
+        } catch {}
+      }
+
+      await page
+        .goto(qwenUrl("/"), {
+          waitUntil: "domcontentloaded",
+          timeout: config.timeouts.navigation,
+        })
+        .catch(() => {});
+
+      if (token) {
+        await page
+          .evaluate((tok) => {
+            try {
+              localStorage.setItem("token", tok);
+              document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+            } catch {}
+          }, token)
+          .catch(() => {});
+        await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      }
+
+      await sleep(1500);
+      const loggedIn = await isPageLoggedIn(page, 5_000);
+      if (loggedIn) {
+        return { success: true };
+      }
     }
 
     return {
       success: false,
-      reason: result.error || `HTTP ${result.status || "desconhecido"} sem corpo JSON válido`,
+      reason: "API signin não confirmou sessão autenticada",
     };
   } catch (err: any) {
-    console.warn(`⚠️  [Playwright] API login error: ${err?.message || err}`);
-    return { success: false, reason: err?.message || String(err) };
+    const errMsg = err?.message || String(err);
+    if (page && !page.isClosed()) {
+      try {
+        await sleep(1500);
+        if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
+          return { success: true };
+        }
+      } catch {}
+    }
+    console.warn(`⚠️  [Playwright] API login error: ${errMsg}`);
+    return { success: false, reason: errMsg };
   }
 }
 
@@ -1917,14 +2031,17 @@ async function loginViaUi(
   password: string,
 ): Promise<LoginAttemptResult> {
   try {
+    if (page.url().startsWith(qwenOrigin()) && !page.url().includes("/auth") && !page.url().includes("/login")) {
+      return { success: true };
+    }
     await page.goto(qwenUrl("/auth"), {
       waitUntil: "domcontentloaded",
       timeout: config.timeouts.navigation,
     });
-    await sleep(2000);
+    await sleep(1500);
 
     // Check if already logged in
-    if (!page.url().includes("/auth")) {
+    if (!page.url().includes("/auth") && !page.url().includes("/login")) {
       return { success: true };
     }
 
@@ -1948,34 +2065,59 @@ async function loginViaUi(
       return { success: false, reason: "Campo de e-mail não encontrado (possível captcha)" };
     }
 
+    // In Qwen Web, if the page opens on the default email OTP panel, click "Log in with a password"
+    // to reveal the standard email + password form.
+    try {
+      const pwdModeBtn = page.getByText(/Log in with a password/i).first();
+      if (await pwdModeBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await pwdModeBtn.click().catch(() => {});
+        await sleep(500);
+      }
+    } catch {}
+
     // Fill email
     await page.fill(emailSelector, email);
+    await sleep(300);
 
-    // The password field may already be visible (single-step form) or only
-    // appear after submitting the email (two-step flow).
+    // If "Log in with a password" button appeared after typing email, click it
+    try {
+      const pwdModeBtn = page.getByText(/Log in with a password/i).first();
+      if (await pwdModeBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await pwdModeBtn.click().catch(() => {});
+        await sleep(500);
+      }
+    } catch {}
+
+    // In Qwen Web, the password field is present on the same form.
+    // NEVER press Enter after filling email alone, as Qwen interprets that
+    // as a request to sign in via email verification code (passwordless OTP).
     const passwordSelector =
       'input[type="password"], input[name="password"]';
-    const passwordAlreadyVisible = await page
-      .locator(passwordSelector)
-      .first()
-      .isVisible()
-      .catch(() => false);
-
-    if (!passwordAlreadyVisible) {
-      await page.keyboard.press("Enter");
+    try {
       await page.waitForSelector(passwordSelector, {
-        timeout: config.timeouts.page,
+        timeout: 10_000,
       });
+    } catch {
+      if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
+        return { success: true };
+      }
+      console.warn(
+        `⚠️  [Playwright] Password input not found on ${page.url()}`,
+      );
+      return {
+        success: false,
+        reason: "Campo de senha não encontrado na tela de autenticação",
+      };
     }
-    await sleep(500);
 
     // Fill password
     await page.fill(passwordSelector, password);
+    await sleep(500);
 
     // Prefer clicking the submit button; fall back to pressing Enter.
     // The button starts disabled and only enables once both fields are filled.
     const submitSelector =
-      'button[type="submit"].qwenchat-auth-pc-submit-button, button[type="submit"]';
+      'button.qwenchat-auth-pc-submit-button, button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")';
     const submitButton = page.locator(submitSelector).first();
     try {
       await page.waitForSelector('button[type="submit"]:not([disabled])', {
@@ -1993,8 +2135,22 @@ async function loginViaUi(
       maxAttempts: config.captcha.maxAttempts,
       retryDelayMs: config.captcha.retryDelayMs,
     }).catch(() => {});
+
+    // Check if an OTP code verification screen appeared (e.g. 2FA / email verification code)
+    const codeSelector =
+      'input[placeholder*="code" i], input[placeholder*="código" i], input[name*="code" i]';
+    const codeInput = page.locator(codeSelector).first();
+    if (await codeInput.isVisible().catch(() => false)) {
+      return {
+        success: false,
+        reason: "Conta requer código de verificação enviado por e-mail (2FA/OTP)",
+      };
+    }
+
     // Check for UI error elements in DOM (Ant Design errors, alerts, toasts)
     const errorSelector = [
+      ".qwen-chat-v2-toast-text",
+      ".qwen-chat-v2-toast-content",
       ".ant-form-item-explain-error",
       ".ant-message-error",
       ".ant-message-notice",
@@ -2016,8 +2172,7 @@ async function loginViaUi(
     }
 
     // Check if login was successful
-    const isLoggedIn =
-      !page.url().includes("auth") && !page.url().includes("login");
+    const isLoggedIn = await isPageLoggedIn(page);
 
     if (isLoggedIn) {
       await page.goto(qwenUrl("/"), {
@@ -2113,6 +2268,9 @@ export async function captureQwenHeaders(
               `❌ [Playwright] Header capture failed for ${accountId} after ${graceTimeoutCount} silent send(s): ${error?.message ?? "no completion request"}`,
             );
           }
+        }
+        if (!headersCaptured) {
+          unmarkAccountHeadersReady(accountId);
         }
         if (error) reject(error);
         else resolve();
@@ -2222,7 +2380,10 @@ export async function captureQwenHeaders(
         // Ignore parse errors or missing postData
       }
 
-      if (!hasRequiredQwenHeaders(capturedHeaders)) {
+      if (
+        !hasRequiredQwenHeaders(capturedHeaders) ||
+        !hasValidAuthToken(capturedHeaders.cookie)
+      ) {
         // Not evidence the page is broken: the SDK also fires completions
         // before it has computed its token. The request still must never reach
         // Qwen, but the capture keeps its route and spends another send —
@@ -2256,8 +2417,13 @@ export async function captureQwenHeaders(
     // Navigate to the stable chat page. Only the first attempt pays for this:
     // a re-trigger types into the page that is already loaded, and reloading
     // would throw away the bx SDK state that just finished warming up.
-    const openChatPage = async () => {
+    const openChatPage = async (forceReload = false) => {
       if (settled || page.isClosed()) return;
+      if (!forceReload && (page as any).__qwenChatHomeLoaded) {
+        delete (page as any).__qwenChatHomeLoaded;
+        await sleep(500);
+        return;
+      }
       await page.goto(qwenUrl("/"), {
         waitUntil: "domcontentloaded",
         timeout: Math.min(config.timeouts.navigation, timeoutMs),
@@ -2272,24 +2438,33 @@ export async function captureQwenHeaders(
       await clearVisibleChallenge(page);
       if (settled || page.isClosed()) return;
 
-      // Session-expiry fast path: if the page landed on the auth/login screen
-      // (redirection after a dead session), typing into the chat input would
-      // burn every trigger attempt on a textarea that does not exist. Re-login
-      // immediately when credentials are available; otherwise fail fast with a
-      // clear diagnosis instead of 3 pointless grace timeouts.
-      const loggedIn = await isPageLoggedIn(
-        page,
-        Math.max(1_000, Math.min(remainingBudgetMs(), SESSION_PROBE_NAVIGATION_TIMEOUT_MS)),
-      );
-      if (!loggedIn) {
+      // Session-expiry check: if the page redirected to /auth or /login,
+      // re-login immediately.
+      // On attempts 1 and 2, do NOT run a tight 3s fetch probe because the session
+      // was already verified during init. Only run isPageLoggedIn if attempt >= 3
+      // (as a last-resort recovery before giving up) and with a generous 8s timeout.
+      const currentUrl = page.url();
+      const isAuthUrl = currentUrl.includes("/auth") || currentUrl.includes("/login");
+      const isSuspectedGuest = attempt >= 3 && !(await isPageLoggedIn(page, 8000));
+      if (isAuthUrl || isSuspectedGuest) {
         const { getAccountCredentials } = await import("../core/accounts.ts");
         const creds = getAccountCredentials(accountId);
         if (creds && creds.email && creds.password) {
           console.warn(
-            `⚠️  [Playwright] Session expired during header capture for ${accountId}; re-authenticating...`,
+            `⚠️  [Playwright] Session expired or guest state detected during header capture for ${accountId}; re-authenticating...`,
           );
+          armOverallDeadline();
           const ok = await loginToQwen(accountId, creds.email, creds.password);
-          if (!ok) {
+          if (ok) {
+            // Re-login navigated; load the chat page and wait for hydration so
+            // the check below probes a live authenticated chat page.
+            await page.goto(qwenUrl("/"), {
+              waitUntil: "domcontentloaded",
+              timeout: Math.min(config.timeouts.navigation, timeoutMs),
+            });
+            await sleep(2000);
+          }
+          if (!ok || !(await isPageLoggedIn(page, 6000))) {
             settle(
               new Error(
                 `Header capture failed for ${accountId}: re-login after session expiry did not succeed`,
@@ -2297,9 +2472,7 @@ export async function captureQwenHeaders(
             );
             return;
           }
-          // Re-login navigated away; reload the chat page so the send below
-          // types into a live chat input (never leave the loop parked).
-          await openChatPage();
+          armOverallDeadline();
           if (settled || page.isClosed()) return;
         } else {
           settle(
@@ -2317,23 +2490,21 @@ export async function captureQwenHeaders(
       // picking a sibling textarea/contenteditable), then fall back to generic.
       // Mirrors upstream 5b3fd3e (robust account header capture).
       const inputSelector =
-        'textarea.message-input-textarea:visible, textarea:visible, [contenteditable="true"]:visible';
+        "textarea.message-input-textarea, textarea[placeholder*='Ask' i], textarea[placeholder*='Pergunte' i], textarea";
       // Bound the appearance wait: a page that never renders the chat input is
       // blocked (WAF interstitial, punish document, or failed SPA hydration).
       // Unbounded, page.focus would burn its 60s default timeout on every
       // attempt, freezing the whole capture and cooling a healthy account with
       // AuthInitFailed. A miss marks the attempt for a reload instead.
+      const inputLocator = page.locator(inputSelector).first();
       try {
-        await page
-          .locator(inputSelector)
-          .first()
-          .waitFor({
-            state: "visible",
-            timeout: Math.max(
-              1,
-              Math.min(CHAT_INPUT_APPEAR_TIMEOUT_MS, remainingBudgetMs()),
-            ),
-          });
+        await inputLocator.waitFor({
+          state: "visible",
+          timeout: Math.max(
+            1,
+            Math.min(CHAT_INPUT_APPEAR_TIMEOUT_MS, remainingBudgetMs()),
+          ),
+        });
       } catch {
         if (settled || page.isClosed()) return;
         console.warn(
@@ -2353,14 +2524,37 @@ export async function captureQwenHeaders(
       for (let interactionTry = 1; interactionTry <= 2; interactionTry++) {
         if (settled || page.isClosed()) return;
         try {
-          await page.focus(inputSelector, { timeout: inputActionTimeoutMs });
+          if (typeof (inputLocator as any).focus === "function") {
+            await (inputLocator as any).focus({ timeout: inputActionTimeoutMs }).catch(() => {});
+          } else {
+            await page.focus(inputSelector, { timeout: inputActionTimeoutMs }).catch(() => {});
+          }
           if (settled || page.isClosed()) return;
-          await page.fill(inputSelector, "", { timeout: inputActionTimeoutMs });
-          if (settled || page.isClosed()) return;
-          await page.type(inputSelector, "a", {
-            delay: 100,
-            timeout: inputActionTimeoutMs,
-          });
+          if (typeof (inputLocator as any).fill === "function") {
+            await (inputLocator as any).fill("a", { timeout: inputActionTimeoutMs }).catch(() => {});
+          } else {
+            await page.fill(inputSelector, "a", { timeout: inputActionTimeoutMs }).catch(() => {});
+          }
+
+          if (typeof page.evaluate === "function") {
+            await page.evaluate((sel) => {
+              const el = document.querySelector(sel) as HTMLTextAreaElement | null;
+              if (el) {
+                el.focus();
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                  window.HTMLTextAreaElement.prototype,
+                  "value",
+                )?.set;
+                if (nativeSetter) {
+                  nativeSetter.call(el, "a");
+                } else {
+                  el.value = "a";
+                }
+                el.dispatchEvent(new Event("input", { bubbles: true }));
+                el.dispatchEvent(new Event("change", { bubbles: true }));
+              }
+            }, inputSelector).catch(() => {});
+          }
           interactionSucceeded = true;
           break;
         } catch {
@@ -2383,13 +2577,28 @@ export async function captureQwenHeaders(
         return;
       }
       if (settled || page.isClosed()) return;
-      await sleep(2000);
+
+      // Wait up to 3s for React to enable the send button after typing
+      try {
+        await page.waitForFunction(() => {
+          const btn = document.querySelector(
+            ".message-input-right-button-send .send-button, .message-input-right-button-send button, .chat-prompt-send-button, button.send-button, button[aria-label*='Send' i], button[aria-label*='Enviar' i], .send-button-container button"
+          ) as HTMLButtonElement | null;
+          return btn && !btn.disabled && !btn.classList.contains("disabled") && btn.getAttribute("aria-disabled") !== "true";
+        }, { timeout: 3000 });
+      } catch {
+        await sleep(500);
+      }
       if (settled || page.isClosed()) return;
 
       const sendSelectors = [
         ".message-input-right-button-send .send-button",
+        ".message-input-right-button-send button",
         ".chat-prompt-send-button",
         "button.send-button",
+        "button[aria-label*='Send' i]",
+        "button[aria-label*='Enviar' i]",
+        ".send-button-container button",
       ];
 
       let clicked = false;
@@ -2398,18 +2607,19 @@ export async function captureQwenHeaders(
         try {
           const btn = await page.$(selector);
           if (btn && (await btn.isVisible())) {
-            await page.evaluate((sel) => {
-              const element = document.querySelector(sel) as HTMLElement;
-              if (element) {
-                element.focus();
-                element.click();
-              }
-            }, selector);
-            if (!settled && !page.isClosed()) {
-              await btn.click({ force: true, delay: 50 }).catch(() => {});
+            const isDisabled = await page.evaluate((el) => {
+              const b = el as HTMLButtonElement;
+              return (
+                b.disabled ||
+                b.classList.contains("disabled") ||
+                b.getAttribute("aria-disabled") === "true"
+              );
+            }, btn);
+            if (!isDisabled) {
+              await btn.click({ delay: 50 }).catch(() => {});
+              clicked = true;
+              break;
             }
-            clicked = true;
-            break;
           }
         } catch {
           // Try the next selector.
@@ -2452,14 +2662,13 @@ export async function captureQwenHeaders(
           // A missing chat input is the exception: the page never rendered the
           // chat UI, so there is no warm SDK state to protect and only a fresh
           // load can recover it.
-          if (
-            attempt === 1 ||
+          const needReload =
             lastAttemptInputMissing ||
-            (lastAttemptGraceTimedOut && attempt >= 3)
-          ) {
+            (lastAttemptGraceTimedOut && attempt >= 3);
+          if (attempt === 1 || needReload) {
             lastAttemptGraceTimedOut = false;
             lastAttemptInputMissing = false;
-            await openChatPage();
+            await openChatPage(needReload);
           }
           if (settled) return;
           await triggerSend(attempt);
@@ -2543,24 +2752,62 @@ async function getCookieSnapshot(
 }
 
 /**
+ * Check whether a raw cookie header string contains a valid, non-empty auth token.
+ */
+export function hasValidAuthToken(cookieHeader?: string): boolean {
+  if (!cookieHeader || typeof cookieHeader !== "string") return false;
+  const match = cookieHeader.match(/(?:^|;\s*)token=([^;]+)/);
+  if (!match || !match[1]) return false;
+  const value = match[1].trim();
+  if (
+    value === "" ||
+    value === '""' ||
+    value === "''" ||
+    value === "null" ||
+    value === "undefined"
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
  * Check if the auth token cookie is still valid.
  * Used to skip unnecessary header recaptures when the token is still fresh.
+ * Inspects the JWT exp claim when present rather than relying on cookie Max-Age.
  * Returns true if the token cookie exists and is not expired.
  */
-function isAuthTokenValidFrom(cookies: CookieSnapshot): boolean {
+export function isAuthTokenValidFrom(
+  cookies: CookieSnapshot,
+  safetyMarginMs = 5 * 60 * 1000,
+): boolean {
   const tokenCookie = cookies.find(
     (c) =>
       c.name === "token" && (c.domain === ".qwen.ai" || c.domain === "qwen.ai"),
   );
 
-  if (!tokenCookie) return false;
+  if (
+    !tokenCookie ||
+    !tokenCookie.value ||
+    tokenCookie.value.trim() === "" ||
+    tokenCookie.value.trim() === '""'
+  ) {
+    return false;
+  }
+
+  // If the token is a JWT, check its exp claim rather than the 1-year cookie Max-Age
+  const jwtExpSec = parseJwtExpiry(tokenCookie.value);
+  if (typeof jwtExpSec === "number" && Number.isFinite(jwtExpSec)) {
+    const expMs = jwtExpSec * 1000;
+    return expMs > Date.now() + safetyMarginMs;
+  }
 
   // Session cookie (expires = -1) is valid as long as browser is open
   if (tokenCookie.expires === -1) return true;
 
-  // Check if expired (with 5-min safety margin)
+  // Opaque token fallback: check cookie expiration with safety margin
   const expiresAt = tokenCookie.expires * 1000;
-  return expiresAt > Date.now() + 5 * 60 * 1000;
+  return expiresAt > Date.now() + safetyMarginMs;
 }
 
 /**
@@ -2583,6 +2830,7 @@ function isShortestCookieValidFrom(cookies: CookieSnapshot): boolean {
 async function refreshHeadersInternal(
   accountId: string,
   timeoutMs = config.timeouts.headers,
+  forceReauth = false,
 ): Promise<void> {
   const cache = getHeaderCache(accountId);
   if (cache.refreshInProgress) return;
@@ -2594,39 +2842,54 @@ async function refreshHeadersInternal(
     // Check if session is expired before capturing headers
     const page = accountPages.get(accountId);
     if (page) {
-      try {
-        await page.goto(qwenUrl("/"), {
-          waitUntil: "domcontentloaded",
-          timeout: Math.min(
-            config.timeouts.navigation,
-            boundedTimeoutMs,
-            SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
-          ),
-        });
-        const url = page.url();
-        const isAuthUrl = url.includes("auth") || url.includes("login");
-        const isLoggedIn = isAuthUrl ? false : await isPageLoggedIn(page, 5_000);
-        if (isAuthUrl || !isLoggedIn) {
-          console.warn(
-            `⚠️  [Playwright] Session expired during refresh for ${accountId}, re-authenticating...`,
-          );
-          const { getAccountCredentials } = await import("../core/accounts.ts");
-          const creds = getAccountCredentials(accountId);
-          if (creds && creds.email && creds.password) {
-            await loginToQwen(accountId, creds.email, creds.password);
-            // Invalidate cookie cache after re-login
-            cookieCaches.delete(accountId);
-          } else {
-            console.warn(
-              `[Playwright] No credentials available for re-login of ${accountId}`,
+      const executeReauth = async () => {
+        console.warn(
+          `⚠️  [Playwright] Session expired or forced re-auth for ${accountId}, re-authenticating...`,
+        );
+        const { getAccountCredentials } = await import("../core/accounts.ts");
+        const creds = getAccountCredentials(accountId);
+        if (creds && creds.email && creds.password) {
+          const ok = await loginToQwen(accountId, creds.email, creds.password);
+          cookieCaches.delete(accountId);
+          if (!ok || !(await isPageLoggedIn(page, 5_000))) {
+            unmarkAccountHeadersReady(accountId);
+            throw new Error(
+              `Re-login for ${accountId} did not restore an authenticated session`,
             );
           }
+        } else {
+          unmarkAccountHeadersReady(accountId);
+          throw new Error(
+            `No credentials available for re-login of ${accountId}`,
+          );
         }
-      } catch (navErr) {
-        console.warn(
-          `[Playwright] Navigation check failed during refresh for ${accountId}:`,
-          (navErr as Error).message,
-        );
+      };
+
+      if (forceReauth) {
+        await executeReauth();
+      } else {
+        try {
+          await page.goto(qwenUrl("/"), {
+            waitUntil: "domcontentloaded",
+            timeout: Math.min(
+              config.timeouts.navigation,
+              boundedTimeoutMs,
+              SESSION_PROBE_NAVIGATION_TIMEOUT_MS,
+            ),
+          });
+          await sleep(2000);
+          const url = page.url();
+          const isAuthUrl = url.includes("auth") || url.includes("login");
+          if (isAuthUrl) {
+            await executeReauth();
+          }
+        } catch (navErr) {
+          console.warn(
+            `[Playwright] Navigation check failed during refresh for ${accountId}:`,
+            (navErr as Error).message,
+          );
+          await executeReauth();
+        }
       }
     }
 
@@ -2656,6 +2919,7 @@ async function refreshHeadersInternal(
 export async function refreshHeaders(
   accountId: string,
   timeoutMs = config.timeouts.headers,
+  forceReauth = false,
 ): Promise<void> {
   const boundedTimeoutMs = Math.max(1_000, timeoutMs);
   const release = await acquireAccountMutex(
@@ -2664,7 +2928,7 @@ export async function refreshHeaders(
     boundedTimeoutMs,
   );
   try {
-    await refreshHeadersInternal(accountId, timeoutMs);
+    await refreshHeadersInternal(accountId, timeoutMs, forceReauth);
   } finally {
     release();
   }
@@ -2681,6 +2945,11 @@ export async function withAccountPage<T>(
   mutexTimeoutMs = PLAYWRIGHT_MUTEX_WAIT_MS,
   recoverOnTimeout = true,
 ): Promise<T> {
+  const inFlightInit = inFlightAccountInits.get(accountId);
+  if (inFlightInit) {
+    await inFlightInit.catch(() => {});
+  }
+
   const page = accountPages.get(accountId);
   if (!page || page.isClosed()) {
     throw new Error(`Playwright page unavailable for account: ${accountId}`);
@@ -3162,6 +3431,25 @@ export async function keepAlivePlaywrightAccount(
 
     const now = Date.now();
     const currentUrl = page.url();
+
+    // Proactive session check: if token expires within 45 minutes, refresh proactively
+    const cookie = await getCookies(accountId);
+    if (cookie && isTokenExpiringSoon(cookie, 45)) {
+      console.log(
+        `💓 [SessionKeeper] Account ${accountId} token expires within 45m; proactively renewing session...`,
+      );
+      try {
+        await refreshHeadersInternal(accountId, config.timeouts.headers, true);
+        lastKeepAliveNavigation.set(accountId, now);
+        touchAccountActivity(accountId);
+        return true;
+      } catch (err) {
+        console.warn(
+          `[SessionKeeper] Proactive session renewal failed for ${accountId}: ${getErrorMessage(err)}`,
+        );
+      }
+    }
+
     const lastNavigation = lastKeepAliveNavigation.get(accountId) ?? 0;
     const shouldNavigate =
       !currentUrl.startsWith(qwenOrigin()) ||

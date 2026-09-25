@@ -6,6 +6,11 @@ import Database from "better-sqlite3";
 
 import { config } from "../core/config.ts";
 import { getSyncStatePath } from "../core/paths.ts";
+import {
+  PLACEHOLDER_API_KEY,
+  isLoopbackHost,
+  isPlaceholderApiKey,
+} from "../core/local-auth.ts";
 import type {
   ClientSyncResult,
   SyncAllOptions,
@@ -46,15 +51,30 @@ export {
   syncAider,
   restoreAider,
 };
-export function resolveApiKey(overrideKey?: string, configKey?: string): string {
+export function resolveApiKey(
+  overrideKey?: string,
+  configKey?: string,
+  host = "127.0.0.1",
+): string {
   if (overrideKey && overrideKey.trim().length > 0) {
+    if (isPlaceholderApiKey(overrideKey) && !isLoopbackHost(host)) {
+      throw new Error(
+        `Refusing to sync clients with placeholder API key ${PLACEHOLDER_API_KEY}. Set API_KEY first.`,
+      );
+    }
     return overrideKey.trim();
   }
-  const envKey = process.env.API_KEY || process.env.ADMIN_PASSWORD || configKey;
-  if (envKey && envKey.trim().length > 0) {
+  const envKey =
+    (!isPlaceholderApiKey(process.env.API_KEY) ? process.env.API_KEY : undefined) ||
+    (!isPlaceholderApiKey(process.env.ADMIN_PASSWORD) ? process.env.ADMIN_PASSWORD : undefined) ||
+    configKey;
+  if (envKey && !isPlaceholderApiKey(envKey)) {
     return envKey.trim();
   }
-  return "sk-qwenproxy-local";
+  if (isLoopbackHost(host)) return PLACEHOLDER_API_KEY;
+  throw new Error(
+    `Refusing to sync clients with placeholder API key ${PLACEHOLDER_API_KEY}. Set API_KEY or start the proxy once to generate one.`,
+  );
 }
 
 export function normalizeClientName(name: string): SyncClientName | null {
@@ -148,7 +168,9 @@ export function getDefaultPaths(): {
 
   return {
     claudeCode: path.join(home, ".claude", "settings.json"),
-    codex: process.env.CODEX_HOME
+    codex: fs.existsSync(path.join(home, ".codex", "config.toml"))
+      ? path.join(home, ".codex", "config.toml")
+      : process.env.CODEX_HOME
       ? path.join(process.env.CODEX_HOME, "config.toml")
       : path.join(home, ".codex", "config.toml"),
     openCode: existingOpenCode || openCodeCandidates[0],
@@ -459,7 +481,8 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
   const port = options.port ?? (config.server?.port || 7936);
   const configuredHost = config.server?.host;
   const host = options.host ?? (configuredHost && configuredHost !== "0.0.0.0" ? configuredHost : "127.0.0.1");
-  const apiKey = resolveApiKey(options.apiKey, config.apiKey);
+  const authHost = options.host ?? configuredHost ?? host;
+  const apiKey = resolveApiKey(options.apiKey, config.apiKey, authHost);
   const { anthropicBaseUrl, openaiBaseUrl } = resolveBaseUrls(port, host);
   const stateFilePath = options.stateFilePath || getDefaultStateFilePath();
   const selectedModel = options.model || "qwen3.8-max";
@@ -529,6 +552,7 @@ export function syncAllClients(options: SyncAllOptions = {}): SyncAllResult {
       baseUrl: openaiBaseUrl,
       model: selectedModel,
       models: syncModels,
+      setActive: options.setActive ?? true,
     });
     results.clients.openCode = openCodeRes;
     if (openCodeRes.success && openCodeRes.backupPath) {

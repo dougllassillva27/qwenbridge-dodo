@@ -10,6 +10,11 @@ import { sendOpenAIError } from "../api/error-helpers.js";
 import { buildQwenRequestHeaders } from "../services/qwen-headers.ts";
 import { qwenUrl } from "../services/qwen-url.ts";
 import { config } from "../core/config.ts";
+import {
+  UnsafeRemoteUrlError,
+  assertSafeRemoteMediaUrl,
+  readResponseWithByteCap,
+} from "../core/safe-remote-url.ts";
 
 // Cache the heavy ali-oss module so we import it once, not on every upload.
 let cachedOSSModule: any = null;
@@ -288,11 +293,15 @@ async function downloadRemoteMedia(url: string): Promise<{
   filename: string;
   mime: string;
 }> {
+  await assertSafeRemoteMediaUrl(url);
+  const headMimeGuess = detectFileType(getFilenameFromUrl(url)).mime;
+  const maxSize = getMaxUploadSize(headMimeGuess);
   const response = await fetch(url, {
     headers: {
       "User-Agent": config.auth.userAgent,
       Accept: "image/*,*/*;q=0.8",
     },
+    redirect: "error",
   });
   if (!response.ok) {
     throw new Error(`Remote media download failed: ${response.status}`);
@@ -312,11 +321,10 @@ async function downloadRemoteMedia(url: string): Promise<{
     );
   }
 
-  const buffer = Buffer.from(await response.arrayBuffer());
-  const maxSize = getMaxUploadSize(detectedMime);
-  if (buffer.length > maxSize) {
-    throw new Error(`Remote media too large: ${buffer.length}`);
-  }
+  const buffer = await readResponseWithByteCap(
+    response,
+    getMaxUploadSize(detectedMime) || maxSize,
+  );
 
   return {
     buffer,
@@ -333,21 +341,22 @@ async function getSTSToken(
   filesize: number,
   filetype: string,
   headers: Record<string, string>,
+  accountId?: string,
 ): Promise<STSResponse["data"]> {
-  const response = await fetch(
-    qwenUrl("/api/v2/files/getstsToken"),
-    {
+  const doFetch = (reqHeaders: Record<string, string>) =>
+    fetch(qwenUrl("/api/v2/files/getstsToken"), {
       method: "POST",
       headers: buildQwenRequestHeaders({
-        cookie: headers.cookie,
-        userAgent: headers["user-agent"],
-        bxUa: headers["bx-ua"],
-        bxUmidtoken: headers["bx-umidtoken"],
-        bxV: headers["bx-v"],
+        cookie: reqHeaders.cookie,
+        userAgent: reqHeaders["user-agent"],
+        bxUa: reqHeaders["bx-ua"],
+        bxUmidtoken: reqHeaders["bx-umidtoken"],
+        bxV: reqHeaders["bx-v"],
       }),
       body: JSON.stringify({ filename, filesize: String(filesize), filetype }),
-    },
-  );
+    });
+
+  let response = await doFetch(headers);
 
   if (!response.ok) {
     const errorText = await response.text().catch(() => "");
@@ -356,8 +365,43 @@ async function getSTSToken(
     );
   }
 
-  const data = await response.json();
-  if (!data.success || !data.data) {
+  let data = await response.json().catch(() => null);
+  const is401 =
+    data?.success === false &&
+    (data?.data?.code === "Unauthorized" ||
+      (typeof data?.data?.details === "string" &&
+        data.data.details.includes("401")));
+
+  if (is401) {
+    try {
+      const { refreshHeaders } = await import("../services/playwright.ts");
+      const { getBasicHeaders } = await import("../services/auth-playwright.ts");
+      const { loadAccounts } = await import("../core/accounts.ts");
+      const resolvedId = accountId ?? loadAccounts()[0]?.id;
+      if (resolvedId) {
+        console.warn(
+          `[Upload] STS token 401 — refreshing session with re-auth and retrying...`,
+        );
+        await refreshHeaders(resolvedId, undefined, true);
+        const fresh = await getBasicHeaders(resolvedId);
+        headers.cookie = fresh.cookie;
+        headers["user-agent"] = fresh.userAgent;
+        headers["bx-v"] = fresh.bxV;
+        if (fresh.bxUa) headers["bx-ua"] = fresh.bxUa;
+        if (fresh.bxUmidtoken) headers["bx-umidtoken"] = fresh.bxUmidtoken;
+        response = await doFetch(headers);
+        if (response.ok) {
+          data = await response.json().catch(() => null);
+        }
+      }
+    } catch (refreshErr) {
+      console.warn(
+        `[Upload] Re-auth for STS token failed: ${refreshErr instanceof Error ? refreshErr.message : String(refreshErr)}`,
+      );
+    }
+  }
+
+  if (!data?.success || !data?.data) {
     throw new Error(
       `STS token invalid: ${JSON.stringify(data).substring(0, 200)}`,
     );
@@ -609,6 +653,7 @@ export async function processImagesForQwen(
     file_url?: { url: string };
   }>,
   headers: Record<string, string>,
+  accountId?: string,
 ): Promise<{ text: string; files: QwenFileEntry[] }> {
   const textParts: string[] = [];
   const files: QwenFileEntry[] = [];
@@ -646,16 +691,19 @@ export async function processImagesForQwen(
             fileSize,
             typeInfo.qwenFileType,
             headers,
+            accountId,
           );
           fileUrl = await uploadToOSS(remoteMedia.buffer, stsData, filename);
           fileId = stsData.file_id;
         } catch (err: any) {
+          if (err instanceof UnsafeRemoteUrlError) {
+            console.warn(`[Upload] Blocked unsafe remote media URL: ${err.message}`);
+            continue;
+          }
           console.warn(
-            `[Upload] Failed to re-upload remote media, falling back to source URL: ${err.message}`,
+            `[Upload] Failed to re-upload remote media, skipping attachment: ${err.message}`,
           );
-          fileUrl = mediaUrl;
-          filename = getFilenameFromUrl(mediaUrl);
-          fileId = uuidv4();
+          continue;
         }
       } else if (mediaUrl.startsWith("data:")) {
         try {
@@ -676,6 +724,7 @@ export async function processImagesForQwen(
             fileSize,
             typeInfo.qwenFileType,
             headers,
+            accountId,
           );
           fileUrl = await uploadToOSS(buffer, stsData, filename);
           fileId = stsData.file_id;

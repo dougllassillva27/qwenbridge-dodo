@@ -985,12 +985,12 @@ export async function requestQwenSettingsDirectFetch(
     // passes the WAF.
     let json: any = null;
     let okShape = false;
-    if (contentType.includes("html")) {
+    if (contentType.includes("html") || !response.ok) {
       okShape = false;
     } else {
       try {
         json = JSON.parse(raw);
-        okShape = json && typeof json === "object" && "success" in json;
+        okShape = json && typeof json === "object" && json.success === true;
       } catch {
         okShape = false;
       }
@@ -1666,10 +1666,10 @@ export async function syncQwenRequestPersonalization(
 
   if (isUnauthorized) {
     console.warn(
-      `[Qwen] Personalization 401 — refreshing session and retrying | account=${cacheKey}`,
+      `[Qwen] Personalization 401 — refreshing session with re-auth and retrying | account=${cacheKey}`,
     );
     try {
-      const { headers: freshHeaders } = await getQwenHeaders(true, accountId);
+      const { headers: freshHeaders } = await getQwenHeaders(true, accountId, true);
       requestHeaders = buildCapturedQwenHeaders(freshHeaders, {
         referer: qwenUrl("/settings/personalization"),
       });
