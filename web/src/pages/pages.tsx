@@ -177,24 +177,7 @@ const ENDPOINTS: Endpoint[] = [
     description: 'Página de entrada com redirecionamento automático para este painel de administração (/admin).',
   },
 
-  // Métricas & Integrações
-  {
-    method: 'GET',
-    path: '/metrics/accounts',
-    title: 'Métricas de Contas (JSON)',
-    category: 'metrics',
-    tag: 'Integração Externa',
-    description: 'Endpoint JSON com o estado de cada conta, status de cooldown, memória RAM e streams ativos para monitoramento externo.',
-    sampleCurl: `curl -X GET http://127.0.0.1:50002/metrics/accounts`,
-  },
-  {
-    method: 'GET',
-    path: '/accounts',
-    title: 'Alias /accounts',
-    category: 'metrics',
-    tag: 'Integração Externa',
-    description: 'Alias direto para `/metrics/accounts` com cabeçalhos CORS abertos para integração simplificada com ferramentas externas.',
-  },
+  // Métricas & Monitoramento
   {
     method: 'GET',
     path: '/health',

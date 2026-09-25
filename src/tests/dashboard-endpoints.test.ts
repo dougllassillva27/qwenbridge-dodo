@@ -84,30 +84,6 @@ test("logHub: buffers and detects log levels correctly", () => {
   assert.equal(debugItem.level, "debug");
 });
 
-test("server: GET /metrics/accounts and /accounts return account metrics with CORS", async () => {
-  const { app } = await import("../api/server.ts");
-
-  const res1 = await app.request("/metrics/accounts");
-  assert.equal(res1.status, 200);
-  assert.equal(res1.headers.get("access-control-allow-origin"), "*");
-  const data1 = await res1.json();
-  assert.equal(typeof data1.total, "number");
-  assert.equal(typeof data1.active, "number");
-  assert.equal(typeof data1.cooldown, "number");
-  assert.equal(typeof data1.requests, "number");
-  assert.equal(typeof data1.ram_mb, "number");
-  assert.equal(typeof data1.stream_errors, "number");
-  assert.equal(Array.isArray(data1.accounts), true);
-
-  const res2 = await app.request("/accounts");
-  assert.equal(res2.status, 200);
-  assert.equal(res2.headers.get("access-control-allow-origin"), "*");
-
-  const resOptions = await app.request("/metrics/accounts", { method: "OPTIONS" });
-  assert.equal(resOptions.status, 204);
-  assert.equal(resOptions.headers.get("access-control-allow-origin"), "*");
-});
-
 test("server: /api/hello and /api/version respond 200 to client probes", async () => {
   const { app } = await import("../api/server.ts");
 
