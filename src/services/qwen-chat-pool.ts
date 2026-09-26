@@ -49,6 +49,23 @@ async function createQwenChatSession(
     );
   }
 
+  // Detect unauthorized embedded in a 200 OK body (Qwen returns HTTP 200 with
+  // {"success":false,"data":{"code":"unauthorized"}} when the session is expired).
+  // Must be checked BEFORE extracting chatId so retry-policy can trigger AuthInitFailed.
+  if (json?.success === false) {
+    const bodyCode: string = json?.data?.code || json?.code || "";
+    if (
+      bodyCode.toLowerCase() === "unauthorized" ||
+      bodyCode.toLowerCase() === "unauthenticated"
+    ) {
+      throw new QwenUpstreamError(
+        `Qwen create chat returned unexpected payload: ${raw.substring(0, 300)}`,
+        "unauthorized",
+        401,
+      );
+    }
+  }
+
   const chatId =
     json?.chat_id ||
     json?.id ||

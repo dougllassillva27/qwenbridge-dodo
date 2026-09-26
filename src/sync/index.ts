@@ -174,7 +174,10 @@ export function getDefaultPaths(): {
       : path.join(home, ".codex", "config.toml"),
     openCode: existingOpenCode || openCodeCandidates[0],
     omp: path.join(home, ".omp", "agent", "models.yml"),
-    hermes: path.join(home, ".hermes", "config.yaml"),
+    hermes:
+      process.platform === "win32"
+        ? path.join(process.env.LOCALAPPDATA || path.join(home, "AppData", "Local"), "hermes", "config.yaml")
+        : path.join(home, ".hermes", "config.yaml"),
     openClaw: path.join(home, ".openclaw", "openclaw.json"),
     kilo: existingKilo || kiloCandidates[0],
     cline: clinePath,
