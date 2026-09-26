@@ -350,6 +350,10 @@ export async function isPageLoggedIn(
     const probe = page
       .evaluate(async () => {
         try {
+          if (localStorage.getItem("qwen_token_logged_out_marker")) {
+            return false;
+          }
+
           const res = await fetch("/api/v1/auths/", { method: "GET" });
           if (res.status !== 200) return false;
           const json: any = await res.json().catch(() => null);
@@ -378,6 +382,52 @@ export async function isPageLoggedIn(
               user.token,
           );
           if (!hasIdentity) return false;
+
+          // Check if Alibaba revoked the session upstream via same-origin settings
+          try {
+            const settingsRes = await fetch("/api/v2/users/user/settings", {
+              method: "GET",
+              credentials: "include",
+              signal: AbortSignal.timeout(3000),
+            });
+            if (settingsRes.status === 401 || settingsRes.status === 403) {
+              return false;
+            }
+            const settingsJson: any = await settingsRes.json().catch(() => null);
+            if (settingsJson && settingsJson.success === false) {
+              const code = String(settingsJson.data?.code || settingsJson.code || "").toLowerCase();
+              const details = String(settingsJson.data?.details || settingsJson.details || "").toLowerCase();
+              if (
+                code.includes("unauthorized") ||
+                details.includes("401") ||
+                details.includes("revogado") ||
+                details.includes("revoked")
+              ) {
+                return false;
+              }
+            }
+          } catch {}
+
+          // Fallback cross-origin refresh probe
+          try {
+            const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
+              method: "GET",
+              credentials: "include",
+              signal: AbortSignal.timeout(3000),
+            });
+            if (refreshRes.status === 200) {
+              const refreshJson: any = await refreshRes.json().catch(() => null);
+              if (refreshJson && refreshJson.success === false) {
+                const code = refreshJson.data?.code || refreshJson.code;
+                const details = String(refreshJson.data?.details || "");
+                if (code === "Unauthorized" || details.includes("revogado") || details.includes("revoked")) {
+                  return false;
+                }
+              }
+            } else if (refreshRes.status === 401 || refreshRes.status === 403) {
+              return false;
+            }
+          } catch {}
 
           // If an authenticated user object is confirmed with a real user identity,
           // the session is 100% valid and verified by upstream.
@@ -474,10 +524,10 @@ interface AccountHeaderCache {
 }
 
 const headerCaches = new Map<string, AccountHeaderCache>();
-// Real TTL measured from Qwen: auth token = 30 days, shortest cookie (acw_tc) = 24 min.
-// 20 min is safe: under the 24-min acw_tc, and bx-ua expiry is handled by 403 retry.
-const HEADER_CACHE_TTL = 20 * 60 * 1000; // 20 minutes
-const HEADER_REFRESH_THRESHOLD = 0.8; // Background refresh at 80% of TTL (16 min)
+// Real TTL measured from Qwen: auth token = 30 days. Anti-bot tokens remain stable
+// across the browser session; cookies are dynamically updated from the browser context.
+const HEADER_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const HEADER_REFRESH_THRESHOLD = 0.8; // Background refresh at 80% of TTL
 const COOKIE_CACHE_TTL = 15 * 60 * 1000; // 15 minutes
 const cookieCaches = new Map<string, { cookie: string; timestamp: number }>();
 const lastAccountActivity = new Map<string, number>();
@@ -1077,6 +1127,9 @@ async function tryLightweightCookieRefresh(
     );
     const cookieStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
     cookieCaches.set(accountId, { cookie: cookieStr, timestamp: Date.now() });
+    if (cache && cache.headers) {
+      cache.headers["cookie"] = cookieStr;
+    }
     return true;
   } catch {
     return false;
@@ -1085,11 +1138,13 @@ async function tryLightweightCookieRefresh(
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export async function getCookies(accountId: string): Promise<string> {
+export async function getCookies(accountId: string, forceFresh = false): Promise<string> {
   const now = Date.now();
-  const cached = cookieCaches.get(accountId);
-  if (cached && now - cached.timestamp < COOKIE_CACHE_TTL) {
-    return cached.cookie;
+  if (!forceFresh) {
+    const cached = cookieCaches.get(accountId);
+    if (cached && now - cached.timestamp < COOKIE_CACHE_TTL) {
+      return cached.cookie;
+    }
   }
 
   const page = accountPages.get(accountId);
@@ -1233,8 +1288,7 @@ export async function getBasicHeaders(accountId: string): Promise<{
       const cookieSnapshot = await getCookieSnapshot(accountId);
       if (
         cookieSnapshot &&
-        isAuthTokenValidFrom(cookieSnapshot) &&
-        isShortestCookieValidFrom(cookieSnapshot)
+        isAuthTokenValidFrom(cookieSnapshot)
       ) {
         // Token is still valid - just refresh cookies, keep cached headers
         const cookie = cookieSnapshot
@@ -1283,6 +1337,53 @@ export async function getBasicHeaders(accountId: string): Promise<{
     }
 
     if (!hasRequiredQwenHeaders(cache.headers)) {
+      try {
+        const { getValidAuthSession } = await import("../core/database.ts");
+        const persisted = getValidAuthSession(accountId);
+        if (persisted) {
+          const restoredHeaders: Record<string, string> = {
+            cookie: persisted.cookie,
+            "user-agent": persisted.userAgent,
+            "bx-v": persisted.bxV,
+            "bx-ua": persisted.bxUa,
+            "bx-umidtoken": persisted.bxUmidtoken,
+            ...(persisted.secChUa ? { "sec-ch-ua": persisted.secChUa } : {}),
+            ...(persisted.secChUaMobile ? { "sec-ch-ua-mobile": persisted.secChUaMobile } : {}),
+            ...(persisted.secChUaPlatform ? { "sec-ch-ua-platform": persisted.secChUaPlatform } : {}),
+            ...(persisted.version ? { version: persisted.version } : {}),
+          };
+          if (hasRequiredQwenHeaders(restoredHeaders) && hasValidAuthToken(restoredHeaders.cookie)) {
+            const page = accountPages.get(accountId);
+            if (page && !page.isClosed()) {
+              try {
+                const cookiesToAdd = parseCookiesForBrowser(restoredHeaders.cookie);
+                if (cookiesToAdd.length > 0) {
+                  await page.context().addCookies(cookiesToAdd).catch(() => {});
+                }
+                const tokenMatch = restoredHeaders.cookie.match(/(?:^|;\s*)token=([^;]+)/);
+                if (tokenMatch) {
+                  const tok = decodeURIComponent(tokenMatch[1].trim());
+                  await page.evaluate((t) => {
+                    try {
+                      localStorage.setItem("token", t);
+                      document.cookie = `token=${encodeURIComponent(t)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                    } catch {}
+                  }, tok).catch(() => {});
+                }
+              } catch {}
+            }
+            cache.headers = restoredHeaders;
+            if (persisted.version) {
+              updateQwenWebVersion(persisted.version);
+            }
+            cache.lastRefresh = persisted.capturedAt;
+            markAccountHeadersReady(accountId);
+          }
+        }
+      } catch {}
+    }
+
+    if (!hasRequiredQwenHeaders(cache.headers)) {
       console.log(
         `🔄 [Playwright] Missing required anti-bot headers for ${accountId}, triggering header interception...`,
       );
@@ -1307,7 +1408,11 @@ export async function getBasicHeaders(accountId: string): Promise<{
     const bxV = cache.headers["bx-v"] || "2.5.37";
 
     // Read cookie AFTER all refreshes (re-login may have updated it)
-    const cookie = await getCookies(accountId);
+    cookieCaches.delete(accountId);
+    const cookie = await getCookies(accountId, true);
+    if (cache.headers) {
+      cache.headers["cookie"] = cookie;
+    }
 
     return {
       cookie,
@@ -1432,6 +1537,62 @@ export async function initPlaywrightForAccount(
         await hook(acctContext);
       }
 
+      // Block telemetry pixels, third-party trackers, ad scripts and heavy video/audio media to speed up page loads by 30-50%
+      // Invariant 5: NEVER abort image or stylesheet requests needed by Baxia slider (Canvas tiles on img.alicdn.com)
+      await acctContext.route("**/*", (route) => {
+        const req = route.request();
+        const url = req.url();
+        const type = req.resourceType();
+
+        // 1. Heavy video/audio media (never used for text completions)
+        if (type === "media") {
+          return route.abort().catch(() => {});
+        }
+
+        // 2. Google Tag Manager: fulfill with stub script to avoid runtime undefined errors
+        if (url.includes("googletagmanager.com/gtag/js") || url.includes("google-analytics.com")) {
+          return route.fulfill({
+            status: 200,
+            contentType: "application/javascript",
+            body: "window.dataLayer=window.dataLayer||[];window.gtag=window.gtag||function(){dataLayer.push(arguments)};",
+          }).catch(() => {});
+        }
+
+        // 3. Telemetry tracking pixels, ad networks and event monitors
+        const isTelemetryOrTracker =
+          url.includes("fourier.taobao.com") ||
+          url.includes("googletagmanager") ||
+          url.includes("analytics.google") ||
+          url.includes("doubleclick.net") ||
+          url.includes("connect.facebook") ||
+          url.includes("facebook.com") ||
+          url.includes("adjust.com") ||
+          url.includes("ucweb.com") ||
+          url.includes("hotjar.com") ||
+          url.includes("clarity.ms") ||
+          url.includes("/AWSC/et/"); // Alibaba Event Tracking (safe to block, verified)
+
+        if (isTelemetryOrTracker) {
+          if (type === "script") {
+            return route.fulfill({
+              status: 200,
+              contentType: "application/javascript",
+              body: "",
+            }).catch(() => {});
+          }
+          if (type === "image") {
+            return route.fulfill({
+              status: 200,
+              contentType: "image/gif",
+              body: Buffer.from("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", "base64"),
+            }).catch(() => {});
+          }
+          return route.abort().catch(() => {});
+        }
+
+        return route.continue().catch(() => {});
+      }).catch(() => {});
+
       // If native profile cookies are empty but a backup storage_state.json exists, restore cookies
       const storageState = loadStorageState(account.id);
       if (storageState) {
@@ -1471,7 +1632,78 @@ export async function initPlaywrightForAccount(
       installContextDeathHandlers(account.id, acctContext, acctPage);
       touchAccountActivity(account.id);
 
-      // Check if already logged in
+      // 1. Fast boot: if a valid session exists in SQLite, restore headers and cookies instantly.
+      // Eliminates redundant navigations, DOM probes, and fake UI typing on healthy accounts.
+      let restoredFromDb = false;
+      if (!options.skipHeaderCapture) {
+        try {
+          const { getValidAuthSession } = await import("../core/database.ts");
+          const persisted = getValidAuthSession(account.id);
+          if (persisted) {
+            const restoredHeaders: Record<string, string> = {
+              cookie: persisted.cookie,
+              "user-agent": persisted.userAgent,
+              "bx-v": persisted.bxV,
+              "bx-ua": persisted.bxUa,
+              "bx-umidtoken": persisted.bxUmidtoken,
+              ...(persisted.secChUa ? { "sec-ch-ua": persisted.secChUa } : {}),
+              ...(persisted.secChUaMobile ? { "sec-ch-ua-mobile": persisted.secChUaMobile } : {}),
+              ...(persisted.secChUaPlatform ? { "sec-ch-ua-platform": persisted.secChUaPlatform } : {}),
+              ...(persisted.version ? { version: persisted.version } : {}),
+            };
+            if (hasRequiredQwenHeaders(restoredHeaders) && hasValidAuthToken(restoredHeaders.cookie)) {
+              // Inject cookies into Chromium browser context so in-page requests are authenticated
+              try {
+                const cookiesToAdd = parseCookiesForBrowser(restoredHeaders.cookie);
+                if (cookiesToAdd.length > 0) {
+                  await acctContext.addCookies(cookiesToAdd).catch(() => {});
+                }
+                const tokenMatch = restoredHeaders.cookie.match(/(?:^|;\s*)token=([^;]+)/);
+                if (tokenMatch && !acctPage.isClosed()) {
+                  const tok = decodeURIComponent(tokenMatch[1].trim());
+                  await acctPage.evaluate((t) => {
+                    try {
+                      localStorage.setItem("token", t);
+                      document.cookie = `token=${encodeURIComponent(t)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                    } catch {}
+                  }, tok).catch(() => {});
+                }
+
+                // Read live cookies from browser context
+                const liveCookies = await acctContext.cookies();
+                if (liveCookies.length > 0 && liveCookies.some((c) => c.name === "token")) {
+                  restoredHeaders.cookie = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+                  cookieCaches.set(account.id, { cookie: restoredHeaders.cookie, timestamp: Date.now() });
+                }
+              } catch {}
+
+              const cache = getHeaderCache(account.id);
+              cache.headers = restoredHeaders;
+              if (persisted.version) {
+                updateQwenWebVersion(persisted.version);
+              }
+              cache.lastRefresh = persisted.capturedAt;
+              markAccountHeadersReady(account.id);
+              restoredFromDb = true;
+              console.log(
+                `⚡ [Playwright] Restored anti-bot headers from database for ${maskEmail(account.email)} (age: ${Math.round((Date.now() - persisted.capturedAt) / 60000)}m, bypassed UI typing)`,
+              );
+            }
+          }
+        } catch {}
+      }
+
+      if (restoredFromDb) {
+        if (!acctPage.isClosed() && (acctPage.url() === "about:blank" || !acctPage.url().startsWith(qwenOrigin()))) {
+          void acctPage.goto(qwenUrl("/"), {
+            waitUntil: "domcontentloaded",
+            timeout: config.timeouts.navigation,
+          }).catch(() => {});
+        }
+        return;
+      }
+
+      // 2. Initial setup for fresh accounts without prior session: check cookies or authenticate
       const cookies = await acctContext.cookies();
       const hasAuthCookie = cookies.some(
         (c) =>
@@ -1483,57 +1715,27 @@ export async function initPlaywrightForAccount(
         await loginToQwen(account.id, account.email, account.password);
       }
 
-      // Navigate to the stable chat page to validate the session and populate cookies.
-      // Retry up to 2 times on transient timeouts before giving up.
-      const maxValidationAttempts = 2;
-      let validationError: Error | null = null;
-      for (let vAttempt = 1; vAttempt <= maxValidationAttempts; vAttempt++) {
-        try {
-          await acctPage.goto(qwenUrl("/"), {
-            waitUntil: "domcontentloaded",
-            timeout: config.timeouts.navigation,
-          });
-          await sleep(1500);
-          const currentUrl = acctPage.url();
-          const isAuthUrl = currentUrl.includes("/auth") || currentUrl.includes("/login");
-          const loggedIn = !isAuthUrl && (await isPageLoggedIn(acctPage, 4_000));
-          if (!loggedIn) {
-            if (account.email && account.password) {
-              console.log(
-                `[Playwright] Session expired or guest state detected for ${maskEmail(account.email)}, re-authenticating...`,
-              );
-              const ok = await loginToQwen(account.id, account.email, account.password);
-              if (!ok || !(await isPageLoggedIn(acctPage, 4_000))) {
-                validationError = new Error(
-                  `Session expired for ${maskEmail(account.email)} and re-authentication failed`,
-                );
-                continue;
-              }
-            } else {
-              validationError = new Error(
-                `Session expired for account ${account.id} but no credentials available for re-login (run 'qpx login')`,
-              );
-              break;
-            }
-          }
-          validationError = null;
-          break;
-        } catch (err: any) {
-          validationError = err;
-          if (vAttempt < maxValidationAttempts) {
-            console.warn(
-              `⚠️  [Playwright] Session validation attempt ${vAttempt}/${maxValidationAttempts} failed for ${maskEmail(account.email)}: ${err.message}, retrying...`,
-            );
-            await sleep(3000);
-          }
+      // Initial navigation to chat home
+      try {
+        await acctPage.goto(qwenUrl("/"), {
+          waitUntil: "domcontentloaded",
+          timeout: config.timeouts.navigation,
+        });
+        await sleep(1500);
+        const currentUrl = acctPage.url();
+        const isAuthUrl = currentUrl.includes("/auth") || currentUrl.includes("/login");
+        if (isAuthUrl && account.email && account.password) {
+          console.log(
+            `[Playwright] Initial login needed for ${maskEmail(account.email)}, authenticating...`,
+          );
+          await loginToQwen(account.id, account.email, account.password);
         }
-      }
-      if (validationError) {
+      } catch (err: any) {
         console.warn(
-          `❌ [Playwright] Failed to validate session for ${maskEmail(account.email)} after ${maxValidationAttempts} attempts: ${validationError.message}`,
+          `⚠️  [Playwright] Initial navigation check for ${maskEmail(account.email)}: ${err.message}`,
         );
-        throw validationError;
       }
+
       if (!options.skipHeaderCapture) {
         (acctPage as any).__qwenChatHomeLoaded = true;
         await captureQwenHeaders(account.id);
@@ -1809,9 +2011,27 @@ async function loginToQwen(
 
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (page.isClosed()) {
+      console.warn(
+        `⚠️  [Playwright] Login aborted: page was closed for ${maskEmail(email)}`,
+      );
+      return false;
+    }
+
     // Try API login first
     const apiResult = await loginViaApi(page, email, password);
     if (apiResult.success) {
+      cookieCaches.delete(accountId);
+      const cache = headerCaches.get(accountId);
+      if (cache) {
+        cache.headers = {};
+        cache.lastRefresh = 0;
+      }
+      unmarkAccountHeadersReady(accountId);
+      try {
+        const { deleteAuthSession } = await import("../core/database.ts");
+        deleteAuthSession(accountId);
+      } catch {}
       await saveStorageState(page.context(), accountId);
       return true;
     }
@@ -1831,6 +2051,17 @@ async function loginToQwen(
     // Fallback to UI login
     const uiResult = await loginViaUi(page, email, password);
     if (uiResult.success) {
+      cookieCaches.delete(accountId);
+      const cache = headerCaches.get(accountId);
+      if (cache) {
+        cache.headers = {};
+        cache.lastRefresh = 0;
+      }
+      unmarkAccountHeadersReady(accountId);
+      try {
+        const { deleteAuthSession } = await import("../core/database.ts");
+        deleteAuthSession(accountId);
+      } catch {}
       await saveStorageState(page.context(), accountId);
       return true;
     }
@@ -1854,6 +2085,20 @@ async function loginToQwen(
       );
       await sleep(backoffMs);
     }
+
+    if (page.isClosed()) {
+      console.warn(
+        `⚠️  [Playwright] Login aborted: page was closed for ${maskEmail(email)}`,
+      );
+      return false;
+    }
+  }
+
+  if (page.isClosed()) {
+    console.warn(
+      `⚠️  [Playwright] Login aborted: page was closed for ${maskEmail(email)}`,
+    );
+    return false;
   }
 
   console.error(
@@ -1873,17 +2118,6 @@ async function loginViaApi(
   password: string,
 ): Promise<LoginAttemptResult> {
   try {
-    await page.goto(qwenUrl("/auth"), {
-      waitUntil: "domcontentloaded",
-      timeout: config.timeouts.navigation,
-    });
-    await sleep(2000);
-
-    // Check if already logged in
-    if (!page.url().includes("/auth")) {
-      return { success: true };
-    }
-
     const hashedPassword = crypto
       .createHash("sha256")
       .update(password)
@@ -1906,6 +2140,7 @@ async function loginViaApi(
             accept: "application/json, text/plain, */*",
             referer: qwenUrl("/auth"),
             origin: qwenOrigin(),
+            source: "web",
           },
           timeout: 10_000,
         });
@@ -1991,17 +2226,13 @@ async function loginViaApi(
         await page
           .evaluate((tok) => {
             try {
+              localStorage.removeItem("qwen_token_logged_out_marker");
               localStorage.setItem("token", tok);
               document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
             } catch {}
           }, token)
           .catch(() => {});
         await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-      }
-
-      await sleep(1500);
-      const loggedIn = await isPageLoggedIn(page, 5_000);
-      if (loggedIn) {
         return { success: true };
       }
     }
@@ -2031,19 +2262,11 @@ async function loginViaUi(
   password: string,
 ): Promise<LoginAttemptResult> {
   try {
-    if (page.url().startsWith(qwenOrigin()) && !page.url().includes("/auth") && !page.url().includes("/login")) {
-      return { success: true };
-    }
     await page.goto(qwenUrl("/auth"), {
       waitUntil: "domcontentloaded",
       timeout: config.timeouts.navigation,
     });
     await sleep(1500);
-
-    // Check if already logged in
-    if (!page.url().includes("/auth") && !page.url().includes("/login")) {
-      return { success: true };
-    }
 
     // Wait for email input
     const emailSelector = [
@@ -2055,9 +2278,12 @@ async function loginViaUi(
     ].join(", ");
     try {
       await page.waitForSelector(emailSelector, {
-        timeout: config.timeouts.page,
+        timeout: Math.min(config.timeouts.page, 8_000),
       });
     } catch {
+      if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
+        return { success: true };
+      }
       if (!page.url().includes("/auth")) return { success: true };
       console.warn(
         `⚠️  [Playwright] Email input not found on ${page.url()} (possible captcha or anti-bot challenge)`,
@@ -2409,6 +2635,26 @@ export async function captureQwenHeaders(
       cookieCaches.delete(accountId);
       touchAccountActivity(accountId);
 
+      // Persist captured anti-bot headers to SQLite for instant boot
+      try {
+        const { saveAuthSession } = await import("../core/database.ts");
+        const { parseJwtExpiry } = await import("../utils/jwt.ts");
+        const tokenExpiry = parseJwtExpiry(capturedHeaders.cookie);
+        saveAuthSession(accountId, {
+          cookie: capturedHeaders.cookie,
+          userAgent: capturedHeaders["user-agent"],
+          bxV: capturedHeaders["bx-v"],
+          bxUa: capturedHeaders["bx-ua"],
+          bxUmidtoken: capturedHeaders["bx-umidtoken"],
+          secChUa: capturedHeaders["sec-ch-ua"],
+          secChUaMobile: capturedHeaders["sec-ch-ua-mobile"],
+          secChUaPlatform: capturedHeaders["sec-ch-ua-platform"],
+          version: capturedHeaders["version"],
+          tokenExpiresAt: tokenExpiry || undefined,
+          capturedAt: Date.now(),
+        });
+      } catch {}
+
       await route.abort("aborted").catch(() => {});
       await sleep(HEADER_CAPTURE_SETTLE_MS);
       settle();
@@ -2440,13 +2686,13 @@ export async function captureQwenHeaders(
 
       // Session-expiry check: if the page redirected to /auth or /login,
       // re-login immediately.
-      // On attempts 1 and 2, do NOT run a tight 3s fetch probe because the session
-      // was already verified during init. Only run isPageLoggedIn if attempt >= 3
-      // (as a last-resort recovery before giving up) and with a generous 8s timeout.
-      const currentUrl = page.url();
+      // On attempt 1, skip probe because the session was just verified during init.
+      // On attempt 2+, probe isPageLoggedIn to catch revoked sessions or guest state
+      // immediately without waiting for repeated silent timeouts.
+      const currentUrl = typeof page.url === "function" ? page.url() : "";
       const isAuthUrl = currentUrl.includes("/auth") || currentUrl.includes("/login");
-      const isSuspectedGuest = attempt >= 3 && !(await isPageLoggedIn(page, 8000));
-      if (isAuthUrl || isSuspectedGuest) {
+      const isSuspectedGuest = isAuthUrl || (attempt >= 2 && !(await isPageLoggedIn(page, 5000)));
+      if (isSuspectedGuest) {
         const { getAccountCredentials } = await import("../core/accounts.ts");
         const creds = getAccountCredentials(accountId);
         if (creds && creds.email && creds.password) {
@@ -2771,6 +3017,30 @@ export function hasValidAuthToken(cookieHeader?: string): boolean {
   return true;
 }
 
+export function parseCookiesForBrowser(cookieHeader: string): Array<{ name: string; value: string; domain: string; path: string; expires: number }> {
+  if (!cookieHeader) return [];
+  const pairs = cookieHeader.split(";").map((s) => s.trim()).filter(Boolean);
+  const result: Array<{ name: string; value: string; domain: string; path: string; expires: number }> = [];
+  const expires = Math.floor(Date.now() / 1000) + 3600 * 24 * 365;
+  for (const pair of pairs) {
+    const eqIdx = pair.indexOf("=");
+    if (eqIdx !== -1) {
+      const name = pair.slice(0, eqIdx).trim();
+      const value = pair.slice(eqIdx + 1).trim();
+      if (name) {
+        result.push({
+          name,
+          value,
+          domain: ".qwen.ai",
+          path: "/",
+          expires,
+        });
+      }
+    }
+  }
+  return result;
+}
+
 /**
  * Check if the auth token cookie is still valid.
  * Used to skip unnecessary header recaptures when the token is still fresh.
@@ -2841,6 +3111,7 @@ async function refreshHeadersInternal(
   try {
     // Check if session is expired before capturing headers
     const page = accountPages.get(accountId);
+    let reauthExecuted = false;
     if (page) {
       const executeReauth = async () => {
         console.warn(
@@ -2857,6 +3128,7 @@ async function refreshHeadersInternal(
               `Re-login for ${accountId} did not restore an authenticated session`,
             );
           }
+          reauthExecuted = true;
         } else {
           unmarkAccountHeadersReady(accountId);
           throw new Error(
@@ -2889,6 +3161,37 @@ async function refreshHeadersInternal(
             (navErr as Error).message,
           );
           await executeReauth();
+        }
+      }
+
+      // Fast re-auth completion: if re-auth succeeded and required anti-bot tokens are already cached,
+      // refresh cookies directly without running slow UI typing interception.
+      if (reauthExecuted && hasRequiredQwenHeaders(cache.headers)) {
+        const liveCookies = await page.context().cookies();
+        if (liveCookies.some((c) => c.name === "token")) {
+          const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+          cache.headers.cookie = cookieStr;
+          cache.lastRefresh = Date.now();
+          markAccountHeadersReady(accountId);
+          try {
+            const { saveAuthSession } = await import("../core/database.ts");
+            const tokenCookie = liveCookies.find((c) => c.name === "token");
+            const exp = tokenCookie ? parseJwtExpiry(tokenCookie.value) : undefined;
+            saveAuthSession(accountId, {
+              cookie: cookieStr,
+              userAgent: cache.headers["user-agent"] || "",
+              bxV: cache.headers["bx-v"] || "2.5.37",
+              bxUa: cache.headers["bx-ua"] || "",
+              bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+              secChUa: cache.headers["sec-ch-ua"] || undefined,
+              secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+              secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+              version: cache.headers["version"] || undefined,
+              tokenExpiresAt: exp || undefined,
+              capturedAt: Date.now(),
+            });
+          } catch {}
+          return;
         }
       }
     }
