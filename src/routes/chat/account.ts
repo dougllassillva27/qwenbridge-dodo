@@ -1238,15 +1238,13 @@ async function tryCreateStreamWithRetry(
 							error instanceof Error ? error.message : String(error);
 					}
 
-					// Agent instructions ride ONLY the account-level personalization —
-					// the prompt never carries them. An unconfirmed sync must fail the
-					// attempt (retryable → rotates accounts, each re-syncs on its own
-					// account) instead of degrading to inline. An empty instruction has
-					// nothing to guarantee (plain chat), so it stays best-effort.
+					// When account-level personalization cannot be applied (e.g. 401 on settings endpoint),
+					// degrade gracefully to inline prompt injection rather than failing the account and cascading cooldowns.
 					if (instruction && !personalizationApplied) {
-						throw new PersonalizationSyncError(
-							`personalization sync not confirmed for ${currentAccountEmail}: ${syncFailure ?? "settings response did not confirm the instruction"}`,
+						console.log(
+							`💡 [Chat] Personalization sync not applied for ${currentAccountEmail} (${syncFailure ?? "unconfirmed"}), delivering instructions inline in prompt`,
 						);
+						promptForUpstream = `${instruction}\n\n${effectivePrompt}`;
 					}
 				} finally {
 					combinedSignal.removeEventListener("abort", onPersonalizationAbort);

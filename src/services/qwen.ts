@@ -1655,7 +1655,8 @@ export async function syncQwenRequestPersonalization(
   // should be a valid dictionary..." — the body is not parsed as a JSON object).
   ({ raw, json } = await attemptPost(requestHeaders));
 
-  // Layer 2: On 401/Unauthorized → refresh session and retry once
+  // Layer 2: On 401/Unauthorized or failure → fallback immediately to inline prompt delivery.
+  // Never disrupt active browser sessions, never call getQwenHeaders(true), and never trigger reauth for personalization.
   const isUnauthorized =
     json?.success === false &&
     (json?.data?.code === "Unauthorized" ||
@@ -1663,42 +1664,10 @@ export async function syncQwenRequestPersonalization(
       (typeof json?.data?.details === "string" &&
         json.data.details.includes("401")));
 
-  if (isUnauthorized) {
+  if (isUnauthorized || json?.success === false) {
     console.warn(
-      `[Qwen] Personalization 401 — refreshing session and retrying | account=${cacheKey}`,
+      `[Qwen] Personalization endpoint ${isUnauthorized ? "unauthorized (401)" : "failed"} for ${cacheKey}. Fallback to inline prompt delivery.`,
     );
-    try {
-      const { headers: freshHeaders } = await getQwenHeaders(true, accountId, true);
-      requestHeaders = buildCapturedQwenHeaders(freshHeaders, {
-        referer: qwenUrl("/settings/personalization"),
-      });
-      ({ raw, json } = await attemptPost(requestHeaders));
-    } catch (retryErr) {
-      // Layer 3: Retry failed → non-fatal, continue without personalization
-      console.warn(
-        `[Qwen] Personalization retry failed, continuing without it | account=${cacheKey} | error=${(retryErr as Error).message?.substring(0, 150)}`,
-      );
-      return false;
-    }
-  }
-
-  // Layer 3: Check final result
-  if (json?.success === false) {
-    const isStillUnauthorized =
-      json?.data?.code === "Unauthorized" ||
-      json?.data?.code === "unauthorized" ||
-      (typeof json?.data?.details === "string" &&
-        json.data.details.includes("401"));
-
-    console.warn(
-      `[Qwen] Personalization sync failed (${isStillUnauthorized ? "unauthorized" : "non-fatal"}) | account=${cacheKey} | response=${raw.slice(0, 200)}`,
-    );
-
-    if (isStillUnauthorized) {
-      throw new PersonalizationSyncError(
-        `401 Unauthorized for account ${cacheKey}: session expired or login invalid`,
-      );
-    }
     return false;
   }
 
@@ -2647,7 +2616,7 @@ async function createQwenStreamInternal(
   // Header recapture is much more expensive and should be reserved for real refresh/login cases,
   // not for ordinary first prompts that simply need parent_id reset.
   const captured = await getQwenHeaders(
-    options?.forceNewChat === true,
+    false,
     accountId,
   );
   ensureNotAborted();

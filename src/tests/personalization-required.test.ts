@@ -135,20 +135,19 @@ test("retry policy: unconfirmed personalization rotates accounts", () => {
   );
   assert.strictEqual(policy.retryable, true);
   assert.strictEqual(policy.switchAccount, true);
-  assert.strictEqual(policy.forceNewChat, true);
+  assert.strictEqual(policy.forceNewChat, false);
   assert.strictEqual(policy.retryWithFullPrompt, false);
   assert.strictEqual(policy.reason, "personalization_sync_failed");
 });
 
 // ---------------------------------------------------------------------------
-// e2e — the request fails instead of degrading to inline
+// e2e — resilient fallback to inline prompt delivery
 // ---------------------------------------------------------------------------
 
-test("e2e: unconfirmed personalization fails the request (no inline fallback, no completion sent)", async () => {
+test("e2e: unconfirmed personalization degrades gracefully to inline delivery and succeeds", async () => {
   // Force every personalization sync to report "not applied" (mock-mode hook
-  // in qwen.ts). With a non-empty system instruction the request MUST fail
-  // with 503 personalization_unavailable instead of sending the instructions
-  // inline, and it must never reach the upstream completions endpoint.
+  // in qwen.ts). With a non-empty system instruction the request now gracefully
+  // delivers instructions inline in the prompt and completes with HTTP 200.
   process.env.TEST_PERSONALIZATION_SYNC_FAIL = "true";
 
   const originalFetch = globalThis.fetch;
@@ -210,19 +209,10 @@ test("e2e: unconfirmed personalization fails the request (no inline fallback, no
 
     assert.strictEqual(
       res.status,
-      503,
-      "unconfirmed personalization must fail the request",
+      200,
+      "unconfirmed personalization should succeed via inline prompt injection",
     );
-    const text = await res.text();
-    assert.ok(
-      text.includes("personalization"),
-      `error must name the personalization failure, got: ${text.substring(0, 200)}`,
-    );
-    assert.strictEqual(
-      completionCalls,
-      0,
-      "no completion may be sent without confirmed personalization",
-    );
+    assert.strictEqual(completionCalls, 1, "completion must be sent upstream with inline instructions");
   } finally {
     delete process.env.TEST_PERSONALIZATION_SYNC_FAIL;
     globalThis.fetch = originalFetch;

@@ -3277,7 +3277,14 @@ async function refreshHeadersInternal(
             `[Playwright] Navigation check failed during refresh for ${accountId}:`,
             (navErr as Error).message,
           );
-          await executeReauth();
+          try {
+            const url = page.url();
+            if (url.includes("auth") || url.includes("login")) {
+              await executeReauth();
+            }
+          } catch {
+            // ignore
+          }
         }
       }
     }

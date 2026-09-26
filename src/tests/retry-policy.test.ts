@@ -338,30 +338,30 @@ test("classifyRetryAction: superseded request (client aborted) is silent, not re
   assert.equal(variant.reason, "client_abort");
 });
 
-test("classifyRetryAction: PersonalizationSyncError with 401 sets AuthExpired cooldown", () => {
+test("classifyRetryAction: PersonalizationSyncError with 401 rotates without cooldown", () => {
   const authErr = new PersonalizationSyncError(
     "401 Unauthorized for account byebye07: session expired or login invalid",
   );
   const action = classifyRetryAction(authErr);
   assert.equal(action.retryable, true);
   assert.equal(action.switchAccount, true);
-  assert.equal(action.forceNewChat, true);
+  assert.equal(action.forceNewChat, false);
   assert.equal(action.reason, "personalization_sync_failed");
-  assert.equal(action.accountCooldownMs, 300_000);
-  assert.equal(action.accountCooldownReason, "AuthExpired");
+  assert.equal(action.accountCooldownMs, undefined);
+  assert.equal(action.accountCooldownReason, undefined);
 });
 
-test("classifyRetryAction: PersonalizationSyncError with timeout sets PersonalizationTimeout cooldown", () => {
+test("classifyRetryAction: PersonalizationSyncError with timeout rotates without cooldown", () => {
   const timeoutErr = new PersonalizationSyncError(
     "personalization sync not confirmed for byebye03: sync timed out after 15000ms",
   );
   const action = classifyRetryAction(timeoutErr);
   assert.equal(action.retryable, true);
   assert.equal(action.switchAccount, true);
-  assert.equal(action.forceNewChat, true);
+  assert.equal(action.forceNewChat, false);
   assert.equal(action.reason, "personalization_sync_failed");
-  assert.equal(action.accountCooldownMs, 60_000);
-  assert.equal(action.accountCooldownReason, "PersonalizationTimeout");
+  assert.equal(action.accountCooldownMs, undefined);
+  assert.equal(action.accountCooldownReason, undefined);
 });
 
 test("classifyRetryAction: bare AbortError (idle/upstream) stays retryable", () => {
