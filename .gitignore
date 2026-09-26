@@ -48,3 +48,4 @@ docs/
 manager.ps1
 .serena/
 message*.txt
+*.tar.gz

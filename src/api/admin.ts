@@ -431,9 +431,9 @@ adminApp.post('/api/accounts/:id/clear-cooldown', adminGuard, (c) => {
 
 adminApp.post('/api/accounts/:id/refresh', adminGuard, async (c) => {
   try {
-    const { refreshHeaders } = await import('../services/playwright.js');
-    const success = await refreshHeaders(c.req.param('id'));
-    return c.json({ ok: Boolean(success) });
+    const { refreshHeadersWithProfileReset } = await import('../services/playwright.js');
+    await refreshHeadersWithProfileReset(c.req.param('id'));
+    return c.json({ ok: true });
   } catch (err: any) {
     return c.json({ error: err.message }, 400);
   }

@@ -76,6 +76,18 @@ export function markAccountRateLimited(
       `⏱️  [AccountManager] Cooldown set | ${accountId} | reason=${cooldownReason} | ${Math.round(duration / 1000)}s | until=${formatCooldownUntil(new Date(until))}`,
     );
   }
+
+  // [Dodo Self-Healing] Dispara auto-recuperação assíncrona se a sessão expirou ou login falhou
+  if (
+    accountId !== "global" &&
+    (cooldownReason === "AuthExpired" || cooldownReason === "AuthInitFailed")
+  ) {
+    import("../services/playwright.ts")
+      .then(({ schedulePlaywrightProfileReset }) => {
+        schedulePlaywrightProfileReset(accountId);
+      })
+      .catch(() => {});
+  }
 }
 
 export function clearAccountCooldown(accountId: string): void {

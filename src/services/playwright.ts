@@ -3635,10 +3635,23 @@ export async function refreshHeadersWithProfileReset(
     await closePlaywrightForAccount(accountId).catch(() => {});
     throw error;
   });
+
+  // [Dodo Self-Healing] Sessão reautenticada com sucesso: limpa o cooldown para devolver a conta ao pool
+  try {
+    const { clearAccountCooldown } = await import("../core/account-manager.ts");
+    clearAccountCooldown(accountId);
+    console.log(
+      `✨ [Playwright:Self-Healing] Sessão de ${maskEmail(account.email)} restaurada com sucesso! Cooldown removido.`,
+    );
+  } catch {}
 }
 
 export function schedulePlaywrightProfileReset(accountId: string): void {
-  if (closingAllPlaywright || profileResetQueue.has(accountId)) return;
+  const isMock =
+    process.env.AUTH_MOCK === "true" ||
+    process.env.NODE_ENV === "test" ||
+    process.env.MOCK_AUTH === "1";
+  if (isMock || closingAllPlaywright || profileResetQueue.has(accountId)) return;
 
   const resetPromise = profileResetChain
     .catch(() => {})
