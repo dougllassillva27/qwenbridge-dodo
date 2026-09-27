@@ -68,6 +68,9 @@ const BAXIA_IFRAME_SELECTORS = [
 ] as const;
 
 const BAXIA_DOCUMENT_SELECTORS = [
+  "#waf_nc_block",
+  "#WAF_NC_WRAPPER",
+  "#aliyunCaptcha-window-embed",
   "#nocaptcha",
   "#baxia-punish .nc-container",
   "#baxia-punish",
@@ -81,15 +84,15 @@ const BAXIA_DOCUMENT_SELECTORS = [
 export const BAXIA_IFRAME_SELECTOR = BAXIA_IFRAME_SELECTORS.join(", ");
 
 const BAXIA_SLIDER_SELECTOR =
-  "#nc_1_n1z, .nc_1_n1z, #nc_2_n1z, .nc_2_n1z, div[id*='_n1z'], span[id*='_n1z'], .btn_slide, .nc_wrapper .btn_slide, ._nc .btn_slide, .nc-container .btn_slide, div[role='slider'], div.slidetounlock, .nc_iconfont, .nc-lang-cnt, .button, span.btn_slide, div.btn_slide";
+  "#aliyunCaptcha-sliding-slider, .slider-move, #nc_1_n1z, .nc_1_n1z, #nc_2_n1z, .nc_2_n1z, div[id*='_n1z'], span[id*='_n1z'], .btn_slide, .nc_wrapper .btn_slide, ._nc .btn_slide, .nc-container .btn_slide, div[role='slider'], div.slidetounlock, .nc_iconfont, .nc-lang-cnt, .button, span.btn_slide, div.btn_slide";
 const BAXIA_TRACK_SELECTOR =
-  "#nc_1_n1t, .nc_scale, #nc_2_n1t, .nc_2_n1t, div[id*='_n1t'], .nc_wrapper .nc_scale, ._nc .nc_scale, .nc-container .nc_scale, .nc_bg, .scale_text, #nc_1__scale_text, #nc_2__scale_text";
+  "#aliyunCaptcha-sliding-body, #aliyunCaptcha-sliding-text-box, #nc_1_n1t, .nc_scale, #nc_2_n1t, .nc_2_n1t, div[id*='_n1t'], .nc_wrapper .nc_scale, ._nc .nc_scale, .nc-container .nc_scale, .nc_bg, .scale_text, #nc_1__scale_text, #nc_2__scale_text";
 const BAXIA_CONTAINER_SELECTOR =
-  "#nc_1_wrapper, #nc_2_wrapper, .nc-container, #nocaptcha, div[id*='nc_'][id*='_wrapper'], .nc_wrapper, #baxia-dialog-content, .baxia-dialog, #baxia-punish, body";
+  "#aliyunCaptcha-window-embed, #aliyunCaptcha-img-box, #WAF_NC_WRAPPER, #waf_nc_block, #nc_1_wrapper, #nc_2_wrapper, .nc-container, #nocaptcha, div[id*='nc_'][id*='_wrapper'], .nc_wrapper, #baxia-dialog-content, .baxia-dialog, #baxia-punish, body";
 const BAXIA_SUCCESS_SELECTOR =
-  ".btn_ok, .nc_ok, .nc_success, .nc_result, .nc_wrapper.nc-success, .nc_wrapper.success, [data-nc-lang=\"SUCCESS\"], [data-nc-lang=\"success\"], #nc-loading-circle";
+  ".btn_ok, .nc_ok, .nc_success, .nc_result, .nc_wrapper.nc-success, .nc_wrapper.success, [data-nc-lang=\"SUCCESS\"], [data-nc-lang=\"success\"], #nc-loading-circle, .aliyunCaptcha-success";
 const BAXIA_RELOAD_SELECTOR =
-  "#nc_1_refresh1, .errloading a, .nc-container .errloading a, .btn_refresh, .clickCaptcha_text .btn_refresh, [data-nc-lang=\"REFRESH\"], a[id*=\"refresh\"]";
+  "#aliyunCaptcha-btn-refresh, button#aliyunCaptcha-btn-refresh, #nc_1_refresh1, .errloading a, .nc-container .errloading a, .btn_refresh, .clickCaptcha_text .btn_refresh, [data-nc-lang=\"REFRESH\"], a[id*=\"refresh\"], button[aria-label*=\"刷新\"]";
 /**
  * Envia uma captura do captcha para o microserviço captchaResolve (OpenAI/Vision).
  * Suporta múltiplos endpoints/IPs (ex: local e VPS) com failover automático.
@@ -193,6 +196,138 @@ export async function resolveViaCaptchaService(
     return null;
   } catch (err: any) {
     console.warn(`⚠️ [Captcha] Erro no captchaResolve: ${err.message || String(err)}`);
+    return null;
+  }
+}
+
+/**
+ * Tenta resolver o captcha do tipo Puzzle localmente no navegador (sem IA),
+ * analisando via Canvas HTML5 a imagem de fundo e a peça do quebra-cabeça
+ * para encontrar o entalhe/sombra (notch) com menor luminosidade de borda.
+ */
+export async function detectPuzzleGapLocally(
+  frame: BaxiaLocatorContext,
+  trackWidth = 300,
+): Promise<number | null> {
+  try {
+    const box = frame.locator("#aliyunCaptcha-img-box, .puzzle").first();
+    if (typeof (box as any).evaluate !== "function") return null;
+
+    const result = await (box as any)
+      .evaluate((container: HTMLElement) => {
+        const bgImg = container.querySelector(
+          "#aliyunCaptcha-img, img.puzzle",
+        ) as HTMLImageElement | null;
+        const pzImg = container.querySelector(
+          "#aliyunCaptcha-puzzle, img[id*='puzzle']",
+        ) as HTMLImageElement | null;
+
+        if (!bgImg || !pzImg) return null;
+
+        const bgW = bgImg.naturalWidth || bgImg.width;
+        const bgH = bgImg.naturalHeight || bgImg.height;
+        const pzW = pzImg.naturalWidth || pzImg.width;
+        const pzH = pzImg.naturalHeight || pzImg.height;
+
+        if (!bgW || !bgH || !pzW || !pzH) return null;
+
+        const canvasBg = document.createElement("canvas");
+        canvasBg.width = bgW;
+        canvasBg.height = bgH;
+        const ctxBg = canvasBg.getContext("2d");
+        if (!ctxBg) return null;
+        ctxBg.drawImage(bgImg, 0, 0);
+        const bgData = ctxBg.getImageData(0, 0, bgW, bgH).data;
+
+        const canvasPz = document.createElement("canvas");
+        canvasPz.width = pzW;
+        canvasPz.height = pzH;
+        const ctxPz = canvasPz.getContext("2d");
+        if (!ctxPz) return null;
+        ctxPz.drawImage(pzImg, 0, 0);
+        const pzData = ctxPz.getImageData(0, 0, pzW, pzH).data;
+
+        // Identifica a bounding box da peça (pixels opacos)
+        let minX = pzW;
+        let maxX = 0;
+        let minY = pzH;
+        let maxY = 0;
+        for (let y = 0; y < pzH; y++) {
+          for (let x = 0; x < pzW; x++) {
+            const a = pzData[(y * pzW + x) * 4 + 3];
+            if (a > 50) {
+              if (x < minX) minX = x;
+              if (x > maxX) maxX = x;
+              if (y < minY) minY = y;
+              if (y > maxY) maxY = y;
+            }
+          }
+        }
+
+        if (maxX <= minX || maxY <= minY) return null;
+
+        // Coleta as bordas da peça do quebra-cabeça
+        const pieceEdges: Array<{ x: number; y: number }> = [];
+        for (let y = minY; y <= maxY; y++) {
+          for (let x = minX; x <= maxX; x++) {
+            const a = pzData[(y * pzW + x) * 4 + 3];
+            if (a > 50) {
+              const isEdge =
+                x === minX ||
+                x === maxX ||
+                y === minY ||
+                y === maxY ||
+                pzData[(y * pzW + x - 1) * 4 + 3] <= 50 ||
+                pzData[(y * pzW + x + 1) * 4 + 3] <= 50 ||
+                pzData[((y - 1) * pzW + x) * 4 + 3] <= 50 ||
+                pzData[((y + 1) * pzW + x) * 4 + 3] <= 50;
+              if (isEdge) {
+                pieceEdges.push({ x: x - minX, y });
+              }
+            }
+          }
+        }
+
+        if (pieceEdges.length === 0) return null;
+
+        // Varrer o fundo na faixa Y da peça buscando o menor score de luminância (entalhe sombreado)
+        let bestX = 0;
+        let minScore = Infinity;
+        const pieceW = maxX - minX;
+        const startX = Math.max(30, minX + 20);
+        const endX = bgW - pieceW - 5;
+
+        for (let targetX = startX; targetX <= endX; targetX++) {
+          let score = 0;
+          for (let i = 0; i < pieceEdges.length; i++) {
+            const pt = pieceEdges[i];
+            const bgX = targetX + pt.x;
+            const bgY = pt.y;
+            const idx = (bgY * bgW + bgX) * 4;
+            const r = bgData[idx];
+            const g = bgData[idx + 1];
+            const b = bgData[idx + 2];
+            score += 0.299 * r + 0.587 * g + 0.114 * b;
+          }
+          if (score < minScore) {
+            minScore = score;
+            bestX = targetX;
+          }
+        }
+
+        return {
+          rawX: bestX,
+          bgWidth: bgW,
+        };
+      })
+      .catch(() => null);
+
+    if (result && result.rawX && result.bgWidth) {
+      const scale = trackWidth / result.bgWidth;
+      return Math.round(result.rawX * scale);
+    }
+    return null;
+  } catch {
     return null;
   }
 }
@@ -517,7 +652,7 @@ async function solveBaxiaCaptchaUnlocked(
         // Fallback: se o seletor específico falhar, tenta achar qualquer botão de slider no frame
         const genericSlider = frame
           .locator(
-            ".btn_slide, div[role='slider'], div.slidetounlock, .nc_iconfont, span[class*='btn']",
+            "#aliyunCaptcha-sliding-slider, .slider-move, .btn_slide, div[role='slider'], div.slidetounlock, .nc_iconfont, span[class*='btn']",
           )
           .first();
         if (await isVisible(genericSlider)) {
@@ -536,7 +671,7 @@ async function solveBaxiaCaptchaUnlocked(
       if (!sliderBox) {
         const genericSlider = frame
           .locator(
-            ".btn_slide, div[role='slider'], div.slidetounlock, .nc_iconfont, span[class*='btn']",
+            "#aliyunCaptcha-sliding-slider, .slider-move, .btn_slide, div[role='slider'], div.slidetounlock, .nc_iconfont, span[class*='btn']",
           )
           .first();
         sliderBox = await genericSlider.boundingBox().catch(() => null);
@@ -551,8 +686,45 @@ async function solveBaxiaCaptchaUnlocked(
         const trackWidth = trackBox?.width ?? 300;
         let dragDistance = Math.max(0, trackWidth - sliderBox.width);
 
-        if (attempt <= 2) {
-          // Tentativas 1 e 2: SEMPRE tenta primeiramente pelo código local nativo (2x forçado localmente sem acionar a API)
+        const puzzleMarker = frame.locator("#aliyunCaptcha-puzzle, #aliyunCaptcha-img-box, .puzzle").first();
+        const isPuzzle = await isVisible(puzzleMarker);
+
+        if (isPuzzle) {
+          if (attempt <= 2) {
+            console.log(
+              `🧩 [Captcha] Puzzle Jigsaw detectado (Tentativa ${attempt}/2 - Local). Tentando resolução nativa por código...`,
+            );
+            const localX = await detectPuzzleGapLocally(frame, trackWidth);
+            if (localX !== null && localX > 0) {
+              const offsetAdjustment = attempt === 2 ? 2 : 0;
+              dragDistance = Math.max(20, Math.min(trackWidth - 30, localX + offsetAdjustment));
+              console.log(
+                `📐 [Captcha] Detecção local de quebra-cabeça calculou arrasto X = ${dragDistance}px (Tentativa ${attempt}/2)`,
+              );
+            } else {
+              const factor = attempt === 1 ? 0.48 : 0.55;
+              dragDistance = Math.round(trackWidth * factor);
+              console.warn(
+                `⚠️ [Captcha] Detecção local de borda inconclusiva. Usando estimativa intermediária (${dragDistance}px)`,
+              );
+            }
+          } else {
+            console.log(
+              `🤖 [Captcha] Puzzle Jigsaw: 2 tentativas locais falharam. Recorrendo ao captchaResolve (AI Vision) (Tentativa ${attempt}/${maxAttempts})...`,
+            );
+            const accountId = options.accountId || "default";
+            const visionX = await resolveViaCaptchaService(frame, page, accountId);
+            if (visionX !== null && visionX > 0) {
+              dragDistance = visionX;
+            } else {
+              dragDistance = Math.round(trackWidth * 0.48);
+              console.warn(
+                `⚠️ [Captcha] captchaResolve indisponível para Puzzle. Usando estimativa intermediária (${dragDistance}px)`,
+              );
+            }
+          }
+        } else if (attempt <= 2) {
+          // Tentativas 1 e 2 para Slide-to-Unlock clássico: resolução nativa arrastando até o fim
           console.log(
             `📐 [Captcha] Tentativa ${attempt}/2 (Local): tentando resolução nativa por código (trilha padrão: ${Math.round(dragDistance)}px)...`,
           );

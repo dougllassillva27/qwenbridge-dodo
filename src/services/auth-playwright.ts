@@ -135,6 +135,7 @@ export async function getQwenHeaders(
   return {
     headers: {
       cookie: basic.cookie,
+      authorization: basic.authorization || "",
       "user-agent": basic.userAgent,
       "bx-v": basic.bxV,
       "bx-ua": basic.bxUa || "",

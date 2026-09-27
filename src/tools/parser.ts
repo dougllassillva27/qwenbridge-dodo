@@ -610,7 +610,7 @@ function findNextToolOpenTagOutsideMarkdownCode(
 
       const match = buffer
         .substring(i)
-        .match(/^(?:<|&lt;)\|?(?:qpx_calls?|qpx_call_[a-zA-Z0-9_-]+|tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function_calls?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
+        .match(/^(?:<|&lt;)\|?(?:qpx_calls?|qpx_call_[a-zA-Z0-9_-]+|tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function(?:_calls?)?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
       if (match && !isPrecededByBacktick(buffer, i)) {
         return { index: i, openTag: match[0] };
       }
@@ -669,7 +669,7 @@ function findToolOpenOutsideJsonString(
 
     const match = buffer
       .substring(i)
-      .match(/^(?:<|&lt;)\|?(?:qpx_calls?|qpx_call_[a-zA-Z0-9_-]+|tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function_calls?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
+      .match(/^(?:<|&lt;)\|?(?:qpx_calls?|qpx_call_[a-zA-Z0-9_-]+|tool_call_begin|tool_calls_section_begin|tool_call_calls_section_begin|tool_calls_section_end|tool_call_calls_section_end|tool_calls?_section|tool_call_section|tool_calls?|tool_calling|function(?:_calls?)?|tool_call_(?!argument|end|begin|calls_section)[a-zA-Z0-9_-]+|function_call_[a-zA-Z0-9_-]+|invoke\b[a-zA-Z0-9_-]*|skill_view|skill_manage)(?:[=:\s]+[^\r\n>]*?)?(?:\|?>|\|?&gt;?|(?=[\r\n]|(?:\s*[{\[<])))/i);
     if (match && !isPrecededByBacktick(buffer, i)) {
       return { index: i, openTag: match[0] };
     }
@@ -726,7 +726,13 @@ function findPartialToolOpenIndexOutsideMarkdownCode(
       if (!tailLower.includes(">")) {
         for (const name of openNames) {
           const full = `<${name.toLowerCase()}`;
-          if (full.startsWith(tailLower)) {
+          if (
+            full.startsWith(tailLower) ||
+            tailLower.startsWith(full + "=") ||
+            tailLower.startsWith(full + " ") ||
+            tailLower.startsWith(full + "\t") ||
+            tailLower.startsWith(full + ":")
+          ) {
             return i;
           }
         }

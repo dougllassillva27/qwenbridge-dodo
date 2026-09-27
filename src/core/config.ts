@@ -181,7 +181,7 @@ const envSchema = z
     MODELS_FILTER: z
       .enum(["max-1m", "all-3.7"])
       .default("max-1m"),
-    QWEN_CHAT_POOL_SIZE: z.string().default("1"),
+    QWEN_CHAT_POOL_SIZE: z.string().default("0"),
     QWEN_CHAT_POOL_MODELS: z.string().default("qwen3.7-plus"),
     QWEN_PERSONALIZATION_FROM_REQUEST: z.string().default("true"),
     QWEN_PERSONALIZATION_VERIFY_GET: z.string().default("true"),

@@ -36,6 +36,7 @@ export const DEFAULT_QWEN_USER_AGENT = getDefaultQwenUserAgent(151);
 const QWEN_TIMEZONE_HEADER = new Date().toString().split(" (")[0];
 export interface BuildQwenHeadersOptions {
   cookie: string;
+  authorization?: string;
   userAgent?: string;
   acceptLanguage?: string;
   bxUa?: string;
@@ -65,7 +66,13 @@ export function extractBearerToken(cookie?: string): string | null {
 export function buildQwenRequestHeaders(
   opts: BuildQwenHeadersOptions,
 ): Record<string, string> {
-  const bearerToken = extractBearerToken(opts.cookie);
+  const authHeader =
+    opts.authorization ||
+    opts.extra?.Authorization ||
+    opts.extra?.authorization;
+  const bearerToken = authHeader
+    ? (authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : authHeader.trim())
+    : extractBearerToken(opts.cookie);
   const headers: Record<string, string> = {
     ...(opts.extra ?? {}),
     ...(bearerToken && !opts.extra?.Authorization && !opts.extra?.authorization
@@ -104,13 +111,16 @@ export function buildQwenRequestHeaders(
     "sec-ch-ua-platform": opts.secChUaPlatform || '"Windows"',
   };
 
-  // The real chat.qwen.ai client sends ONLY bx-v on API requests — the WAF
-  // carries bx-ua/bx-umidtoken as browser cookies, not headers. Match that
-  // unless QWEN_SEND_BX_UA=true restores the legacy injection.
-  if (config.qwen.sendBxUa) {
-    if (opts.bxUa) headers["bx-ua"] = opts.bxUa;
-    if (opts.bxUmidtoken) headers["bx-umidtoken"] = opts.bxUmidtoken;
+  const tokenMatch = opts.cookie?.match(/(?:^|;\s*)token=([^;]+)/);
+  if (tokenMatch && !headers["Authorization"] && !headers["authorization"]) {
+    const bearer = decodeURIComponent(tokenMatch[1].trim());
+    if (bearer && bearer !== '""' && bearer !== "null") {
+      headers["Authorization"] = `Bearer ${bearer}`;
+    }
   }
+
+  if (opts.bxUa) headers["bx-ua"] = opts.bxUa;
+  if (opts.bxUmidtoken) headers["bx-umidtoken"] = opts.bxUmidtoken;
 
   return headers;
 }

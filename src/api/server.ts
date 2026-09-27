@@ -573,6 +573,7 @@ async function warmConfiguredChatPools(
   ) => Promise<void>,
   accountId?: string,
 ): Promise<void> {
+  if (config.qwen.chatPoolSize <= 0) return;
   await Promise.all(
     config.qwen.chatPoolModels.map((model) =>
       warmQwenChatPool(accountId, model).catch(() => {}),
@@ -841,6 +842,12 @@ export async function startServer(options?: {
   }
 
   startPromise = (async () => {
+    const { getAppVersion } = await import("../core/version.ts");
+    const appVersion = getAppVersion();
+    if (options?.showBanner !== false && !isAuthMockEnabled()) {
+      console.log(`🚀 [Server] Iniciando QwenProxy ${appVersion} na porta ${config.server.port}...`);
+    }
+
     cache = new MemoryCache();
     await cache.connect();
 
@@ -925,12 +932,17 @@ export async function startServer(options?: {
         let readyAccountId: string | null = null;
         const totalAccounts = accounts.length;
 
-        // Warm accounts in priority order (recently successful accounts first),
-        // skipping accounts still on cooldown, so the startup account matches
-        // the one request routing will pick first.
-        const warmOrder = getAccountsByPriority(accounts).filter(
-          (account) => !getAccountCooldownInfo(account.id),
-        );
+        // Warm accounts in priority order, giving top precedence to accounts
+        // that already have valid, non-expired sessions in SQLite (restores in ~0.5s),
+        // skipping accounts still on cooldown.
+        const { getValidAuthSession } = await import("../core/database.ts");
+        const warmOrder = getAccountsByPriority(accounts)
+          .filter((account) => !getAccountCooldownInfo(account.id))
+          .sort((a, b) => {
+            const aHasSession = getValidAuthSession(a.id) !== null ? 1 : 0;
+            const bHasSession = getValidAuthSession(b.id) !== null ? 1 : 0;
+            return bHasSession - aHasSession;
+          });
 
         for (let i = 0; i < warmOrder.length; i++) {
           console.log(
@@ -952,9 +964,13 @@ export async function startServer(options?: {
           }
         }
 
-        const remainingAccounts = accounts.filter(
-          (account) => account.id !== readyAccountId,
-        );
+        const remainingAccounts = accounts
+          .filter((account) => account.id !== readyAccountId)
+          .sort((a, b) => {
+            const aHasSession = getValidAuthSession(a.id) !== null ? 1 : 0;
+            const bHasSession = getValidAuthSession(b.id) !== null ? 1 : 0;
+            return bHasSession - aHasSession;
+          });
         if (readyAccountId === null) {
           console.warn(
             `⚠️  [Server] No account ready during startup; continuing in background`,
@@ -1069,11 +1085,11 @@ export async function startServer(options?: {
 
     const endpoint = `${started.url}/v1`;
 
-    if (options?.showBanner !== false) {
+    if (options?.showBanner !== false && !isAuthMockEnabled()) {
       console.log(`
 +${"-".repeat(W)}+
 |${blank()}|
-|${center("QwenProxy")}|
+|${center(`QwenProxy ${appVersion}`)}|
 |${center("OpenAI & Anthropic Compatible API")}|
 |${blank()}|
 +${"-".repeat(W)}+

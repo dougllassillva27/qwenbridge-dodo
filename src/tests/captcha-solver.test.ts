@@ -42,8 +42,15 @@ function pageWithLocators(
   const fallback = locator();
   const resolveLocator = (selector: string): Locator =>
     locators[selector] ??
-    (selector.includes("nc_1_n1z") ? locators["#nc_1_n1z"] : undefined) ??
-    (selector.includes("nc_1_n1t") ? locators["#nc_1_n1t"] : undefined) ??
+    (selector.includes("nc_1_n1z") || selector.includes("aliyunCaptcha-sliding-slider")
+      ? locators["#aliyunCaptcha-sliding-slider"] ?? locators["#nc_1_n1z"]
+      : undefined) ??
+    (selector.includes("nc_1_n1t") || selector.includes("aliyunCaptcha-sliding-body")
+      ? locators["#aliyunCaptcha-sliding-body"] ?? locators["#nc_1_n1t"]
+      : undefined) ??
+    (selector.includes("aliyunCaptcha-puzzle") || selector.includes("puzzle")
+      ? locators["#aliyunCaptcha-puzzle"]
+      : undefined) ??
     fallback;
   return {
     locator: resolveLocator,
@@ -752,3 +759,80 @@ test("withAccountPage respects recoverOnTimeout=false and does not destroy conte
     unregisterPlaywrightAccountForTests(accountId);
   }
 });
+
+test("solveBaxiaCaptcha recognizes Aliyun WAF puzzle captcha, tries local code on attempts 1 & 2, then invokes captchaResolve on attempt 3", async () => {
+  const originalFetch = globalThis.fetch;
+  let fetchCallCount = 0;
+  let challengeVisible = true;
+  let attemptCount = 0;
+
+  globalThis.fetch = (async () => {
+    fetchCallCount++;
+    return new Response(JSON.stringify({ success: true, x: 148 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  const slider = locator({
+    waitFor: async () => undefined,
+    boundingBox: async () => ({ x: 8, y: 550, width: 40, height: 40 }),
+  });
+  const track = locator({
+    boundingBox: async () => ({ x: 8, y: 550, width: 300, height: 40 }),
+  });
+  const puzzlePiece = locator({
+    isVisible: () => Promise.resolve(true),
+  });
+
+  const frame = {
+    locator: (selector: string) => {
+      if (selector.includes("aliyunCaptcha-sliding-slider") || selector.includes("slider-move")) return slider;
+      if (selector.includes("aliyunCaptcha-sliding-body") || selector.includes("sliding-text")) return track;
+      if (selector.includes("aliyunCaptcha-puzzle") || selector.includes("puzzle")) return puzzlePiece;
+      const base = locator();
+      (base as any).screenshot = async () => Buffer.from("test");
+      return base;
+    },
+  } as unknown as FrameLocator;
+
+  const page = pageWithLocators(
+    {
+      "#waf_nc_block": locator({ isVisible: () => Promise.resolve(challengeVisible) }),
+      "#WAF_NC_WRAPPER": locator({ isVisible: () => Promise.resolve(challengeVisible) }),
+      "#aliyunCaptcha-window-embed": locator({ isVisible: () => Promise.resolve(challengeVisible) }),
+      "#aliyunCaptcha-sliding-slider": slider,
+      "#aliyunCaptcha-sliding-body": track,
+      "#aliyunCaptcha-puzzle": puzzlePiece,
+    },
+    frame,
+    {
+      move: async () => undefined,
+      down: async () => undefined,
+      up: async () => {
+        attemptCount++;
+        // Falha nas tentativas 1 e 2 (código local) e resolve na tentativa 3 (captchaResolve)
+        if (attemptCount >= 3) {
+          challengeVisible = false;
+        }
+      },
+    } as unknown as Page["mouse"],
+  );
+
+  try {
+    const solved = await solveBaxiaCaptcha(page, {
+      maxAttempts: 3,
+      retryDelayMs: 0,
+      settleMs: 0,
+      sliderTimeoutMs: 500,
+      waitForMs: 100,
+    });
+
+    assert.equal(solved, true);
+    assert.equal(attemptCount, 3, "Must make 3 attempts total");
+    assert.equal(fetchCallCount, 1, "Must not query captchaResolve on attempts 1 & 2; only on attempt 3");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
