@@ -800,10 +800,19 @@ async function withQwenBrowserPage<T>(
         (normalizedTargetPath !== null && currentPath !== normalizedTargetPath);
 
       if (needsNavigation) {
-        await page.goto(targetUrl, {
-          waitUntil: "domcontentloaded",
-          timeout: Math.min(config.timeouts.navigation, operationTimeoutMs),
-        });
+        try {
+          await page.goto(targetUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: Math.min(config.timeouts.navigation, operationTimeoutMs),
+          });
+        } catch (err: any) {
+          // If navigation was aborted because page reached target origin or redirect finished, ignore benign abort
+          if (err?.message?.includes("ERR_ABORTED") && page.url().startsWith(targetOrigin)) {
+            // benign navigation interruption
+          } else {
+            throw err;
+          }
+        }
       }
 
       return fn(page);
@@ -908,7 +917,7 @@ export async function requestQwenTextInBrowser(
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
         try {
-          const response = await fetch(url, {
+          let response = await fetch(url, {
             method,
             credentials: "include",
             headers,
@@ -916,6 +925,50 @@ export async function requestQwenTextInBrowser(
             signal: controller.signal,
             ...(referrer ? { referrer } : {}),
           });
+
+          // If 401 Unauthorized in browser, try silent in-page token refresh before giving up
+          if (response.status === 401) {
+            try {
+              const rTok = localStorage.getItem("refresh_token");
+              if (rTok) {
+                const refreshRes = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
+                  method: "GET",
+                  credentials: "include",
+                  headers: {
+                    accept: "application/json, text/plain, */*",
+                    source: "web",
+                    version: "0.3.11",
+                    "x-request-origin": "https://chat.qwen.ai",
+                    timezone: new Date().toString().split(" (")[0],
+                    authorization: `Bearer ${rTok}`,
+                  },
+                  signal: AbortSignal.timeout(5000),
+                });
+                const refreshJson: any = await refreshRes.json().catch(() => null);
+                const freshTok = refreshJson?.data?.access_token || refreshJson?.data?.token;
+                const nextRTok = refreshJson?.data?.refresh_token;
+                if (refreshJson?.success === true && freshTok) {
+                  localStorage.setItem("token", freshTok);
+                  localStorage.setItem("access_token", freshTok);
+                  if (nextRTok) localStorage.setItem("refresh_token", nextRTok);
+                  document.cookie = `token=${encodeURIComponent(freshTok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                  if (headers["authorization"] || headers["Authorization"]) {
+                    headers["authorization"] = `Bearer ${freshTok}`;
+                    headers["Authorization"] = `Bearer ${freshTok}`;
+                  }
+                  response = await fetch(url, {
+                    method,
+                    credentials: "include",
+                    headers,
+                    body,
+                    signal: controller.signal,
+                    ...(referrer ? { referrer } : {}),
+                  });
+                }
+              }
+            } catch {}
+          }
+
           return {
             status: response.status,
             contentType: response.headers.get("content-type") || "",
@@ -938,13 +991,30 @@ export async function requestQwenTextInBrowser(
   // Settings and personalization requests run as same-origin in-browser fetch
   // with appropriate Referer, keeping the page on the stable chat UI without
   // expensive page.goto navigations that can time out under load.
-  const response = await withQwenBrowserPage<BrowserTextResponse>(
+  let response = await withQwenBrowserPage<BrowserTextResponse>(
     accountId,
     evaluateRequest,
     undefined,
     options.timeoutMs,
     recoverOnTimeout,
   );
+
+  // If evaluateRequest still received 401, trigger outer token refresh and retry once
+  if (response.status === 401 && accountId) {
+    try {
+      const { refreshAccountToken } = await import("./playwright.ts");
+      const refreshed = await refreshAccountToken(accountId);
+      if (refreshed.success) {
+        response = await withQwenBrowserPage<BrowserTextResponse>(
+          accountId,
+          evaluateRequest,
+          undefined,
+          options.timeoutMs,
+          recoverOnTimeout,
+        );
+      }
+    } catch {}
+  }
 
   return new Response(response.raw, {
     status: response.status,
@@ -1059,20 +1129,7 @@ async function requestQwenPersonalizationInBrowser(
   headers: Record<string, string>,
   payload?: Record<string, unknown>,
 ): Promise<{ status: number; raw: string; json: any }> {
-  // If browser-only fetch is disabled, try direct Node fetch as fast-path
-  if (!config.qwen.browserOnlyFetch && !isAuthMockEnabled()) {
-    const direct = await requestQwenSettingsDirectFetch(
-      accountId,
-      method,
-      path,
-      headers,
-      payload,
-    );
-    if (direct) {
-      return direct;
-    }
-  }
-
+  // Always route personalization through stealth browser page (user constraint: tudo via browser stealth)
   const response = await requestQwenTextInBrowser(
     accountId,
     method,
@@ -1686,7 +1743,11 @@ export async function syncQwenRequestPersonalization(
     );
     try {
       currentSettings = null;
-      const { headers: freshHeaders } = await getQwenHeaders(true, accountId, true);
+      const { refreshAccountToken } = await import("./playwright.ts");
+      if (accountId) {
+        await refreshAccountToken(accountId);
+      }
+      const { headers: freshHeaders } = await getQwenHeaders(false, accountId);
       requestHeaders = buildCapturedQwenHeaders(freshHeaders, {
         referer: qwenUrl("/settings/personalization"),
       });
@@ -2702,10 +2763,19 @@ async function createQwenStreamInternal(
   };
 
   // A new logical chat session should reuse the warmed header cache when available.
-  // Header recapture is much more expensive and should be reserved for real refresh/login cases,
-  // not for ordinary first prompts that simply need parent_id reset.
+  // Proactively check if the access token is expiring soon (<3m) and refresh quietly before starting.
+  let forceRefresh = options?.forceNewChat === true;
+  if (!forceRefresh && accountId) {
+    try {
+      const basic = await getBasicHeaders(accountId);
+      if (isTokenExpiringSoon(basic.cookie, 3)) {
+        forceRefresh = true;
+      }
+    } catch {}
+  }
+
   const captured = await getQwenHeaders(
-    options?.forceNewChat === true,
+    forceRefresh,
     accountId,
   );
   ensureNotAborted();
@@ -2721,7 +2791,7 @@ async function createQwenStreamInternal(
   if (options && "chatSessionId" in options) {
     if (options.chatSessionId === null || options.chatSessionId === "") {
       const acquired = await acquireNewQwenChatSession(
-        headers,
+        activeHeaders,
         model,
         accountId,
         options?.chatMode ?? "thread",
@@ -2729,6 +2799,10 @@ async function createQwenStreamInternal(
       chatSessionId = acquired.chatId;
       leasedWarmChat = acquired.leasedFromPool;
       createdNewChat = true;
+      try {
+        const fresh = await getQwenHeaders(false, accountId);
+        activeHeaders = fresh.headers;
+      } catch {}
     } else {
       chatSessionId = options.chatSessionId;
     }
@@ -2736,7 +2810,7 @@ async function createQwenStreamInternal(
     chatSessionId = captured.chatSessionId;
     if (!chatSessionId) {
       const acquired = await acquireNewQwenChatSession(
-        headers,
+        activeHeaders,
         model,
         accountId,
         options?.chatMode ?? "thread",
@@ -2744,6 +2818,10 @@ async function createQwenStreamInternal(
       chatSessionId = acquired.chatId;
       leasedWarmChat = acquired.leasedFromPool;
       createdNewChat = true;
+      try {
+        const fresh = await getQwenHeaders(false, accountId);
+        activeHeaders = fresh.headers;
+      } catch {}
     }
   }
 
