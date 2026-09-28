@@ -29,7 +29,7 @@ const states = new Map<string, WafBlockState>();
 
 export interface WafBlockResult {
   cooldownMs: number;
-  fingerprintRotated: true;
+  fingerprintRotated: boolean;
   escalated: boolean;
 }
 
@@ -158,3 +158,4 @@ export function noteWafRecovery(accountId: string): void {
 export function clearWafIsolation(accountId: string): void {
   states.delete(accountId);
 }
+

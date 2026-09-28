@@ -479,19 +479,21 @@ export function classifyRetryAction(
   // Agent instructions ride ONLY the account-level personalization. An
   // unconfirmed sync means this account cannot serve the request as-is —
   // rotate to another account (each attempt re-syncs on its own account).
-  // Park the failing account with PersonalizationFailed cooldown so it does
-  // not enter an infinite ping-pong loop when multiple accounts fail.
+  // Do NOT park the account with a 300s cooldown: rotation across accounts
+  // is already guarded by triedAccounts, preventing pool collapse.
   if (err instanceof PersonalizationSyncError) {
     return makeRetryAction("personalization_sync_failed", {
       switchAccount: true,
       forceNewChat: false,
       retryAfterMs: Math.min(baseDelayMs, 1_000),
+      accountCooldownMs: 0,
+      accountCooldownReason: "PersonalizationFailed",
     });
   }
 
   // Upstream 401 / Unauthorized on chat creation or API requests:
-  // Account session is invalid or expired. Cool down account with AuthInitFailed so the
-  // proxy rotates to a valid account instead of looping endlessly on 503s.
+  // Access token expired (15m window). Rotate without locking into a 300s cooldown
+  // so the account can immediately be renewed via refresh_token.
   if (
     code === "createchatinvalidresponse" ||
     code === "createchatfailed" ||
@@ -500,15 +502,16 @@ export function classifyRetryAction(
     message.includes("não tem permissão para acessar") ||
     message.includes("401 unauthorized") ||
     message.includes('"code":"unauthorized"') ||
-    message.includes('"code": "unauthorized"')
+    message.includes('"code": "unauthorized"') ||
+    message.includes("token has expired")
   ) {
     return makeRetryAction("account_initialization_failed", {
       switchAccount: true,
       forceNewChat: true,
       retryWithFullPrompt: true,
       retryAfterMs: Math.min(baseDelayMs, 1_000),
-      accountCooldownMs: config.concurrency.initFailureCooldownMs,
-      accountCooldownReason: "AuthInitFailed",
+      accountCooldownMs: 0,
+      accountCooldownReason: "AuthExpired",
     });
   }
   // Specialized recoveries first (even if wrapped as RetryableQwenStreamError)

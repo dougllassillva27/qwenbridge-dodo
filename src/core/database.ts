@@ -228,6 +228,7 @@ function runMigrations(db: Database.Database): void {
     "sec_ch_ua_mobile TEXT",
     "sec_ch_ua_platform TEXT",
     "version TEXT",
+    "refresh_token TEXT",
     "captured_at INTEGER DEFAULT 0",
   ];
   for (const col of authSessionCols) {
@@ -491,6 +492,7 @@ export interface PersistedAuthSession {
   version?: string;
   userId?: string;
   tokenExpiresAt?: number;
+  refreshToken?: string;
   capturedAt: number;
 }
 
@@ -508,6 +510,7 @@ export function saveAuthSession(
     version?: string;
     userId?: string;
     tokenExpiresAt?: number;
+    refreshToken?: string;
     capturedAt?: number;
   },
 ): void {
@@ -516,11 +519,11 @@ export function saveAuthSession(
     INSERT OR REPLACE INTO qwen_auth_sessions (
       account_id, cookie, user_agent, bx_v, bx_ua, bx_umidtoken,
       sec_ch_ua, sec_ch_ua_mobile, sec_ch_ua_platform, version,
-      user_id, token_expires_at, captured_at, updated_at
+      user_id, token_expires_at, refresh_token, captured_at, updated_at
     ) VALUES (
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
-      ?, ?, ?, datetime('now')
+      ?, ?, ?, ?, datetime('now')
     )
   `);
   stmt.run(
@@ -536,6 +539,7 @@ export function saveAuthSession(
     session.version || null,
     session.userId || null,
     session.tokenExpiresAt || null,
+    session.refreshToken || null,
     session.capturedAt ?? Date.now(),
   );
 }
@@ -549,7 +553,7 @@ export function getValidAuthSession(
     .prepare(
       `SELECT account_id, cookie, user_agent, bx_v, bx_ua, bx_umidtoken,
               sec_ch_ua, sec_ch_ua_mobile, sec_ch_ua_platform, version,
-              user_id, token_expires_at, captured_at
+              user_id, token_expires_at, refresh_token, captured_at
        FROM qwen_auth_sessions WHERE account_id = ?`,
     )
     .get(accountId) as any;
@@ -576,9 +580,9 @@ export function getValidAuthSession(
     } catch {}
   }
 
-  if (tokenExp) {
+  if (!row.refresh_token && tokenExp) {
     const tokenExpMs = tokenExp * 1000;
-    // Safety margin of 5 minutes before token expires
+    // Safety margin of 5 minutes before token expires (only when no refresh_token exists)
     if (tokenExpMs <= Date.now() + 5 * 60 * 1000) {
       return null;
     }
@@ -602,6 +606,7 @@ export function getValidAuthSession(
     version: row.version || undefined,
     userId: row.user_id || undefined,
     tokenExpiresAt: row.token_expires_at ? Number(row.token_expires_at) : undefined,
+    refreshToken: row.refresh_token || undefined,
     capturedAt,
   };
 }

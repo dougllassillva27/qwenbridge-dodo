@@ -138,6 +138,8 @@ test("retry policy: unconfirmed personalization rotates accounts", () => {
   assert.strictEqual(policy.forceNewChat, false);
   assert.strictEqual(policy.retryWithFullPrompt, false);
   assert.strictEqual(policy.reason, "personalization_sync_failed");
+  assert.strictEqual(policy.accountCooldownReason, "PersonalizationFailed");
+  assert.strictEqual(policy.accountCooldownMs, 0);
 });
 
 // ---------------------------------------------------------------------------

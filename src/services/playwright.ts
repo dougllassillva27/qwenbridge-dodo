@@ -570,7 +570,7 @@ export async function isPageLoggedIn(
 
 export async function getOrLaunchSharedBrowser(
   browserType: BrowserType = "chromium",
-  headless = true,
+  headless = config.playwright.headless,
 ): Promise<Browser> {
   if (sharedBrowser && sharedBrowser.isConnected()) {
     return sharedBrowser;
@@ -1220,8 +1220,29 @@ export function getStealthScript(profile: FingerprintProfile): string {
         const _toBlob = HTMLCanvasElement.prototype.toBlob;
         const _getImageData = CanvasRenderingContext2D.prototype.getImageData;
 
+        function isCaptchaCanvas(canvas) {
+          try {
+            if (!canvas) return false;
+            const id = (canvas.id || "").toLowerCase();
+            const cls = (canvas.className || "").toLowerCase();
+            return (
+              id.includes("baxia") ||
+              id.includes("nc_") ||
+              id.includes("captcha") ||
+              id.includes("punish") ||
+              cls.includes("baxia") ||
+              cls.includes("nc_") ||
+              cls.includes("captcha") ||
+              Boolean(canvas.closest?.("#baxia-dialog, #baxia-punish, [class*='baxia'], [class*='nc_'], .auth-layout"))
+            );
+          } catch(e) {
+            return false;
+          }
+        }
+
         function addNoise(canvas) {
           try {
+            if (isCaptchaCanvas(canvas)) return;
             const ctx = canvas.getContext('2d');
             if (!ctx) return;
             const style = ctx.fillStyle;
@@ -1245,6 +1266,9 @@ export function getStealthScript(profile: FingerprintProfile): string {
 
         CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
           const imageData = _getImageData.apply(this, arguments);
+          if (isCaptchaCanvas(this.canvas)) {
+            return imageData;
+          }
           const data = imageData.data;
           const maxPixels = Math.min(data.length / 4, 2500);
           for (let i = 0; i < maxPixels * 4; i += 4) {
@@ -1304,32 +1328,19 @@ export function getStealthScript(profile: FingerprintProfile): string {
         }
       } catch(e) {}
 
-      // --- Auto-dismiss age confirmation modal ---
+      // --- Auto-resolve birthday compliance & eliminate false logout markers ---
       try {
-        setInterval(function() {
+        localStorage.removeItem("qwen_token_logged_out_marker");
+        const b = localStorage.getItem("qwen_account_birthday");
+        if (b) {
           try {
-            var ageModal = document.querySelector('.age-confirmation-year, .age-confirmation-desc')
-              || Array.from(document.querySelectorAll('.ant-modal-title')).find(function(el) {
-                var t = (el.textContent || '').toLowerCase();
-                return t.includes('idade') || t.includes('age') || t.includes('nasceu');
-              });
-            if (ageModal) {
-              var modal = (typeof ageModal.closest === 'function' ? ageModal.closest('.ant-modal-content') : null)
-                || document.querySelector('.ant-modal-content')
-                || document;
-              var buttons = Array.from(modal.querySelectorAll('button'));
-              var confirmBtn = buttons.find(function(b) {
-                if (b.style.display === 'none' || b.getAttribute('aria-label') === 'Close') return false;
-                var text = (b.textContent || '').toLowerCase().trim();
-                var isBlackBtn = b.classList.contains('qwen-chat-v2-btn-black') || b.classList.contains('qwen-chat-v2-btn-block');
-                return text.includes('continuar') || text.includes('continue') || text.includes('confirm') || text.includes('确定') || isBlackBtn;
-              });
-              if (confirmBtn && confirmBtn.offsetParent !== null) {
-                confirmBtn.click();
-              }
+            const parsed = JSON.parse(b);
+            if (!parsed.birthday) {
+              parsed.birthday = "1995-06-15";
+              localStorage.setItem("qwen_account_birthday", JSON.stringify(parsed));
             }
-          } catch(e) {}
-        }, 1000);
+          } catch {}
+        }
       } catch(e) {}
     })();
   `;
@@ -1786,7 +1797,7 @@ async function resolveAccountCredentials(account: QwenAccount): Promise<QwenAcco
 
 export async function initPlaywrightForAccount(
   rawAccount: QwenAccount,
-  headless = true,
+  headless = config.playwright.headless,
   browserType: BrowserType = "chromium",
   options: { skipHeaderCapture?: boolean } = {},
 ): Promise<void> {
@@ -2406,6 +2417,8 @@ export interface LoginAttemptResult {
   success: boolean;
   permanentFailure?: boolean;
   reason?: string;
+  token?: string;
+  refreshToken?: string;
 }
 
 export function classifyQwenAuthError(
@@ -2514,17 +2527,34 @@ async function loginToQwen(
     const apiResult = await loginViaApi(page, email, effectivePassword);
     if (apiResult.success) {
       cookieCaches.delete(accountId);
-      const cache = headerCaches.get(accountId);
-      if (cache) {
-        cache.headers = {};
-        cache.lastRefresh = 0;
-      }
-      unmarkAccountHeadersReady(accountId);
-      try {
-        const { deleteAuthSession } = await import("../core/database.ts");
-        deleteAuthSession(accountId);
-      } catch {}
       await saveStorageState(page.context(), accountId);
+      try {
+        const liveCookies = await page.context().cookies();
+        const tokenCookie = liveCookies.find((c) => c.name === "token");
+        if (tokenCookie) {
+          const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+          const cache = getHeaderCache(accountId);
+          cache.headers.cookie = cookieStr;
+          cache.lastRefresh = Date.now();
+          markAccountHeadersReady(accountId);
+          const { saveAuthSession } = await import("../core/database.ts");
+          const exp = parseJwtExpiry(tokenCookie.value);
+          saveAuthSession(accountId, {
+            cookie: cookieStr,
+            userAgent: cache.headers["user-agent"] || "",
+            bxV: cache.headers["bx-v"] || "2.5.37",
+            bxUa: cache.headers["bx-ua"] || "",
+            bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+            secChUa: cache.headers["sec-ch-ua"] || undefined,
+            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+            version: cache.headers["version"] || undefined,
+            tokenExpiresAt: exp || undefined,
+            refreshToken: apiResult.refreshToken,
+            capturedAt: Date.now(),
+          });
+        }
+      } catch {}
       return true;
     }
     console.log(`⚠️  [Playwright:Login] API sign-in did not succeed, falling back to UI login...`);
@@ -2545,23 +2575,40 @@ async function loginToQwen(
     const uiResult = await loginViaUi(page, email, effectivePassword);
     if (uiResult.success) {
       cookieCaches.delete(accountId);
-      const cache = headerCaches.get(accountId);
-      if (cache) {
-        cache.headers = {};
-        cache.lastRefresh = 0;
-      }
-      unmarkAccountHeadersReady(accountId);
+      await saveStorageState(page.context(), accountId);
       try {
-        const { deleteAuthSession } = await import("../core/database.ts");
-        deleteAuthSession(accountId);
-      } catch {}
-      try {
-        const lsToken = await page.evaluate(() => localStorage.getItem("token") || "");
-        if (lsToken && cache) {
-          cache.headers["authorization"] = lsToken.startsWith("Bearer ") ? lsToken : `Bearer ${lsToken}`;
+        const liveCookies = await page.context().cookies();
+        const tokenCookie = liveCookies.find((c) => c.name === "token");
+        if (tokenCookie) {
+          const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+          const cache = getHeaderCache(accountId);
+          cache.headers.cookie = cookieStr;
+          cache.lastRefresh = Date.now();
+          markAccountHeadersReady(accountId);
+          const { saveAuthSession } = await import("../core/database.ts");
+          const exp = parseJwtExpiry(tokenCookie.value);
+          let rTok = uiResult.refreshToken;
+          if (!rTok) {
+            try {
+              rTok = (await page.evaluate(() => localStorage.getItem("refresh_token") || "")) || undefined;
+            } catch {}
+          }
+          saveAuthSession(accountId, {
+            cookie: cookieStr,
+            userAgent: cache.headers["user-agent"] || "",
+            bxV: cache.headers["bx-v"] || "2.5.37",
+            bxUa: cache.headers["bx-ua"] || "",
+            bxUmidtoken: cache.headers["bx-umidtoken"] || "",
+            secChUa: cache.headers["sec-ch-ua"] || undefined,
+            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
+            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
+            version: cache.headers["version"] || undefined,
+            tokenExpiresAt: exp || undefined,
+            refreshToken: rTok,
+            capturedAt: Date.now(),
+          });
         }
       } catch {}
-      await saveStorageState(page.context(), accountId);
       return true;
     }
 
@@ -2579,8 +2626,9 @@ async function loginToQwen(
 
     if (attempt < maxAttempts) {
       const backoffMs = attempt * 5_000;
+      const failReason = uiResult.reason || apiResult.reason || "falha temporária";
       console.warn(
-        `⚠️  [Playwright] Login attempt ${attempt}/${maxAttempts} failed for ${maskEmail(email)} (${apiResult.reason || uiResult.reason || "falha temporária"}), retrying in ${backoffMs / 1000}s`,
+        `⚠️  [Playwright] Login attempt ${attempt}/${maxAttempts} failed for ${maskEmail(email)} (${failReason}), retrying in ${backoffMs / 1000}s`,
       );
       await sleep(backoffMs);
     }
@@ -2621,46 +2669,65 @@ async function loginViaApi(
       .createHash("sha256")
       .update(password)
       .digest("hex");
-    const signinUrl = qwenUrl("/api/v2/auths/signin");
 
-    let signinSuccess = false;
-    let data: any = null;
-
-    if (page.request && typeof page.request.post === "function") {
-      try {
-        const response = await page.request.post(signinUrl, {
-          data: {
-            email,
-            password: hashedPassword,
-            login_type: "email",
-          },
-          headers: {
-            "content-type": "application/json",
-            accept: "application/json, text/plain, */*",
-            referer: qwenUrl("/auth"),
-            origin: qwenOrigin(),
-            source: "web",
-          },
-          timeout: 10_000,
-        });
-        data = await response.json().catch(() => null);
-        signinSuccess = Boolean(data && (data.success === true || data.token));
-        if (!signinSuccess && data) {
-          console.warn(`[Playwright:Login:API] Sign-in API returned: ${JSON.stringify(data)}`);
-        }
-      } catch (reqErr: any) {
-        console.warn(`[Playwright:Login:API] Request error: ${reqErr?.message || reqErr}`);
-      }
+    // Ensure the page is loaded at /auth so that same-site/CORS credentials and Baxia WAF headers are active
+    if (!page.url().includes("/auth")) {
+      await page.goto(qwenUrl("/auth"), {
+        waitUntil: "domcontentloaded",
+        timeout: config.timeouts.navigation,
+      }).catch(() => {});
+      await sleep(1000);
     }
 
-    if (!signinSuccess && !data) {
-      // Fallback to in-page evaluate fetch if page.request was unavailable
-      const requestId = crypto.randomUUID();
-      const evalRes = await page
+    const signinUrl = "https://auth.qwen.ai/api/v2/auths/signin";
+    const requestId = crypto.randomUUID();
+
+    const evalRes = await page
+      .evaluate(
+        async ({ email, password, signinUrl, requestId }) => {
+          try {
+            const response = await fetch(signinUrl, {
+              method: "POST",
+              signal: AbortSignal.timeout(15_000),
+              credentials: "include",
+              headers: {
+                accept: "application/json, text/plain, */*",
+                "content-type": "application/json",
+                source: "web",
+                version: "0.3.11",
+                "x-request-origin": "https://chat.qwen.ai",
+                timezone: new Date().toString().split(" (")[0],
+                "x-request-id": requestId,
+              },
+              body: JSON.stringify({ email, password }),
+            });
+            const json = await response.json().catch(() => null);
+            return { ok: response.ok, status: response.status, data: json };
+          } catch (e: any) {
+            return { ok: false, error: e.message };
+          }
+        },
+        { email, password: hashedPassword, signinUrl, requestId },
+      )
+      .catch(() => null);
+
+    let data: any = evalRes?.data;
+    let signinSuccess = Boolean(
+      data &&
+      (data.success === true ||
+        data.token ||
+        data.data?.access_token ||
+        data.data?.token),
+    );
+
+    // Fallback to legacy chat.qwen.ai endpoint if auth.qwen.ai did not succeed
+    if (!signinSuccess && !data?.data?.code) {
+      const fallbackUrl = qwenUrl("/api/v2/auths/signin");
+      const fallbackRes = await page
         .evaluate(
-          async ({ email, password, signinUrl, requestId }) => {
+          async ({ email, password, fallbackUrl, requestId }) => {
             try {
-              const response = await fetch(signinUrl, {
+              const response = await fetch(fallbackUrl, {
                 method: "POST",
                 signal: AbortSignal.timeout(10_000),
                 credentials: "include",
@@ -2668,10 +2735,11 @@ async function loginViaApi(
                   accept: "application/json, text/plain, */*",
                   "content-type": "application/json",
                   source: "web",
+                  version: "0.3.11",
                   timezone: new Date().toString().split(" (")[0],
                   "x-request-id": requestId,
                 },
-                body: JSON.stringify({ email, password, login_type: "email" }),
+                body: JSON.stringify({ email, password }),
               });
               const json = await response.json().catch(() => null);
               return { ok: response.ok, status: response.status, data: json };
@@ -2679,13 +2747,19 @@ async function loginViaApi(
               return { ok: false, error: e.message };
             }
           },
-          { email, password: hashedPassword, signinUrl, requestId },
+          { email, password: hashedPassword, fallbackUrl, requestId },
         )
         .catch(() => null);
 
-      if (evalRes?.data) {
-        data = evalRes.data;
-        signinSuccess = Boolean(data && (data.success === true || data.token));
+      if (fallbackRes?.data) {
+        data = fallbackRes.data;
+        signinSuccess = Boolean(
+          data &&
+          (data.success === true ||
+            data.token ||
+            data.data?.access_token ||
+            data.data?.token),
+        );
       }
     }
 
@@ -2701,7 +2775,14 @@ async function loginViaApi(
     }
 
     if (signinSuccess) {
-      const token = data?.data?.token || data?.token;
+      const token =
+        data?.data?.access_token ||
+        data?.data?.token ||
+        data?.access_token ||
+        data?.token;
+      const refreshToken =
+        data?.data?.refresh_token || data?.refresh_token;
+
       if (token) {
         try {
           await page.context().addCookies([
@@ -2728,16 +2809,21 @@ async function loginViaApi(
 
       if (token) {
         await page
-          .evaluate((tok) => {
-            try {
-              localStorage.removeItem("qwen_token_logged_out_marker");
-              localStorage.setItem("token", tok);
-              document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
-            } catch {}
-          }, token)
+          .evaluate(
+            ({ tok, rTok }) => {
+              try {
+                localStorage.removeItem("qwen_token_logged_out_marker");
+                localStorage.setItem("token", tok);
+                localStorage.setItem("access_token", tok);
+                if (rTok) localStorage.setItem("refresh_token", rTok);
+                document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+              } catch {}
+            },
+            { tok: token, rTok: refreshToken },
+          )
           .catch(() => {});
         await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
-        return { success: true };
+        return { success: true, token, refreshToken };
       }
     }
 
@@ -2766,12 +2852,28 @@ async function loginViaUi(
   password: string,
 ): Promise<LoginAttemptResult> {
   try {
-    console.log(`🖥️ [Playwright:Login:UI] Navigating to ${qwenUrl("/auth")}...`);
-    await page.goto(qwenUrl("/auth"), {
-      waitUntil: "domcontentloaded",
-      timeout: config.timeouts.navigation,
-    });
-    await sleep(1500);
+    // 0. If the page is ALREADY logged in, avoid touching /auth altogether!
+    if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 2000).catch(() => false))) {
+      return { success: true };
+    }
+
+    try {
+      await page.goto(qwenUrl("/auth"), {
+        waitUntil: "domcontentloaded",
+        timeout: Math.min(config.timeouts.navigation, 15_000),
+      });
+      await sleep(1000);
+    } catch (gotoErr: any) {
+      // If navigation was aborted because the page redirected to / (because already logged in):
+      if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000).catch(() => false))) {
+        return { success: true };
+      }
+    }
+
+    // Check if redirect occurred after navigation
+    if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000).catch(() => false))) {
+      return { success: true };
+    }
 
     // Check if already logged in (redirected to home)
     if (!page.url().includes("/auth") && !page.url().includes("/login")) {
@@ -2793,7 +2895,7 @@ async function loginViaUi(
     ].join(", ");
     try {
       await page.waitForSelector(emailSelector, {
-        timeout: Math.min(config.timeouts.page, 8_000),
+        timeout: Math.min(config.timeouts.page, 5_000),
       });
     } catch {
       if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 4000))) {
@@ -2805,59 +2907,81 @@ async function loginViaUi(
       return { success: false, reason: "Campo de e-mail não encontrado (possível captcha)" };
     }
 
-    // Switch to password login mode if page opens on email verification code (OTP) panel
-    const trySwitchToPasswordMode = async (): Promise<boolean> => {
-      const passwordSelector = 'input[type="password"], input[name="password"]';
-      if (await page.locator(passwordSelector).first().isVisible().catch(() => false)) {
-        return true;
-      }
-      const candidates = [
-        page.getByText(/Log in with (?:a )?password|Sign in with (?:a )?password|Password login|Entrar com (?:uma )?senha|Login com senha|Fazer login com senha|Usar senha|Iniciar sesi[oó]n con contrase[ñn]a|密码登录|账号密码登录/i).first(),
-        page.locator('button, a, [role="button"], span, div').filter({
-          hasText: /password|senha|contrase[ñn]a|密码/i,
-        }).first(),
-        page.locator('[class*="password"], [class*="login-mode"], [class*="switch"], [data-testid*="password"]').first(),
-      ];
-      for (const loc of candidates) {
-        try {
-          if (await loc.isVisible({ timeout: 1000 }).catch(() => false)) {
-            const btnText = (await loc.innerText().catch(() => ""))?.trim();
-            console.log(`🔑 [Playwright:Login:UI] Clicking password login switch ("${btnText}")...`);
-            await loc.click().catch(() => {});
-            await sleep(600);
-            if (await page.locator(passwordSelector).first().isVisible({ timeout: 2000 }).catch(() => false)) {
-              return true;
-            }
-          }
-        } catch {}
-      }
-      return false;
+    // In Qwen Web, if the page opens on the default email OTP panel, click "Log in with a password"
+    // (supporting English, Portuguese, Spanish, Chinese) to reveal the standard email + password form.
+    await clearVisibleChallenge(page);
+
+    const isPasswordInputPresent = async () => {
+      return (await page.locator('input[type="password"], input[name="password"]').count().catch(() => 0)) > 0;
     };
 
-    await trySwitchToPasswordMode();
-
-    // Fill email
-    console.log(`✍️ [Playwright:Login:UI] Filling email: ${maskEmail(email)}`);
-    await page.fill(emailSelector, email);
-    await sleep(300);
-
-    // If password input is not visible yet, try switching again or check for Next/Continuar button
-    const passwordSelector = 'input[type="password"], input[name="password"]';
-    let pwdAlreadyVisible = await page.locator(passwordSelector).first().isVisible().catch(() => false);
-    if (!pwdAlreadyVisible) {
-      await trySwitchToPasswordMode();
-      pwdAlreadyVisible = await page.locator(passwordSelector).first().isVisible().catch(() => false);
-    }
-    if (!pwdAlreadyVisible) {
-      const nextBtn = page.locator('button[type="submit"], button, [role="button"]').filter({
-        hasText: /^(?:Next|Continuar|Pr[oó]ximo|Avançar|Avanzar|Seguinte|下一步)$/i,
-      }).first();
-      if (await nextBtn.isVisible({ timeout: 1500 }).catch(() => false)) {
-        console.log(`🔘 [Playwright:Login:UI] Clicking Next/Continuar button on email step...`);
-        await nextBtn.click().catch(() => {});
+    const revealPasswordMode = async () => {
+      // If already on /forget, navigate back to /auth
+      if (page.url().includes("/forget")) {
+        await page.goto(qwenUrl("/auth"), { waitUntil: "domcontentloaded", timeout: 10_000 }).catch(() => {});
         await sleep(1000);
-        await trySwitchToPasswordMode();
       }
+
+      // If password input is already in DOM, do NOT click any switch buttons!
+      if (await isPasswordInputPresent()) return;
+
+      // 1. Playwright button locator with multilingual matching (strictly excluding "Esqueci a senha" / "Forgot password")
+      const btn = page
+        .locator("button")
+        .filter({
+          hasText: /(?:log\s*in\s*with\s*(?:a\s*)?password|fazer\s*login\s*com\s*senha|entrar\s*com\s*(?:uma\s*)?senha|iniciar\s*sesi[oó]n\s*con\s*contrase[nñ]a|密码登录)/i,
+        })
+        .filter({
+          hasNotText: /(?:esqueci|forgot|olvid|reset|recover)/i,
+        })
+        .first();
+
+      if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await btn.click({ timeout: 2000 }).catch(() => {});
+        await sleep(500);
+      }
+
+      if (await isPasswordInputPresent()) return;
+
+      // 2. In-page evaluate fail-safe to trigger direct DOM click on the password button
+      await page
+        .evaluate(() => {
+          try {
+            const buttons = Array.from(document.querySelectorAll("button, [role='button'], a"));
+            for (const b of buttons) {
+              const txt = ((b as HTMLElement).innerText || "").trim().toLowerCase();
+              if (
+                /(?:log\s*in\s*with\s*(?:a\s*)?password|fazer\s*login\s*com\s*senha|entrar\s*com\s*(?:uma\s*)?senha|iniciar\s*sesi[oó]n\s*con\s*contrase[nñ]a|密码登录)/i.test(txt) &&
+                !txt.includes("esqueci") && !txt.includes("forgot") && !txt.includes("olvid") && !txt.includes("reset")
+              ) {
+                (b as HTMLElement).click();
+                return true;
+              }
+            }
+          } catch {}
+          return false;
+        })
+        .catch(() => false);
+      await sleep(500);
+    };
+
+    await revealPasswordMode();
+
+    const passwordSelector = 'input[type="password"], input[name="password"]';
+    // Fill email
+    try {
+      await page.fill(emailSelector, email, { timeout: 8_000 });
+      await sleep(300);
+    } catch {
+      if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
+        return { success: true };
+      }
+      throw new Error(`Campo de e-mail não encontrado na tela de autenticação`);
+    }
+
+    // If password field is still not visible after typing email, trigger reveal again
+    if (!(await isPasswordInputPresent())) {
+      await revealPasswordMode();
     }
 
     try {
@@ -2891,25 +3015,54 @@ async function loginViaUi(
     }
 
     // Fill password
-    console.log(`✍️ [Playwright:Login:UI] Filling password...`);
-    await page.fill(passwordSelector, password);
-    await sleep(500);
+    try {
+      await page.fill(passwordSelector, password, { timeout: 8_000 });
+      await sleep(500);
+    } catch {
+      if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
+        return { success: true };
+      }
+      throw new Error(`Campo de senha não encontrado na tela de autenticação`);
+    }
 
-    // Prefer clicking the submit button; fall back to pressing Enter.
-    // The button starts disabled and only enables once both fields are filled.
+    // Dispatch input/change/blur events so Ant Design / React enables the submit button
+    await page
+      .evaluate(() => {
+        try {
+          const emailEl = document.querySelector('input[name="email"], input[type="email"], input[type="text"]');
+          const passEl = document.querySelector('input[type="password"], input[name="password"]');
+          if (emailEl) {
+            emailEl.dispatchEvent(new Event("input", { bubbles: true }));
+            emailEl.dispatchEvent(new Event("change", { bubbles: true }));
+            emailEl.dispatchEvent(new Event("blur", { bubbles: true }));
+          }
+          if (passEl) {
+            passEl.dispatchEvent(new Event("input", { bubbles: true }));
+            passEl.dispatchEvent(new Event("change", { bubbles: true }));
+            passEl.dispatchEvent(new Event("blur", { bubbles: true }));
+          }
+        } catch {}
+      })
+      .catch(() => {});
+
+    // Prefer clicking the submit button; do NOT press Enter if disabled
     const submitSelector =
-      'button.qwenchat-auth-pc-submit-button, button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")';
+      'button.qwenchat-auth-pc-submit-button, button[type="submit"], button:has-text("Log in"), button:has-text("Sign in"), button:has-text("Fazer login"), button:has-text("Entrar"), button:has-text("Iniciar sesión"), button:has-text("登录")';
     const submitButton = page.locator(submitSelector).first();
     try {
       await page.waitForSelector('button[type="submit"]:not([disabled])', {
-        timeout: 5_000,
+        timeout: 4_000,
       });
       console.log(`🔘 [Playwright:Login:UI] Clicking submit button...`);
       await submitButton.click();
     } catch {
-      console.log(`⌨️ [Playwright:Login:UI] Pressing Enter to submit...`);
-      await page.keyboard.press("Enter");
-    }
+      const isDisabled = await submitButton.isDisabled().catch(() => true);
+      if (!isDisabled) {
+        await submitButton.click({ force: true }).catch(() => {});
+      } else {
+        if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 2000))) {
+          return { success: true };
+        }
 
     // Wait and solve any visible captcha challenge (Baxia slider / Turnstile / Cloudflare)
     await sleep(2000);
@@ -2952,43 +3105,82 @@ async function loginViaUi(
       };
     }
 
-    // Check for UI error elements in DOM (Ant Design errors, alerts, toasts)
-    const errorSelector = [
-      ".qwen-chat-v2-toast-text",
-      ".qwen-chat-v2-toast-content",
-      ".ant-form-item-explain-error",
-      ".ant-message-error",
-      ".ant-message-notice",
-      '[role="alert"]',
-      ".qwenchat-auth-error",
-      ".auth-error-message",
-    ].join(", ");
-    const errorEl = page.locator(errorSelector).first();
-    if (await errorEl.isVisible().catch(() => false)) {
-      const errorText = (await errorEl.innerText().catch(() => "")).trim();
-      if (errorText) {
-        const classified = classifyQwenAuthError(undefined, errorText);
-        return {
-          success: false,
-          permanentFailure: classified.isPermanent,
-          reason: `Formulário: ${classified.reason}`,
-        };
       }
     }
+    // Post-submit verification loop: wait up to 15s for captcha, redirect, cookies, or errors
+    const postSubmitDeadline = Date.now() + 15_000;
+    while (Date.now() < postSubmitDeadline) {
+      if (page.isClosed()) break;
 
-    // Check if login was successful
-    const isLoggedIn = await isPageLoggedIn(page);
+      // If a slider puzzle captcha appeared after submit, solve it automatically
+      if (config.captcha.enabled) {
+        await solveBaxiaCaptcha(page, {
+          waitForMs: 1500,
+          maxAttempts: config.captcha.maxAttempts,
+          retryDelayMs: config.captcha.retryDelayMs,
+        }).catch(() => {});
+      }
 
-    if (isLoggedIn) {
-      await page.goto(qwenUrl("/"), {
-        waitUntil: "domcontentloaded",
-        timeout: config.timeouts.navigation,
-      }).catch(() => {});
-      console.log(`🏁 [Playwright:Login:UI] Completed: isLoggedIn=${isLoggedIn} | finalUrl=${page.url()}`);
+      // Check for UI error elements in DOM (Ant Design errors, alerts, toasts)
+      const errorSelector = [
+        ".qwen-chat-v2-toast-text",
+        ".qwen-chat-v2-toast-content",
+        ".ant-form-item-explain-error",
+        ".ant-message-error",
+        ".ant-message-notice",
+        '[role="alert"]',
+        ".qwenchat-auth-error",
+        ".auth-error-message",
+      ].join(", ");
+      const errorEl = page.locator(errorSelector).first();
+      if (await errorEl.isVisible().catch(() => false)) {
+        const errorText = (await errorEl.innerText().catch(() => "")).trim();
+        if (errorText) {
+          const classified = classifyQwenAuthError(undefined, errorText);
+          return {
+            success: false,
+            permanentFailure: classified.isPermanent,
+            reason: `Formulário: ${classified.reason}`,
+          };
+        }
+      }
+
+      // Check if an OTP code verification screen appeared (e.g. 2FA / email verification code)
+      const codeSelector =
+        'input[placeholder*="code" i], input[placeholder*="código" i], input[name*="code" i]';
+      const codeInput = page.locator(codeSelector).first();
+      if (await codeInput.isVisible().catch(() => false)) {
+        return {
+          success: false,
+          reason: "Conta requer código de verificação enviado por e-mail (2FA/OTP)",
+        };
+      }
+
+      // Check if auth cookie 'token' appeared
+      try {
+        const liveCookies = await page.context().cookies();
+        if (liveCookies.some((c) => c.name === "token")) {
+          return { success: true };
+        }
+      } catch {}
+
+      // Check if page redirected away from /auth and is logged in
+      const currentUrl = page.url();
+      if (!currentUrl.includes("/auth") && !currentUrl.includes("/login")) {
+        if (await isPageLoggedIn(page, 3000)) {
+          return { success: true };
+        }
+      }
+
+      await sleep(1000);
+    }
+
+    // Final check
+    if (await isPageLoggedIn(page, 3000)) {
       return { success: true };
     }
 
-    console.log(`🏁 [Playwright:Login:UI] Completed: isLoggedIn=${isLoggedIn} | finalUrl=${page.url()}`);
+    console.log(`🏁 [Playwright:Login:UI] Completed: isLoggedIn=false | finalUrl=${page.url()}`);
     return {
       success: false,
       reason: "A página permaneceu na tela de autenticação após envio do formulário",
@@ -2997,6 +3189,161 @@ async function loginViaUi(
     console.warn(`⚠️  [Playwright:Login:UI] UI login error: ${err?.message || err}`);
     return { success: false, reason: err?.message || String(err) };
   }
+}
+
+/**
+ * Silently refresh the short-lived access token (15m) using the 30-day refresh_token.
+ * Uses official in-page fetch matching Qwen Web /api/v2/auths/refresh verified in HAR.
+ */
+export async function refreshAccountToken(
+  accountId: string,
+): Promise<{ success: boolean; token?: string; error?: string }> {
+  const page = accountPages.get(accountId);
+  if (!page || page.isClosed()) {
+    return { success: false, error: "Account page not active" };
+  }
+
+  // 1. Get refresh token from SQLite session or localStorage
+  const { getValidAuthSession, saveAuthSession } = await import("../core/database.ts");
+  const session = getValidAuthSession(accountId);
+  let refreshToken = session?.refreshToken;
+
+  if (!refreshToken) {
+    try {
+      refreshToken =
+        (await page.evaluate(() => localStorage.getItem("refresh_token") || "")) ||
+        undefined;
+    } catch {}
+  }
+
+  // 2. If we have a refresh token, invoke the working refresh endpoint in-page
+  if (refreshToken) {
+    try {
+      const refreshResult = await page.evaluate(
+        async ({ rTok }) => {
+          try {
+            const response = await fetch("https://auth.qwen.ai/api/v2/auths/refresh", {
+              method: "GET",
+              credentials: "include",
+              headers: {
+                accept: "application/json, text/plain, */*",
+                source: "web",
+                version: "0.3.11",
+                "x-request-origin": "https://chat.qwen.ai",
+                timezone: new Date().toString().split(" (")[0],
+                authorization: `Bearer ${rTok}`,
+              },
+            });
+            const json = await response.json().catch(() => null);
+            return { ok: response.ok, status: response.status, data: json };
+          } catch (e: any) {
+            return { ok: false, error: e.message };
+          }
+        },
+        { rTok: refreshToken },
+      );
+
+      const json = refreshResult?.data;
+      if (json && json.success === true && json.data) {
+        const newAccessToken = json.data.access_token || json.data.token;
+        const newRefreshToken = json.data.refresh_token || refreshToken;
+
+        if (newAccessToken) {
+          // Update browser cookie and localStorage
+          await page.context().addCookies([
+            {
+              name: "token",
+              value: newAccessToken,
+              domain: ".qwen.ai",
+              path: "/",
+              expires: Math.floor(Date.now() / 1000) + 31536000,
+              httpOnly: false,
+              secure: true,
+              sameSite: "Lax",
+            },
+          ]);
+
+          await page
+            .evaluate(
+              ({ tok, rTok }) => {
+                try {
+                  localStorage.removeItem("qwen_token_logged_out_marker");
+                  localStorage.setItem("token", tok);
+                  localStorage.setItem("access_token", tok);
+                  if (rTok) localStorage.setItem("refresh_token", rTok);
+                  document.cookie = `token=${encodeURIComponent(tok)}; path=/; domain=.qwen.ai; max-age=31536000`;
+                } catch {}
+              },
+              { tok: newAccessToken, rTok: newRefreshToken },
+            )
+            .catch(() => {});
+
+          // Update memory cache
+          const liveCookies = await page.context().cookies();
+          const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+          const cache = getHeaderCache(accountId);
+          cache.headers.cookie = cookieStr;
+          cache.lastRefresh = Date.now();
+          markAccountHeadersReady(accountId);
+
+          // Update SQLite session with new tokens
+          saveAuthSession(accountId, {
+            cookie: cookieStr,
+            userAgent: cache.headers["user-agent"] || session?.userAgent || "",
+            bxV: cache.headers["bx-v"] || session?.bxV || "2.5.37",
+            bxUa: cache.headers["bx-ua"] || session?.bxUa || "",
+            bxUmidtoken: cache.headers["bx-umidtoken"] || session?.bxUmidtoken || "",
+            secChUa: cache.headers["sec-ch-ua"] || session?.secChUa,
+            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || session?.secChUaMobile,
+            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || session?.secChUaPlatform,
+            version: cache.headers["version"] || session?.version,
+            userId: session?.userId,
+            tokenExpiresAt: parseJwtExpiry(newAccessToken) || undefined,
+            refreshToken: newRefreshToken,
+            capturedAt: Date.now(),
+          });
+
+          return { success: true, token: newAccessToken };
+        }
+      }
+    } catch {}
+  }
+
+  // 3. Fallback: if refresh_token was invalid/absent or refresh failed, do clean API login
+  const { getAccountCredentials } = await import("../core/accounts.ts");
+  const creds = getAccountCredentials(accountId);
+  if (creds && creds.email && creds.password) {
+    const apiResult = await loginViaApi(page, creds.email, creds.password);
+    if (apiResult.success) {
+      const liveCookies = await page.context().cookies();
+      const tokenCookie = liveCookies.find((c) => c.name === "token");
+      if (tokenCookie) {
+        const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
+        const cache = getHeaderCache(accountId);
+        cache.headers.cookie = cookieStr;
+        cache.lastRefresh = Date.now();
+        markAccountHeadersReady(accountId);
+        saveAuthSession(accountId, {
+          cookie: cookieStr,
+          userAgent: cache.headers["user-agent"] || session?.userAgent || "",
+          bxV: cache.headers["bx-v"] || session?.bxV || "2.5.37",
+          bxUa: cache.headers["bx-ua"] || session?.bxUa || "",
+          bxUmidtoken: cache.headers["bx-umidtoken"] || session?.bxUmidtoken || "",
+          secChUa: cache.headers["sec-ch-ua"] || session?.secChUa,
+          secChUaMobile: cache.headers["sec-ch-ua-mobile"] || session?.secChUaMobile,
+          secChUaPlatform: cache.headers["sec-ch-ua-platform"] || session?.secChUaPlatform,
+          version: cache.headers["version"] || session?.version,
+          userId: session?.userId,
+          tokenExpiresAt: parseJwtExpiry(tokenCookie.value) || undefined,
+          refreshToken: apiResult.refreshToken,
+          capturedAt: Date.now(),
+        });
+        return { success: true, token: tokenCookie.value };
+      }
+    }
+  }
+
+  return { success: false, error: "Could not refresh or re-authenticate token" };
 }
 
 // ─── Header Capture ───────────────────────────────────────────────────────────
@@ -3825,6 +4172,11 @@ async function refreshHeadersInternal(
       };
 
       if (forceReauth) {
+        // Try silent token refresh first using the 30-day refresh_token or direct API signin!
+        const refreshed = await refreshAccountToken(accountId);
+        if (refreshed.success) {
+          return;
+        }
         await executeReauth();
       } else {
         try {
@@ -3861,9 +4213,9 @@ async function refreshHeadersInternal(
         }
       }
 
-      // Fast re-auth completion: if re-auth succeeded and required anti-bot tokens are already cached,
+      // Fast refresh completion: if required anti-bot tokens are already cached,
       // refresh cookies directly without running slow UI typing interception.
-      if (reauthExecuted && hasRequiredQwenHeaders(cache.headers)) {
+      if (hasRequiredQwenHeaders(cache.headers)) {
         const liveCookies = await page.context().cookies();
         if (liveCookies.some((c) => c.name === "token")) {
           const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
@@ -4454,21 +4806,17 @@ export async function keepAlivePlaywrightAccount(
     const now = Date.now();
     const currentUrl = page.url();
 
-    // Proactive session check: if token expires within 45 minutes, refresh proactively
+    // Proactive session check: if token expires within 5 minutes, refresh in-page silently using refreshAccountToken
     const cookie = await getCookies(accountId);
-    if (cookie && isTokenExpiringSoon(cookie, 45)) {
+    if (cookie && isTokenExpiringSoon(cookie, 5)) {
       console.log(
-        `💓 [SessionKeeper] Account ${accountId} token expires within 45m; proactively renewing session...`,
+        `💓 [SessionKeeper] Account ${accountId} access token expiring soon (<5m); silently refreshing...`,
       );
-      try {
-        await refreshHeadersInternal(accountId, config.timeouts.headers, false);
+      const res = await refreshAccountToken(accountId);
+      if (res.success) {
         lastKeepAliveNavigation.set(accountId, now);
         touchAccountActivity(accountId);
         return true;
-      } catch (err) {
-        console.warn(
-          `[SessionKeeper] Proactive session renewal failed for ${accountId}: ${getErrorMessage(err)}`,
-        );
       }
     }
 
@@ -4902,3 +5250,5 @@ export async function restoreWindow(page: any): Promise<void> {
     await cdp.detach();
   } catch {}
 }
+
+
