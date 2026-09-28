@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from "uuid";
+﻿import { v4 as uuidv4 } from "uuid";
 import {
 	getAccountCooldownInfo,
 	getNextAccount,
@@ -71,6 +71,7 @@ import {
 	classifyRetryAction,
 	isAntiBotError as isAntiBotPolicyError,
 	isAccountInitializationError,
+	isAuthExpiredError,
 	isChatInProgressError,
 	isQuotaLikeError,
 	isTerminalLocalError,
@@ -728,7 +729,7 @@ export async function acquireUpstreamStream(
 			const stickyRotation =
 				stickyThreadAccountId === accountId &&
 				(isAccountUnavailableError(lastError) ||
-					isAccountInitializationError(lastError) ||
+					isAccountInitializationError(lastError) || isAuthExpiredError(lastError) ||
 					isChatInProgressError(lastError));
 			console.warn(
 				`⚠️  [Chat] Quota exceeded | ${quotaInfo.email} | cooldown=${quotaInfo.cooldownSeconds}s${quotaInfo.untilStr} | ${quotaInfo.message}${stickyRotation ? " | switching sticky account with full context" : ""}`,
@@ -756,7 +757,7 @@ export async function acquireUpstreamStream(
 			// account the WAF happened to pick.
 			const stickyAccountMustRotate =
 				isAccountUnavailableError(lastError) ||
-				isAccountInitializationError(lastError) ||
+				isAccountInitializationError(lastError) || isAuthExpiredError(lastError) ||
 				isAntiBotError(lastError);
 			if (stickyAccountMustRotate) {
 				if (!quotaInfo) {
@@ -1718,7 +1719,7 @@ async function tryCreateStreamWithRetry(
 			const cooldownMs = policy.accountCooldownMs ?? 0;
 			if (cooldownMs > 0) {
 				console.warn(
-					`⚠️  [Chat] Account initialization failed | ${currentAccountEmail} | cooldown=${Math.round(cooldownMs / 1000)}s`,
+					`⚠️  [Chat] Account initialization failed (${policy.accountCooldownReason}) | ${currentAccountEmail} | cooldown=${Math.round(cooldownMs / 1000)}s`,
 				);
 				markAccountFailed(currentAccountId);
 				markAccountRateLimited(
@@ -1728,13 +1729,14 @@ async function tryCreateStreamWithRetry(
 				);
 			} else {
 				console.warn(
-					`⚠️  [Chat] Account auth expired/retryable | ${currentAccountEmail} | rotating without cooldown`,
+					`⚠️  [Chat] Account initialization failed (${policy.accountCooldownReason}) | ${currentAccountEmail} | rotating without cooldown`,
 				);
-				if (policy.accountCooldownReason === "AuthExpired") {
-					import("../../services/playwright.ts")
-						.then(({ refreshAccountToken }) => refreshAccountToken(currentAccountId))
-						.catch(() => {});
-				}
+			}
+			
+			if (policy.accountCooldownReason === "AuthExpired") {
+				import("../../services/playwright.ts")
+					.then(({ refreshAccountToken }) => refreshAccountToken(currentAccountId))
+					.catch(() => {});
 			}
 			return { success: false, error: err };
 		}
@@ -1898,3 +1900,4 @@ async function tryCreateStreamWithRetry(
 			new Error("Qwen stream retry attempts were exhausted"),
 	};
 }
+

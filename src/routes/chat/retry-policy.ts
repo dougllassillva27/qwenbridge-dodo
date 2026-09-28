@@ -1,3 +1,19 @@
+﻿export function isAuthExpiredError(err: unknown): boolean {
+  if (!err) return false;
+  const message = (err as any)?.message?.toLowerCase() || '';
+  const code = (err as any)?.code?.toLowerCase() || '';
+  return (
+    code === 'createchatinvalidresponse' ||
+    code === 'createchatfailed' ||
+    code === 'unauthorized' ||
+    message.includes('401 não autorizado') ||
+    message.includes('não tem permissão para acessar') ||
+    message.includes('401 unauthorized') ||
+    message.includes('"code":"unauthorized"') ||
+    message.includes('"code": "unauthorized"') ||
+    message.includes('token has expired')
+  );
+}
 /*
  * Generic upstream retry / account-switch policy.
  *
@@ -486,7 +502,7 @@ export function classifyRetryAction(
       switchAccount: true,
       forceNewChat: false,
       retryAfterMs: Math.min(baseDelayMs, 1_000),
-      accountCooldownMs: 0,
+      accountCooldownMs: 15_000,
       accountCooldownReason: "PersonalizationFailed",
     });
   }
@@ -494,23 +510,13 @@ export function classifyRetryAction(
   // Upstream 401 / Unauthorized on chat creation or API requests:
   // Access token expired (15m window). Rotate without locking into a 300s cooldown
   // so the account can immediately be renewed via refresh_token.
-  if (
-    code === "createchatinvalidresponse" ||
-    code === "createchatfailed" ||
-    code === "unauthorized" ||
-    message.includes("401 não autorizado") ||
-    message.includes("não tem permissão para acessar") ||
-    message.includes("401 unauthorized") ||
-    message.includes('"code":"unauthorized"') ||
-    message.includes('"code": "unauthorized"') ||
-    message.includes("token has expired")
-  ) {
+  if (isAuthExpiredError(err)) {
     return makeRetryAction("account_initialization_failed", {
       switchAccount: true,
       forceNewChat: true,
       retryWithFullPrompt: true,
       retryAfterMs: Math.min(baseDelayMs, 1_000),
-      accountCooldownMs: 0,
+      accountCooldownMs: 15_000,
       accountCooldownReason: "AuthExpired",
     });
   }
@@ -790,3 +796,6 @@ export function throwFromSseUpstreamError(
 
   throw toRetryableStreamError(normalizedErrCode, errDetails);
 }
+
+
+
