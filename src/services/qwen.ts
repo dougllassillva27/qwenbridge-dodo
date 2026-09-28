@@ -825,6 +825,7 @@ function getBrowserFetchHeaders(
   const browserAllowedHeaders = new Set([
     "accept",
     "content-type",
+    "authorization",
     "bx-ua",
     "bx-umidtoken",
     "bx-v",

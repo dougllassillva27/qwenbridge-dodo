@@ -71,6 +71,12 @@ export function buildDragTrajectory(
   const overshootX = endX + Math.max(4, distance * 0.12);
   const correctionSteps = Math.max(4, Math.round(steps * 0.2));
 
+  // Control point for Quadratic Bezier: creates a realistic "bow" or arc in the drag path
+  // instead of a perfectly straight line. We offset the Y in the middle of the drag.
+  const controlX = startX + (overshootX - startX) * 0.5;
+  const controlYOffset = (rng() > 0.5 ? 1 : -1) * (distance * (0.05 + 0.1 * rng())); // 5-15% of distance as arc height
+  const controlY = startY + (endY - startY) * 0.5 + controlYOffset;
+
   for (let step = 1; step <= steps; step++) {
     const progress = step / steps;
     // Cubic ease-in-out with an acceleration ramp: slow start, fast middle.
@@ -80,7 +86,10 @@ export function buildDragTrajectory(
         : 1 - Math.pow(-2 * progress + 2, 3) / 2;
     const ramp = 0.7 + Math.min(0.6, progress * 1.3);
 
-    const targetX = startX + (overshootX - startX) * eased;
+    // Quadratic Bezier interpolation for the X and Y coordinates
+    const t = eased;
+    const targetX = Math.pow(1 - t, 2) * startX + 2 * (1 - t) * t * controlX + Math.pow(t, 2) * overshootX;
+    const bezierY = Math.pow(1 - t, 2) * startY + 2 * (1 - t) * t * controlY + Math.pow(t, 2) * endY;
     const jitterY = gaussianNoise(rng) * 1.2;
 
     // Micro-pauses: humans hesitate at roughly a third and two thirds of a
@@ -93,7 +102,7 @@ export function buildDragTrajectory(
 
     samples.push({
       x: targetX,
-      y: startY + (endY - startY) * eased + jitterY,
+      y: bezierY + jitterY,
       delayMs,
     });
   }

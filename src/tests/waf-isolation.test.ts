@@ -41,13 +41,22 @@ test("hard WAF block rotates the fingerprint and quarantines the account", () =>
   clearAccountCooldown(acc);
   const before = getFingerprintProfile(acc);
 
-  const result = recordWafHardBlock(acc);
+  const result1 = recordWafHardBlock(acc);
 
-  assert.equal(result.fingerprintRotated, true);
+  assert.equal(result1.fingerprintRotated, false, "first block must be soft (no rotation)");
+  assert.equal(
+    getFingerprintProfile(acc).seed,
+    before.seed,
+    "soft recovery must preserve the fingerprint",
+  );
+
+  const result2 = recordWafHardBlock(acc);
+
+  assert.equal(result2.fingerprintRotated, true, "second block must be hard (rotation)");
   assert.notEqual(
     getFingerprintProfile(acc).seed,
     before.seed,
-    "recovery must NOT return on the fingerprint the WAF already flagged",
+    "hard recovery must NOT return on the fingerprint the WAF already flagged",
   );
   const cd = getAccountCooldownInfo(acc);
   assert.ok(cd, "account must be quarantined after a hard block");

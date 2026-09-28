@@ -60,6 +60,13 @@ export function setWafContextResetListener(fn: ContextResetListener | null): voi
   contextResetListener = fn;
 }
 
+type SoftRecoveryListener = (accountId: string) => void | Promise<void>;
+let softRecoveryListener: SoftRecoveryListener | null = null;
+export function setWafSoftRecoveryListener(fn: SoftRecoveryListener | null): void {
+  softRecoveryListener = fn;
+}
+
+
 function getState(accountId: string): WafBlockState {
   let state = states.get(accountId);
   if (!state) {
@@ -94,36 +101,47 @@ export function recordWafHardBlock(accountId: string): WafBlockResult {
     markAccountRateLimited(accountId, cooldownMs, "WafChallenge");
   }
 
-  rotateFingerprintSeed(accountId);
-  logger.warn(
-    `[WafIsolation] Hard WAF block on ${accountId}: fingerprint rotated (streak ${state.consecutiveHardBlocks}), quarantined ${Math.round(cooldownMs / 1000)}s`,
-  );
+  const isHardBlock = state.consecutiveHardBlocks >= 2;
 
-  // After 2+ consecutive hard blocks, the automated solver is clearly failing.
-  // Flag the account for headed browser recovery so the next initialization
-  // opens a visible window where the solver retries with real GPU rendering.
-  if (state.consecutiveHardBlocks >= 2 && headedRecoveryListener && config.playwright.headedRecovery) {
-    headedRecoveryListener(accountId, cooldownMs);
+  if (isHardBlock) {
+    rotateFingerprintSeed(accountId);
     logger.warn(
-      `[WafIsolation] Account ${accountId} flagged for headed recovery after ${state.consecutiveHardBlocks} consecutive hard blocks.`,
+      `[WafIsolation] Hard WAF block on ${accountId}: fingerprint rotated (streak ${state.consecutiveHardBlocks}), quarantined ${Math.round(cooldownMs / 1000)}s`,
     );
-  }
 
-  if (contextResetListener) {
-    // Best-effort: the next use re-initializes the context with the rotated
-    // profile; a failed close must not abort the quarantine.
-    void Promise.resolve(contextResetListener(accountId)).catch((error: unknown) => {
+    // After 2+ consecutive hard blocks, the automated solver is clearly failing.
+    // Flag the account for headed browser recovery so the next initialization
+    // opens a visible window where the solver retries with real GPU rendering.
+    if (headedRecoveryListener && config.playwright.headedRecovery) {
+      headedRecoveryListener(accountId, cooldownMs);
       logger.warn(
-        `[WafIsolation] Context reset listener failed for ${accountId}: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `[WafIsolation] Account ${accountId} flagged for headed recovery after ${state.consecutiveHardBlocks} consecutive hard blocks.`,
       );
-    });
+    }
+
+    if (contextResetListener) {
+      // Best-effort: the next use re-initializes the context with the rotated
+      // profile; a failed close must not abort the quarantine.
+      void Promise.resolve(contextResetListener(accountId)).catch((error: unknown) => {
+        logger.warn(
+          `[WafIsolation] Context reset listener failed for ${accountId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      });
+    }
+  } else {
+    logger.warn(
+      `[WafIsolation] Soft WAF block on ${accountId}: clearing session cookies without rotating fingerprint (streak ${state.consecutiveHardBlocks}), quarantined ${Math.round(cooldownMs / 1000)}s`,
+    );
+    if (softRecoveryListener) {
+      void Promise.resolve(softRecoveryListener(accountId)).catch(() => {});
+    }
   }
 
   return {
     cooldownMs,
-    fingerprintRotated: true,
+    fingerprintRotated: isHardBlock,
     escalated: state.consecutiveHardBlocks > 1,
   };
 }

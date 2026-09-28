@@ -80,7 +80,7 @@ import { setFingerprintRotationListener } from "../core/account-isolation.ts";
 import { subtlePageActivity } from "./human-behavior.ts";
 import { solveBaxiaCaptcha } from "./captcha-solver.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
-import { setWafContextResetListener, setWafHeadedRecoveryListener } from "../core/waf-isolation.ts";
+import { setWafContextResetListener, setWafHeadedRecoveryListener, setWafSoftRecoveryListener } from "../core/waf-isolation.ts";
 import { updateQwenWebVersion, getQwenWebVersion } from "./qwen-headers.ts";
 import { getAccountProfilePath, getProfilesDir } from "../core/paths.ts";
 import { parseJwtExpiry, isTokenExpiringSoon } from "../utils/jwt.ts";
@@ -474,6 +474,7 @@ export async function isPageLoggedIn(
       .evaluate(async () => {
         try {
           try { localStorage.removeItem("qwen_token_logged_out_marker"); } catch {}
+          if (!localStorage.getItem("token")) return false;
 
           const res = await fetch("/api/v1/auths/", { method: "GET" });
           if (res.status !== 200) return false;
@@ -491,24 +492,36 @@ export async function isPageLoggedIn(
           }
           const user = json.data?.user || json.data || json;
           if (!user || typeof user !== "object") return false;
-          if (user.is_guest === true || user.is_login === false) return false;
+          if (
+            user.is_guest === true ||
+            user.is_login === false ||
+            user.role === "guest" ||
+            String(user.name || "").toLowerCase() === "guest" ||
+            String(user.name || "").toLowerCase() === "convidado"
+          ) {
+            return false;
+          }
+          const email = typeof user.email === "string" ? user.email.trim() : "";
+          const phone = typeof user.phone === "string" ? user.phone.trim() : "";
+          const name = typeof user.name === "string" ? user.name.trim() : "";
           const hasIdentity = Boolean(
-            user.id ||
-              user.user_id ||
-              user.userId ||
-              user.email ||
-              user.name ||
-              json.data?.token ||
-              json.token ||
-              user.token,
+            (email && email.includes("@")) ||
+              phone ||
+              (name && name.toLowerCase() !== "guest" && name.toLowerCase() !== "convidado")
           );
           if (!hasIdentity) return false;
 
           // Validate upstream session via same-origin settings
           try {
+            const token = user.token || json.data?.token || json.token || localStorage.getItem("token") || "";
+            const headers: Record<string, string> = {};
+            if (token) {
+              headers["authorization"] = token.startsWith("Bearer ") ? token : `Bearer ${token}`;
+            }
             const settingsRes = await fetch("/api/v2/users/user/settings", {
               method: "GET",
               credentials: "include",
+              headers,
               signal: AbortSignal.timeout(4000),
             });
             if (settingsRes.status === 401 || settingsRes.status === 403) {
@@ -3053,63 +3066,63 @@ export async function captureQwenHeaders(
           ) {
             headersCaptured = true;
             if (timeout) clearTimeout(timeout);
-            cache.headers = capturedHeaders;
-            if (!cache.headers["authorization"] && !page.isClosed()) {
-              page.evaluate(async () => {
-                let tok = localStorage.getItem("token") || "";
-                if (!tok) {
-                  try {
-                    const res = await fetch("/api/v1/auths/", { method: "GET" });
-                    if (res.status === 200) {
-                      const json = await res.json().catch(() => null);
-                      tok = json?.token || json?.data?.token || "";
-                      if (tok) {
-                        try { localStorage.setItem("token", tok); } catch {}
-                      }
+            void (async () => {
+              if (!cache.headers["authorization"] && !page.isClosed()) {
+                try {
+                  const tok = await page.evaluate(async () => {
+                    let t = localStorage.getItem("token") || "";
+                    if (!t) {
+                      try {
+                        const res = await fetch("/api/v1/auths/", { method: "GET" });
+                        if (res.status === 200) {
+                          const json = await res.json().catch(() => null);
+                          t = json?.token || json?.data?.token || "";
+                          if (t) {
+                            try { localStorage.setItem("token", t); } catch {}
+                          }
+                        }
+                      } catch {}
                     }
-                  } catch {}
-                }
-                return tok;
-              }).then((tok) => {
-                if (tok) {
-                  cache.headers["authorization"] = tok.startsWith("Bearer ") ? tok : `Bearer ${tok}`;
-                }
-              }).catch(() => {});
-            }
-            if (capturedHeaders["version"]) {
-              updateQwenWebVersion(capturedHeaders["version"]);
-            }
-            markAccountHeadersReady(accountId);
-            cache.lastRefresh = Date.now();
-            cookieCaches.delete(accountId);
-            touchAccountActivity(accountId);
-
-            try {
-              import("../core/database.ts").then(({ saveAuthSession }) => {
-                import("../utils/jwt.ts").then(({ parseJwtExpiry }) => {
-                  const tokenExpiry = parseJwtExpiry(capturedHeaders.cookie);
-                  saveAuthSession(accountId, {
-                    cookie: capturedHeaders.cookie,
-                    userAgent: capturedHeaders["user-agent"],
-                    bxV: capturedHeaders["bx-v"],
-                    bxUa: capturedHeaders["bx-ua"],
-                    bxUmidtoken: capturedHeaders["bx-umidtoken"],
-                    secChUa: capturedHeaders["sec-ch-ua"],
-                    secChUaMobile: capturedHeaders["sec-ch-ua-mobile"],
-                    secChUaPlatform: capturedHeaders["sec-ch-ua-platform"],
-                    version: capturedHeaders["version"],
-                    tokenExpiresAt: tokenExpiry || undefined,
-                    capturedAt: Date.now(),
+                    return t;
                   });
-                }).catch(() => {});
-              }).catch(() => {});
-            } catch {}
+                  if (tok) {
+                    cache.headers["authorization"] = tok.startsWith("Bearer ") ? tok : `Bearer ${tok}`;
+                  }
+                } catch {}
+              }
+              if (capturedHeaders["version"]) {
+                updateQwenWebVersion(capturedHeaders["version"]);
+              }
+              markAccountHeadersReady(accountId);
+              cache.lastRefresh = Date.now();
+              cookieCaches.delete(accountId);
+              touchAccountActivity(accountId);
 
-            console.log(
-              `✨ [Playwright] Passive header capture succeeded from ${url.split("?")[0]} for ${accountId}`,
-            );
-            void cleanupRoute();
-            settle();
+              try {
+                const { saveAuthSession } = await import("../core/database.ts");
+                const { parseJwtExpiry } = await import("../utils/jwt.ts");
+                const tokenExpiry = parseJwtExpiry(capturedHeaders.cookie);
+                saveAuthSession(accountId, {
+                  cookie: capturedHeaders.cookie,
+                  userAgent: capturedHeaders["user-agent"],
+                  bxV: capturedHeaders["bx-v"],
+                  bxUa: capturedHeaders["bx-ua"],
+                  bxUmidtoken: capturedHeaders["bx-umidtoken"],
+                  secChUa: capturedHeaders["sec-ch-ua"],
+                  secChUaMobile: capturedHeaders["sec-ch-ua-mobile"],
+                  secChUaPlatform: capturedHeaders["sec-ch-ua-platform"],
+                  version: capturedHeaders["version"],
+                  tokenExpiresAt: tokenExpiry || undefined,
+                  capturedAt: Date.now(),
+                });
+              } catch {}
+
+              console.log(
+                `✨ [Playwright] Passive header capture succeeded from ${url.split("?")[0]} for ${accountId}`,
+              );
+              void cleanupRoute();
+              settle();
+            })();
           }
         } catch {}
       };
@@ -3826,7 +3839,8 @@ async function refreshHeadersInternal(
           await sleep(2000);
           const url = page.url();
           const isAuthUrl = url.includes("auth") || url.includes("login");
-          if (isAuthUrl) {
+          const loggedIn = !isAuthUrl && (await isPageLoggedIn(page, 5_000));
+          if (isAuthUrl || !loggedIn) {
             await executeReauth();
           }
         } catch (navErr) {
@@ -3836,7 +3850,9 @@ async function refreshHeadersInternal(
           );
           try {
             const url = page.url();
-            if (url.includes("auth") || url.includes("login")) {
+            const isAuthUrl = url.includes("auth") || url.includes("login");
+            const loggedIn = !isAuthUrl && (await isPageLoggedIn(page, 5_000));
+            if (isAuthUrl || !loggedIn) {
               await executeReauth();
             }
           } catch {
@@ -3898,6 +3914,10 @@ async function refreshHeadersInternal(
     touchAccountActivity(accountId);
     cache.refreshInProgress = false;
   }
+}
+
+export function isAccountRecovering(accountId: string): boolean {
+  return getHeaderCache(accountId).refreshInProgress;
 }
 
 export async function refreshHeaders(
@@ -4644,6 +4664,23 @@ setWafContextResetListener((accountId: string) => {
       }`,
     );
   });
+});
+
+// Soft Recovery: delete only anti-bot session cookies to avoid a full context
+// reset, which preserves the trusted fingerprint.
+setWafSoftRecoveryListener(async (accountId: string) => {
+  const context = accountContexts.get(accountId);
+  if (!context) return;
+  try {
+    const cookies = await context.cookies();
+    // acw_tc is the primary WAF challenge cookie. _tb_token_ might also matter.
+    const toKeep = cookies.filter(c => !["acw_tc", "token", "_tb_token_"].includes(c.name));
+    await context.clearCookies();
+    await context.addCookies(toKeep);
+    console.warn(`🧹 [Playwright] Soft WAF recovery: cleared WAF/session cookies for ${accountId}`);
+  } catch (err) {
+    console.warn(`[Playwright] Soft WAF recovery failed for ${accountId}:`, err);
+  }
 });
 
 export async function closeAllPlaywright(): Promise<void> {

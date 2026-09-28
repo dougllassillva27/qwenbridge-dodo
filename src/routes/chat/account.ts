@@ -41,6 +41,7 @@ import {
 	isPlaywrightInitialized,
 	isAccountRecentlyActive,
 	refreshHeaders,
+	isAccountRecovering,
 } from "../../services/playwright.ts";
 import { enqueueOrphanChatDeletion } from "../../services/chat-cleanup.ts";
 import {
@@ -327,6 +328,7 @@ function hasFreeAlternateAccount(
 			candidate.id !== currentAccountId &&
 			!triedAccountIds.has(candidate.id) &&
 			!getAccountCooldownInfo(candidate.id) &&
+			!isAccountRecovering(candidate.id) &&
 			!isAccountTemporarilyBusy(candidate.id) &&
 			!isAccountBusy(candidate.id),
 	);
@@ -353,6 +355,7 @@ function getNextFreeAccountForParallel(
 			c.id !== currentAccountId &&
 			!triedAccountIds.has(c.id) &&
 			!getAccountCooldownInfo(c.id) &&
+			!isAccountRecovering(c.id) &&
 			!isAccountTemporarilyBusy(c.id) &&
 			!isAccountBusy(c.id),
 	);
@@ -368,15 +371,18 @@ async function attemptRelogin(
 	accountId: string,
 	accountEmail: string,
 ): Promise<boolean> {
+	const displayEmail = accountEmail.includes("@")
+		? accountEmail
+		: (loadAccounts().find((a) => a.id === accountId)?.email || accountEmail);
 	try {
-		await refreshHeaders(accountId);
+		await refreshHeaders(accountId, config.timeouts.headers, true);
 		console.log(
-			`✅ [Chat] Playwright headers refreshed for ${maskEmail(accountEmail)}. Retrying...`,
+			`✅ [Chat] Playwright headers refreshed for ${maskEmail(displayEmail)}. Retrying...`,
 		);
 		return true;
 	} catch (refreshErr: unknown) {
 		logger.error("[Chat] Playwright header refresh failed", {
-			accountEmail: maskEmail(accountEmail),
+			accountEmail: maskEmail(displayEmail),
 			error:
 				refreshErr instanceof Error ? refreshErr.message : String(refreshErr),
 			cause:
@@ -515,6 +521,23 @@ export async function acquireUpstreamStream(
 			);
 			const nextCandidate = getNextAvailableAccount(triedAccountIds);
 			if (nextCandidate && !getAccountCooldownInfo(nextCandidate.id)) {
+				account = nextCandidate;
+				continue;
+			}
+		}
+		
+		// Circuit Breaker: do not route requests to an account that is currently
+		// in the middle of re-authenticating or refreshing headers (recovering).
+		if (
+			isAccountRecovering(accountId) &&
+			accountId !== stickyThreadAccountId &&
+			hasFreeAlternateAccount(configuredAccounts, accountId, triedAccountIds)
+		) {
+			console.log(
+				`⏭️  [Chat] Skipping account ${accountEmail} (${accountId}) recovering; rotating to a free account`,
+			);
+			const nextCandidate = getNextAvailableAccount(triedAccountIds);
+			if (nextCandidate && !getAccountCooldownInfo(nextCandidate.id) && !isAccountRecovering(nextCandidate.id)) {
 				account = nextCandidate;
 				continue;
 			}
