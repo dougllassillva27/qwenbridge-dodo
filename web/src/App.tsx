@@ -190,7 +190,7 @@ export function App() {
               return (
                 <a
                   key={item.path}
-                  href="http://10.10.0.1:8787"
+                  href="http://100.71.22.98:8787"
                   target="_blank"
                   rel="noopener noreferrer"
                   className={cn(
