@@ -164,7 +164,7 @@ function readPackageVersion(): string {
 }
 
 function adminPassword(): string {
-  return config.adminPassword || process.env.API_KEY || config.apiKey || '';
+  return process.env.ADMIN_PASSWORD || config.adminPassword || process.env.API_KEY || config.apiKey || '';
 }
 
 function signSession(expiresAt: number): string {
@@ -176,7 +176,35 @@ function signSession(expiresAt: number): string {
   return `${payload}.${sig}`;
 }
 
+function timingSafeCompare(a: string, b: string): boolean {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function isValidAdminToken(token: string): boolean {
+  if (!token) return false;
+  const pass = adminPassword();
+  const apiKey = (process.env.API_KEY || config.apiKey || '').trim();
+  const candidates = [pass, apiKey].filter(Boolean);
+  for (const candidate of candidates) {
+    if (timingSafeCompare(token, candidate)) return true;
+  }
+  return false;
+}
+
 function verifySession(c: any): boolean {
+  // Autenticação via Header para integrações de máquina/dashboard (ex.: VPS Dashboard)
+  const auth = c.req.header('Authorization') || c.req.header('authorization');
+  if (auth?.startsWith('Bearer ')) {
+    const bearer = auth.slice(7).trim();
+    if (isValidAdminToken(bearer)) return true;
+  }
+  const xApiKey = c.req.header('x-api-key')?.trim();
+  if (xApiKey && isValidAdminToken(xApiKey)) return true;
+
+  // Autenticação via Cookie do Web Admin
   const token = getCookie(c, COOKIE_NAME);
   if (!token) return false;
   const dot = token.lastIndexOf('.');
@@ -187,9 +215,7 @@ function verifySession(c: any): boolean {
     .createHmac('sha256', `qwenproxy:${adminPassword()}`)
     .update(payload)
     .digest('base64url');
-  const a = Buffer.from(sig);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  if (!timingSafeCompare(sig, expected)) return false;
   const [expiresAt] = payload.split(':');
   return Number(expiresAt) > Date.now();
 }

@@ -112,3 +112,34 @@ test("Admin API: Authenticated session can access overview, accounts, users, and
   }
 });
 
+test("Admin API: Machine-to-machine authentication via Bearer token and x-api-key", async () => {
+  process.env.ADMIN_PASSWORD = "test-secret-bearer-password";
+  try {
+    // 1. Rejeita bearer incorreto
+    const failRes = await app.request("/admin/api/clear-cooldowns", {
+      method: "POST",
+      headers: { Authorization: "Bearer wrong-token" },
+    });
+    assert.equal(failRes.status, 401);
+
+    // 2. Aceita Bearer token válido (como enviado pelo VPS Dashboard)
+    const okBearerRes = await app.request("/admin/api/clear-cooldowns", {
+      method: "POST",
+      headers: { Authorization: "Bearer test-secret-bearer-password" },
+    });
+    assert.equal(okBearerRes.status, 200);
+    const dataBearer = await okBearerRes.json();
+    assert.equal(dataBearer.ok, true);
+
+    // 3. Aceita header x-api-key válido
+    const okKeyRes = await app.request("/admin/api/accounts", {
+      headers: { "x-api-key": "test-secret-bearer-password" },
+    });
+    assert.equal(okKeyRes.status, 200);
+    const dataKey = await okKeyRes.json();
+    assert.ok(Array.isArray(dataKey.accounts));
+  } finally {
+    delete process.env.ADMIN_PASSWORD;
+  }
+});
+

@@ -10,6 +10,8 @@ dist/
 .env.production
 
 # Persistent runtime data (DB, profiles, benchmarks, diagnostics)
+# Saiu da árvore em 19/10/2026: vive em /root/dodo/data/qwenbridge/
+# (bind do container). As regras abaixo ficam por segurança.
 data/
 data-test/
 qwen_profiles/
