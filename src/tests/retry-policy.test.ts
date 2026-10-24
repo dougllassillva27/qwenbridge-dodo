@@ -143,7 +143,7 @@ test("classifyRetryAction: upstream CreateChatInvalidResponse with Unauthorized 
   assert.equal(action.switchAccount, true);
   assert.equal(action.forceNewChat, true);
   assert.equal(action.accountCooldownReason, "AuthExpired");
-  assert.equal(action.accountCooldownMs, 0);
+  assert.equal(action.accountCooldownMs, 15_000);
   assert.equal(action.reason, "account_initialization_failed");
 });
 
@@ -153,7 +153,7 @@ test("classifyRetryAction: upstream 401 details cools account and rotates", () =
   assert.equal(action.retryable, true);
   assert.equal(action.switchAccount, true);
   assert.equal(action.accountCooldownReason, "AuthExpired");
-  assert.equal(action.accountCooldownMs, 0);
+  assert.equal(action.accountCooldownMs, 15_000);
   assert.equal(action.reason, "account_initialization_failed");
 });
 
@@ -346,10 +346,10 @@ test("classifyRetryAction: PersonalizationSyncError with 401 rotates without coo
   const action = classifyRetryAction(authErr);
   assert.equal(action.retryable, true);
   assert.equal(action.switchAccount, true);
-  assert.equal(action.forceNewChat, false);
+  assert.equal(action.forceNewChat, true);
   assert.equal(action.reason, "personalization_sync_failed");
-  assert.equal(action.accountCooldownMs, undefined);
-  assert.equal(action.accountCooldownReason, undefined);
+  assert.equal(action.accountCooldownMs, 15_000);
+  assert.equal(action.accountCooldownReason, "PersonalizationFailed");
 });
 
 test("classifyRetryAction: PersonalizationSyncError with timeout rotates without cooldown", () => {
@@ -359,10 +359,10 @@ test("classifyRetryAction: PersonalizationSyncError with timeout rotates without
   const action = classifyRetryAction(timeoutErr);
   assert.equal(action.retryable, true);
   assert.equal(action.switchAccount, true);
-  assert.equal(action.forceNewChat, false);
+  assert.equal(action.forceNewChat, true);
   assert.equal(action.reason, "personalization_sync_failed");
-  assert.equal(action.accountCooldownMs, undefined);
-  assert.equal(action.accountCooldownReason, undefined);
+  assert.equal(action.accountCooldownMs, 15_000);
+  assert.equal(action.accountCooldownReason, "PersonalizationFailed");
 });
 
 test("classifyRetryAction: bare AbortError (idle/upstream) stays retryable", () => {
@@ -401,7 +401,7 @@ test("classifyRetryAction: Token has expired sets zero cooldown (AuthExpired) to
   assert.equal(action.switchAccount, true);
   assert.equal(action.forceNewChat, true);
   assert.equal(action.accountCooldownReason, "AuthExpired");
-  assert.equal(action.accountCooldownMs, 0);
+  assert.equal(action.accountCooldownMs, 15_000);
   assert.equal(action.reason, "account_initialization_failed");
 });
 
@@ -412,7 +412,7 @@ test("classifyRetryAction: PersonalizationSyncError sets zero cooldown to preven
   assert.equal(action.switchAccount, true);
   assert.equal(action.forceNewChat, true);
   assert.equal(action.accountCooldownReason, "PersonalizationFailed");
-  assert.equal(action.accountCooldownMs, 0);
+  assert.equal(action.accountCooldownMs, 15_000);
   assert.equal(action.reason, "personalization_sync_failed");
 });
 

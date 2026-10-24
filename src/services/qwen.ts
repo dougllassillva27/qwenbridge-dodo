@@ -28,10 +28,11 @@ import {
   syncModelMetadata,
 } from "../core/model-registry.ts";
 import { type Page, type BrowserContext } from "patchright";
-import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated, isPlaywrightInitializing } from "./playwright.ts";
+import { withAccountPage, assertAntiBotHeaders, onBrowserContextCreated, isPlaywrightInitializing, isPlaywrightInitialized } from "./playwright.ts";
 import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
 import { isAccountBusy } from "../core/account-concurrency.ts";
+import { formatAsciiTimezone, sanitizeHeaderForFetch } from "../utils/timezone.ts";
 
 // Re-exported from extracted modules for backward compatibility
 export {
@@ -112,6 +113,7 @@ interface BrowserStreamMetadata {
 }
 
 interface BrowserStreamState {
+  accountId?: string;
   chunks: Uint8Array[];
   done: boolean;
   error: Error | null;
@@ -122,6 +124,36 @@ interface BrowserStreamState {
 const browserStreamStates = new Map<string, BrowserStreamState>();
 const browserStreamBindingPages = new WeakSet<object>();
 const browserStreamBindingContexts = new WeakSet<object>();
+
+/**
+ * Abort all active browser streams for an account immediately.
+ * Called when an account page is navigated by captcha recovery, closed, or reset,
+ * so in-flight streams fail fast (retryable) instead of stalling for minutes.
+ */
+export function abortActiveBrowserStreamsForAccount(
+  accountId: string,
+  reason = "Account browser stream interrupted (page context unloaded)",
+): number {
+  let count = 0;
+  for (const [requestId, state] of browserStreamStates) {
+    if (state.accountId === accountId && !state.done) {
+      count++;
+      handleBrowserStreamEvent(requestId, {
+        type: "error",
+        message: reason,
+        errorName: "AbortError",
+      });
+    }
+  }
+  if (count > 0) {
+    logger.debug("[Qwen] Aborted active browser streams for account", {
+      accountId,
+      count,
+      reason,
+    });
+  }
+  return count;
+}
 
 export async function registerBrowserContextStreamBinding(
   context: BrowserContext,
@@ -609,18 +641,21 @@ export function buildCapturedQwenHeaders(
 // the first's whole generation). FIFO handoff on release keeps the old
 // leak-recovery semantics (release is idempotent; a dropped stream still blocks
 // its slot until cancel/idle-timeout frees it — same as before).
+export const STREAM_SLOT_MAX_HOLD_MS = 30 * 60 * 1000; // 30 minutes
+
 interface AccountStreamSlots {
-  active: number;
-  queue: Array<() => void>;
+  activeSlots: Map<number, number>; // slotId -> startedAt
+  queue: Array<(releaseFn: () => void) => void>;
 }
 const accountStreamMutexes = new Map<string, AccountStreamSlots>();
+let nextStreamSlotId = 1;
 
-function getAccountStreamMutex(
+export function getAccountStreamMutex(
   accountId: string,
 ): AccountStreamSlots {
   let slots = accountStreamMutexes.get(accountId);
   if (!slots) {
-    slots = { active: 0, queue: [] };
+    slots = { activeSlots: new Map(), queue: [] };
     accountStreamMutexes.set(accountId, slots);
   }
   return slots;
@@ -630,29 +665,78 @@ function streamSlotCapacity(): number {
   return Math.max(1, config.concurrency.maxStreamsPerAccount);
 }
 
-function createStreamSlotRelease(slots: AccountStreamSlots): () => void {
+function createStreamSlotRelease(slots: AccountStreamSlots, slotId: number): () => void {
   let released = false;
   return () => {
     if (released) return;
     released = true;
-    slots.active -= 1;
+    slots.activeSlots.delete(slotId);
     const next = slots.queue.shift();
     if (next) {
       // Hand the slot directly to the waiter (FIFO), same as the old mutex.
-      slots.active += 1;
-      next();
+      const nextId = nextStreamSlotId++;
+      slots.activeSlots.set(nextId, Date.now());
+      next(createStreamSlotRelease(slots, nextId));
     }
   };
 }
 
-async function acquireAccountStreamLock(accountId: string): Promise<() => void> {
+export function sweepStaleAccountStreamSlots(maxHoldMs: number = STREAM_SLOT_MAX_HOLD_MS): number {
+  const now = Date.now();
+  let sweptCount = 0;
+  for (const [accountId, slots] of accountStreamMutexes.entries()) {
+    for (const [slotId, startedAt] of Array.from(slots.activeSlots.entries())) {
+      if (now - startedAt >= maxHoldMs) {
+        logger.warn(
+          `[Qwen] Force-releasing stale stream slot | account=${accountId} | slotId=${slotId} | heldFor=${now - startedAt}ms | maxHold=${maxHoldMs}ms`,
+        );
+        slots.activeSlots.delete(slotId);
+        sweptCount++;
+        const next = slots.queue.shift();
+        if (next) {
+          const nextId = nextStreamSlotId++;
+          slots.activeSlots.set(nextId, now);
+          next(createStreamSlotRelease(slots, nextId));
+        }
+      }
+    }
+  }
+  return sweptCount;
+}
+
+let staleSlotSweeperTimer: NodeJS.Timeout | null = null;
+
+export function ensureStaleSlotSweeperStarted(): void {
+  if (staleSlotSweeperTimer) return;
+  staleSlotSweeperTimer = setInterval(() => {
+    try {
+      sweepStaleAccountStreamSlots();
+    } catch (err) {
+      logger.error("[Qwen] Error in stale stream slot sweeper", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }, 60_000);
+  staleSlotSweeperTimer.unref();
+}
+
+export function stopStaleSlotSweeperForTests(): void {
+  if (staleSlotSweeperTimer) {
+    clearInterval(staleSlotSweeperTimer);
+    staleSlotSweeperTimer = null;
+  }
+}
+
+export async function acquireAccountStreamLock(accountId: string): Promise<() => void> {
+  ensureStaleSlotSweeperStarted();
   const slots = getAccountStreamMutex(accountId);
-  if (slots.active < streamSlotCapacity()) {
-    slots.active += 1;
-    return Promise.resolve(createStreamSlotRelease(slots));
+  if (slots.activeSlots.size < streamSlotCapacity()) {
+    const slotId = nextStreamSlotId++;
+    slots.activeSlots.set(slotId, Date.now());
+    return Promise.resolve(createStreamSlotRelease(slots, slotId));
   }
   return new Promise<() => void>((resolve) => {
-    slots.queue.push(() => resolve(createStreamSlotRelease(slots)));
+    slots.queue.push((releaseFn) => resolve(releaseFn));
   });
 }
 
@@ -816,7 +900,7 @@ async function withQwenBrowserPage<T>(
       return fn(page);
     },
     operationTimeoutMs,
-    Math.min(config.timeouts.page, 30_000),
+    Math.max(60_000, operationTimeoutMs),
     recoverOnTimeout,
   );
 }
@@ -828,7 +912,7 @@ async function withQwenBrowserPage<T>(
  * adds Cookie, User-Agent, Origin, Referer, and sec-* headers, so we only
  * pass the anti-bot tokens and metadata that the browser cannot infer.
  */
-function getBrowserFetchHeaders(
+export function getBrowserFetchHeaders(
   headers: Record<string, string>,
 ): Record<string, string> {
   const browserAllowedHeaders = new Set([
@@ -845,11 +929,13 @@ function getBrowserFetchHeaders(
     "x-accel-buffering",
   ]);
 
-  return Object.fromEntries(
-    Object.entries(headers).filter(([name]) =>
-      browserAllowedHeaders.has(name.toLowerCase()),
-    ),
-  );
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (browserAllowedHeaders.has(name.toLowerCase())) {
+      result[name] = sanitizeHeaderForFetch(String(value ?? ""));
+    }
+  }
+  return result;
 }
 
 interface BrowserTextResponse {
@@ -904,13 +990,14 @@ export async function requestQwenTextInBrowser(
 
   const evaluateRequest = (page: Page) =>
     page.evaluate(
-      async ({ url, method, headers, body, referrer, timeoutMs }: {
+      async ({ url, method, headers, body, referrer, timeoutMs, tz }: {
         url: string;
         method: "GET" | "POST" | "DELETE";
         headers: Record<string, string>;
         body?: string;
         referrer?: string;
         timeoutMs: number;
+        tz: string;
       }): Promise<BrowserTextResponse> => {
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -937,7 +1024,7 @@ export async function requestQwenTextInBrowser(
                     source: "web",
                     version: "0.3.11",
                     "x-request-origin": "https://chat.qwen.ai",
-                    timezone: new Date().toString().split(" (")[0],
+                    timezone: tz,
                     authorization: `Bearer ${rTok}`,
                   },
                   signal: AbortSignal.timeout(5000),
@@ -983,6 +1070,7 @@ export async function requestQwenTextInBrowser(
         body,
         referrer: options.referrer,
         timeoutMs: options.timeoutMs ?? Math.min(config.timeouts.page, 20_000),
+        tz: formatAsciiTimezone(),
       },
     );
   const recoverOnTimeout = !options.noMutexRecovery;
@@ -1137,6 +1225,7 @@ async function requestQwenPersonalizationInBrowser(
     {
       settingsPage: true,
       referrer: qwenUrl("/settings/personalization"),
+      noMutexRecovery: true,
     },
   );
   const { raw, json } = await readJsonTextResponse(response);
@@ -1203,6 +1292,7 @@ async function createQwenBrowserResponse(
 
   const requestId = uuidv4();
   const state: BrowserStreamState = {
+    accountId,
     chunks: [],
     done: false,
     error: null,
@@ -1223,10 +1313,14 @@ async function createQwenBrowserResponse(
   let settled = false;
   let abortListener: (() => void) | undefined;
   let cancelPromise: Promise<void> | undefined;
+  let pageCleanup: (() => void) | undefined;
   const cleanup = () => {
     if (settled) return;
     settled = true;
     if (abortListener) signal.removeEventListener("abort", abortListener);
+    try {
+      pageCleanup?.();
+    } catch {}
     browserStreamStates.delete(requestId);
   };
   const cancel = () => {
@@ -1267,6 +1361,34 @@ async function createQwenBrowserResponse(
       accountId,
       async (page) => {
         await ensureBrowserStreamBinding(page);
+        if (typeof (page as any).on === "function") {
+          const onFrameNavigated = (frame: any) => {
+            if (!settled && typeof (page as any).mainFrame === "function" && frame === (page as any).mainFrame()) {
+              handleBrowserStreamEvent(requestId, {
+                type: "error",
+                message: "Qwen browser page navigated during stream (session interrupted)",
+                errorName: "AbortError",
+              });
+            }
+          };
+          const onPageClosed = () => {
+            if (!settled) {
+              handleBrowserStreamEvent(requestId, {
+                type: "error",
+                message: "Qwen browser page closed during stream",
+                errorName: "AbortError",
+              });
+            }
+          };
+          (page as any).on("framenavigated", onFrameNavigated);
+          (page as any).on("close", onPageClosed);
+          pageCleanup = () => {
+            try {
+              (page as any).off?.("framenavigated", onFrameNavigated);
+              (page as any).off?.("close", onPageClosed);
+            } catch {}
+          };
+        }
         if (config.captcha.enabled) {
           captchaWatcher = startBaxiaCaptchaWatcher(
             page,
@@ -1539,6 +1661,12 @@ async function createQwenBrowserResponse(
   }
 }
 
+const inFlightPersonalizationSyncs = new Map<string, Promise<boolean>>();
+
+export function getInFlightPersonalizationCount(): number {
+  return inFlightPersonalizationSyncs.size;
+}
+
 export async function syncQwenRequestPersonalization(
   instruction: string,
   accountId?: string,
@@ -1551,15 +1679,67 @@ export async function syncQwenRequestPersonalization(
     forceSync?: boolean;
   } = {},
 ): Promise<boolean> {
-  if (isAuthMockEnabled()) {
-    // Test hook: force the sync to report "not applied" so the fail-fast
-    // contract (personalization-required suite) is exercisable in mock mode.
-    if (process.env.TEST_PERSONALIZATION_SYNC_FAIL === "true") return false;
-    return true;
-  }
-  // instruction pode ser vazia para limpar personalization
-
   const cacheKey = accountId || "global";
+  const sent = textSize(instruction);
+  const syncHash = sent.hash ? `${sent.hash}:${QWEN_SAFE_SETTINGS_HASH}` : null;
+  const inFlightKey = `${cacheKey}:${syncHash || "empty"}`;
+
+  const existingInFlight = inFlightPersonalizationSyncs.get(inFlightKey);
+  if (existingInFlight) {
+    logger.debug("[Qwen] Personalization sync already in flight, sharing promise", {
+      accountId: cacheKey,
+    });
+    return existingInFlight;
+  }
+
+  let syncPromise!: Promise<boolean>;
+  syncPromise = (async () => {
+    await Promise.resolve();
+    try {
+      if (isAuthMockEnabled()) {
+        const delay = parseInt(process.env.TEST_PERSONALIZATION_DELAY_MS || "0", 10);
+        if (delay > 0) {
+          await sleep(delay);
+        }
+        // Test hook: force the sync to report "not applied" so the fail-fast
+        // contract (personalization-required suite) is exercisable in mock mode.
+        if (process.env.TEST_PERSONALIZATION_SYNC_FAIL === "true") return false;
+        return true;
+      }
+      return await syncQwenRequestPersonalizationInternal(
+        instruction,
+        accountId,
+        metadata,
+        cacheKey,
+        sent,
+        syncHash,
+      );
+    } finally {
+      if (inFlightPersonalizationSyncs.get(inFlightKey) === syncPromise) {
+        inFlightPersonalizationSyncs.delete(inFlightKey);
+      }
+    }
+  })();
+
+  inFlightPersonalizationSyncs.set(inFlightKey, syncPromise);
+  return syncPromise;
+}
+
+async function syncQwenRequestPersonalizationInternal(
+  instruction: string,
+  accountId: string | undefined,
+  metadata: {
+    model?: string;
+    toolsCount?: number;
+    sessionId?: string | null;
+    promptChars?: number;
+    forceSync?: boolean;
+  },
+  cacheKey: string,
+  sent: ReturnType<typeof textSize>,
+  syncHash: string | null,
+): Promise<boolean> {
+  // instruction pode ser vazia para limpar personalization
 
   // Proactive token renewal: refresh BEFORE attempting personalization
   // to avoid 401 errors that waste time on retry
@@ -1583,8 +1763,6 @@ export async function syncQwenRequestPersonalization(
   let currentSettings: any = null;
   let payload = buildQwenSettingsUpdatePayload(currentSettings, instruction);
 
-  const sent = textSize(instruction);
-  const syncHash = sent.hash ? `${sent.hash}:${QWEN_SAFE_SETTINGS_HASH}` : null;
   const bypassCache = metadata.forceSync === true;
 
   // 1. Check memory cache (skipped on forceSync)
@@ -1749,8 +1927,13 @@ export async function syncQwenRequestPersonalization(
     typeof textSize
   >;
 
+  const matchReturned =
+    (isEmptyInstruction && (!returnedInstruction || returned.chars === 0)) ||
+    (returned.hash !== null && returned.hash === sent.hash);
+
   let verifyData: any = null;
-  if (config.qwen.personalizationVerifyGet) {
+  // If the update response already confirmed the exact instruction, skip the redundant GET round-trip
+  if (config.qwen.personalizationVerifyGet && !matchReturned) {
     const { json: verifyJson } =
       await requestQwenPersonalizationInBrowser(
         accountId,
@@ -1761,10 +1944,6 @@ export async function syncQwenRequestPersonalization(
     verifyData = verifyJson?.data?.personalization;
     stored = textSize(verifyData?.instruction);
   }
-
-  const matchReturned =
-    (isEmptyInstruction && (!returnedInstruction || returned.chars === 0)) ||
-    (returned.hash !== null && returned.hash === sent.hash);
   const matchStored =
     stored.hash === null
       ? null
@@ -1847,7 +2026,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
           async (page) => {
             const requestId = crypto.randomUUID();
             const response = await page.evaluate(
-              async ({ payload, timeoutMs, requestId }: { payload: any; timeoutMs: number; requestId: string }) => {
+              async ({ payload, timeoutMs, requestId, tz }: { payload: any; timeoutMs: number; requestId: string; tz: string }) => {
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
                 try {
@@ -1859,7 +2038,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
                         accept: "application/json, text/plain, */*",
                         "content-type": "application/json",
                         "x-request-id": requestId,
-                        timezone: new Date().toString().split(" (")[0],
+                        timezone: tz,
                         source: "web",
                       },
                       body: JSON.stringify(payload),
@@ -1871,7 +2050,7 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
                   clearTimeout(timeoutId);
                 }
               },
-              { payload, timeoutMs: config.timeouts.http, requestId },
+              { payload, timeoutMs: config.timeouts.http, requestId, tz: formatAsciiTimezone() },
             );
             return response;
           },
@@ -2157,7 +2336,7 @@ export async function deleteSingleQwenChat(
   const requestHeaders: Record<string, string> = {
     source: "web",
     version: "0.2.89",
-    timezone: new Date().toString().split(" (")[0],
+    timezone: formatAsciiTimezone(),
     "x-request-id": crypto.randomUUID(),
     Referer: qwenUrl(`/c/${encodeURIComponent(chatId)}`),
   };
@@ -2210,7 +2389,7 @@ export async function fetchRemoteQwenChats(
 
   const requestHeaders: Record<string, string> = {
     version: "0.2.89",
-    timezone: new Date().toString().split(" (")[0],
+    timezone: formatAsciiTimezone(),
     "x-request-id": crypto.randomUUID(),
     Referer: qwenUrl("/settings/chats"),
   };
@@ -2249,6 +2428,20 @@ export async function fetchQwenModels(
     return cached.models;
   }
 
+  // For accounts that are not initialized yet, avoid cold-booting Playwright just for model metadata.
+  // Reuse existing models from any active cache entry (models catalog is identical across accounts).
+  if (accountId && !isAuthMockEnabled() && !isPlaywrightInitialized(accountId)) {
+    for (const [, entry] of modelsCache.entries()) {
+      if (entry && now - entry.fetchedAt < MODEL_CACHE_TTL_MS * 4) {
+        syncModelMetadata(
+          entry.models as unknown as Array<Record<string, unknown> & { id: string }>,
+          accountId,
+        );
+        return entry.models;
+      }
+    }
+  }
+
   // Use an isolated page only when the main page is actively serving a stream.
   // Startup/idle operations should not open a visible extra tab.
   if (accountId && !isAuthMockEnabled() && isAccountBusy(accountId)) {
@@ -2258,7 +2451,7 @@ export async function fetchQwenModels(
         async (page) => {
           const requestId = crypto.randomUUID();
           const response = await page.evaluate(
-            async ({ timeoutMs, requestId }: { timeoutMs: number; requestId: string }) => {
+            async ({ timeoutMs, requestId, tz }: { timeoutMs: number; requestId: string; tz: string }) => {
               const controller = new AbortController();
               const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
               try {
@@ -2267,7 +2460,7 @@ export async function fetchQwenModels(
                   headers: {
                     accept: "application/json, text/plain, */*",
                     "x-request-id": requestId,
-                    timezone: new Date().toString().split(" (")[0],
+                    timezone: tz,
                     source: "web",
                   },
                   signal: controller.signal,
@@ -2277,7 +2470,7 @@ export async function fetchQwenModels(
                 clearTimeout(timeoutId);
               }
             },
-            { timeoutMs: config.timeouts.http, requestId },
+            { timeoutMs: config.timeouts.http, requestId, tz: formatAsciiTimezone() },
           );
           return response;
         },
@@ -2323,7 +2516,7 @@ export async function fetchQwenModels(
       bxUa,
       bxUmidtoken,
       extra: {
-        timezone: new Date().toString(),
+        timezone: formatAsciiTimezone(),
       },
     }),
     undefined,
@@ -2476,15 +2669,23 @@ function parseQwenJsonError(
 
   if (errorJson?.success === false) {
     const code = errorJson.data?.code || errorJson.code || "UpstreamError";
+    const detailsStr = typeof details === "string" ? details : "";
+    const codeStr = String(code).toLowerCase();
+    const detailsLower = detailsStr.toLowerCase();
 
-    if (
+    const isAuthExpired =
       status === 401 ||
-      code === "Unauthorized" ||
-      (typeof details === "string" &&
-        (details.includes("login") || details.includes("session")))
-    ) {
+      codeStr.includes("unauthorized") ||
+      detailsLower.includes("token has expired") ||
+      detailsLower.includes("log in") ||
+      detailsLower.includes("login") ||
+      detailsLower.includes("session") ||
+      detailsLower.includes("não autorizado") ||
+      detailsLower.includes("unauthorized");
+
+    if (isAuthExpired) {
       return new QwenSessionExpiredError(
-        `Session expired: ${details}`,
+        `Session expired: ${detailsStr || codeStr}`,
         accountId || "global",
       );
     }
@@ -2846,13 +3047,9 @@ async function createQwenStreamInternal(
     }
 
     // Dynamic idle timeout based on model type and payload size
-    // Reasoning models (thinking enabled): use REASONING_MODEL_TIMEOUT as base
-    // Non-reasoning models: use IDLE_STREAM_TIMEOUT as base
-    // Both add 30s per MB of payload. Parallel-escape streams get a tight cap
-    // ONLY when non-thinking (see computeDynamicIdleTimeout).
-    const baseTimeoutMs = enableThinking
-      ? config.timeouts.reasoningModelTimeout
-      : config.timeouts.idleStreamTimeout;
+    // Base timeout for gaps between chunks is governed by IDLE_STREAM_TIMEOUT (default 60s)
+    // plus dynamic payload scaling (30s per MB).
+    const baseTimeoutMs = config.timeouts.idleStreamTimeout;
     const dynamicIdleTimeoutMs = computeDynamicIdleTimeout({
       enableThinking,
       parallelEscape: options?.parallelEscape,
@@ -2869,15 +3066,15 @@ async function createQwenStreamInternal(
       dynamicTimeout: dynamicIdleTimeoutMs,
     });
 
-    // Thinking models idle at 600s — fine for gaps AFTER data flows, but a
-    // stream that produced NOTHING in the first-chunk window is dead. Fail
-    // fast (retryable) so the account slot is not held for 10 minutes.
+    // Thinking models legitimately pause before first chunk (up to reasoningModelTimeout).
+    // After the first chunk, the normal dynamicIdleTimeoutMs (60s+) governs chunk gaps.
     const firstChunkDeadlineMs = enableThinking
       ? Math.max(
+          config.timeouts.reasoningModelTimeout,
           config.timeouts.firstChunkTimeout,
           config.timeouts.timeToFirstByte,
         )
-      : undefined;
+      : Math.max(config.timeouts.firstChunkTimeout, config.timeouts.timeToFirstByte);
 
     return addIdleTimeoutToStream(
       stream,
@@ -3297,8 +3494,29 @@ async function createQwenStreamInternal(
           );
         }
 
+        const parsedJsonErr = parseQwenJsonError(errText, response.status, accountId);
+        if (
+          parsedJsonErr instanceof QwenSessionExpiredError &&
+          accountId &&
+          !retriedNonSseResponse
+        ) {
+          retriedNonSseResponse = true;
+          logger.warn(
+            "[Qwen] Token expired on completion fetch (200 JSON); refreshing session and retrying",
+            { accountId, chatId: chatSessionId ?? "new" },
+          );
+          const { refreshAccountToken } = await import("./playwright.ts");
+          const refreshed = await refreshAccountToken(accountId);
+          if (refreshed.success) {
+            const fresh = await getQwenHeaders(false, accountId);
+            activeHeaders = fresh.headers;
+            response = await fetchCompletion(activeHeaders);
+            continue;
+          }
+        }
+
         throw withCreatedChatMetadata(
-          parseQwenJsonError(errText, response.status, accountId) ??
+          parsedJsonErr ??
             new QwenUpstreamError(
               `Qwen returned non-stream JSON response: ${errText.substring(0, 300)}`,
               "NonStreamJsonResponse",
@@ -3374,6 +3592,35 @@ async function createQwenStreamInternal(
             response.status,
             accountId,
           );
+          if (
+            parsedError instanceof QwenSessionExpiredError &&
+            accountId &&
+            !retriedNonSseResponse
+          ) {
+            retriedNonSseResponse = true;
+            logger.warn(
+              "[Qwen] Token expired on completion fetch (!response.ok); refreshing session and retrying",
+              { accountId, chatId: chatSessionId ?? "new", status: response.status },
+            );
+            const { refreshAccountToken } = await import("./playwright.ts");
+            const refreshed = await refreshAccountToken(accountId);
+            if (refreshed.success) {
+              const fresh = await getQwenHeaders(false, accountId);
+              activeHeaders = fresh.headers;
+              response = await fetchCompletion(activeHeaders);
+              if (response.ok && response.body) {
+                return {
+                  stream: wrapUpstreamStream(response.body, controller),
+                  headers: activeHeaders,
+                  uiSessionId: chatSessionId || "",
+                  controller,
+                  accountId: accountId ?? "global",
+                  createdNewChat,
+                  tokenEstimationContext,
+                };
+              }
+            }
+          }
           if (parsedError) {
             throw withCreatedChatMetadata(parsedError);
           }

@@ -12,38 +12,40 @@ import {
   clearAllAccountCooldowns,
 } from "../core/account-manager.ts";
 
-test("PROVA MECANICA: Token expirado nunca mais coloca a conta em cooldown", () => {
+test("PROVA MECANICA: Token expirado aplica cooldown curto de 15s (Dodo Shield anti-loop 502)", () => {
   clearAllAccountCooldowns();
 
   // 1. Simula exatamente o erro do log: Token has expired
   const tokenExpiredErr = new Error("Qwen upstream error: unauthorized: Token has expired, please log in again..");
   const policy = classifyRetryAction(tokenExpiredErr);
 
-  // A policy DEVE ter cooldownMs: 0
-  assert.equal(policy.accountCooldownMs, 0, "cooldownMs DEVE ser 0 para token expirado");
+  // A policy DEVE ter cooldownMs: 15_000 para evitar loop infinito de erro 502 no cliente
+  assert.equal(policy.accountCooldownMs, 15_000, "cooldownMs DEVE ser 15000 para token expirado");
   assert.equal(policy.accountCooldownReason, "AuthExpired");
 
-  // Mesmo que tente aplicar no account manager
+  // Ao aplicar no account manager
   markAccountRateLimited("conta-teste-1", policy.accountCooldownMs, policy.accountCooldownReason);
   const info = getAccountCooldownInfo("conta-teste-1");
 
-  // A conta NÃO PODE estar em cooldown
-  assert.equal(info, null, "A conta NÃO pode estar em cooldown após token expirado!");
+  // A conta está temporariamente resguardada por 15s
+  assert.ok(info !== null, "A conta deve ter cooldown temporário de 15s");
+  assert.equal(info?.reason, "AuthExpired");
 });
 
-test("PROVA MECANICA: Falha de personalizacao nunca mais coloca a conta em cooldown", () => {
+test("PROVA MECANICA: Falha de personalizacao aplica cooldown curto de 15s (Dodo Shield anti-loop 502)", () => {
   clearAllAccountCooldowns();
 
   const persErr = new PersonalizationSyncError("Personalization sync failed: timeout after 45s");
   const policy = classifyRetryAction(persErr);
 
-  assert.equal(policy.accountCooldownMs, 0, "cooldownMs DEVE ser 0 para falha de personalizacao");
+  assert.equal(policy.accountCooldownMs, 15_000, "cooldownMs DEVE ser 15000 para falha de personalizacao");
   assert.equal(policy.accountCooldownReason, "PersonalizationFailed");
 
   markAccountRateLimited("conta-teste-2", policy.accountCooldownMs, policy.accountCooldownReason);
   const info = getAccountCooldownInfo("conta-teste-2");
 
-  assert.equal(info, null, "A conta NÃO pode estar em cooldown após falha de personalizacao!");
+  assert.ok(info !== null, "A conta deve ter cooldown temporário de 15s");
+  assert.equal(info?.reason, "PersonalizationFailed");
 });
 
 test("PROVA MECANICA: Limite real da Alibaba (update_member) CONTINUA sendo respeitado", () => {

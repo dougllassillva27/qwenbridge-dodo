@@ -19,6 +19,7 @@ import {
 } from "../../core/accounts.ts";
 import { ServerManager } from "../server-manager.ts";
 import { config } from "../../core/config.ts";
+import { renderProgressBar } from "./status-view.ts";
 export function formatCooldownReason(reason?: string | null, maxLen = 28): string {
   if (!reason) return theme.yellow("Cooldown ativo");
   if (
@@ -58,11 +59,17 @@ export class AccountsView implements TuiView {
   private isAddModalOpen = false;
   private isBatchModalOpen = false;
   private isValidatingAccount = false;
+  private isOtpRequesting = false;
+  private isOtpCodeSent = false;
+  private addLoginMode: "password" | "otp" = "password";
+  private otpSessionId: string | null = null;
   private addEmailInput = "";
   private addPasswordInput = "";
+  private addOtpCodeInput = "";
   private addEmailCursor = 0;
   private addPasswordCursor = 0;
-  private addActiveField: "email" | "password" = "email";
+  private addOtpCodeCursor = 0;
+  private addActiveField: "email" | "password" | "code" = "email";
   private batchInput = "";
   private batchCursor = 0;
   private batchHoveredButton: "import" | "cancel" | null = null;
@@ -71,7 +78,7 @@ export class AccountsView implements TuiView {
   private lastBatchModalStartRow = 4;
   private hoveredActionRow: number | null = null;
   private hoveredAccountIndex: number | null = null;
-  private modalHoveredField: "email" | "password" | "save" | "cancel" | null = null;
+  private modalHoveredField: "email" | "password" | "code" | "save" | "cancel" | "mode" | null = null;
   private lastModalLeftPad = 0;
   private lastLeftW = 46;
   private accountsScrollOffset = 0;
@@ -148,11 +155,116 @@ export class AccountsView implements TuiView {
     }, 4000);
   }
 
+  private resetAddModalState(): void {
+    if (this.otpSessionId && !process.env.NODE_TEST_CONTEXT) {
+      const sid = this.otpSessionId;
+      import("../../services/playwright.ts")
+        .then(({ cancelEmailOtpLogin }) => cancelEmailOtpLogin(sid))
+        .catch(() => {});
+    }
+    this.isAddModalOpen = false;
+    this.isValidatingAccount = false;
+    this.isOtpRequesting = false;
+    this.isOtpCodeSent = false;
+    this.otpSessionId = null;
+    this.addEmailInput = "";
+    this.addPasswordInput = "";
+    this.addOtpCodeInput = "";
+    this.addEmailCursor = 0;
+    this.addPasswordCursor = 0;
+    this.addOtpCodeCursor = 0;
+    this.addActiveField = "email";
+    this.addLoginMode = "password";
+  }
+
   private async saveModalAccount(): Promise<void> {
-    if (this.isValidatingAccount) return;
+    if (this.isValidatingAccount || this.isOtpRequesting) return;
     const email = this.addEmailInput.trim();
+    if (!email) {
+      this.setStatusMessage(theme.yellow("[!] E-mail é obrigatório"));
+      return;
+    }
+
+    if (this.addLoginMode === "otp") {
+      if (!this.isOtpCodeSent) {
+        if (process.env.NODE_TEST_CONTEXT) {
+          this.isOtpCodeSent = true;
+          this.addActiveField = "code";
+          this.otpSessionId = "mock-otp-" + Date.now();
+          this.setStatusMessage(theme.green("✓ Código enviado para o e-mail!"));
+          return;
+        }
+
+        this.isOtpRequesting = true;
+        this.setStatusMessage(theme.yellow(`[...] Enviando código OTP para ${email}...`));
+
+        try {
+          const { startEmailOtpLogin } = await import("../../services/playwright.ts");
+          const res = await startEmailOtpLogin(email, { headless: config.playwright.headless });
+          this.isOtpRequesting = false;
+          if (!res.success || !res.sessionId) {
+            this.setStatusMessage(theme.red(`✗ Falha ao enviar código: ${res.error || "Erro desconhecido"}`));
+            return;
+          }
+          this.otpSessionId = res.sessionId;
+          this.isOtpCodeSent = true;
+          this.addActiveField = "code";
+          this.setStatusMessage(theme.green("✓ Código enviado! Digite os 6 dígitos abaixo."));
+        } catch (err: any) {
+          this.isOtpRequesting = false;
+          this.setStatusMessage(theme.red(`✗ Erro: ${err?.message || String(err)}`));
+        }
+        return;
+      }
+
+      const code = this.addOtpCodeInput.trim();
+      if (!code) {
+        this.setStatusMessage(theme.yellow("[!] Digite o código de 6 dígitos recebido por e-mail"));
+        return;
+      }
+
+      if (process.env.NODE_TEST_CONTEXT) {
+        try {
+          const newAcc = addAccount(email, "");
+          this.resetAddModalState();
+          await this.refresh();
+          this.setStatusMessage(theme.green(`✓ Conta ${email} salva via código OTP!`));
+        } catch (err: any) {
+          this.setStatusMessage(theme.red(`✗ Erro ao salvar: ${err?.message || String(err)}`));
+        }
+        return;
+      }
+
+      this.isValidatingAccount = true;
+      this.setStatusMessage(theme.yellow("[...] Validando código e capturando sessão de 30 dias..."));
+      try {
+        const { verifyEmailOtpLogin } = await import("../../services/playwright.ts");
+        const res = await verifyEmailOtpLogin(this.otpSessionId!, code);
+        this.isValidatingAccount = false;
+        if (!res.success || !res.account) {
+          this.setStatusMessage(theme.red(`✗ Código inválido: ${res.error || "Verificação falhou"}`));
+          return;
+        }
+        this.resetAddModalState();
+        await this.refresh();
+        this.setStatusMessage(theme.green(`✓ Conta ${res.account.email} autenticada via código OTP!`));
+
+        if (process.stdout.isTTY) {
+          const sManager = ServerManager.getInstance();
+          const sState = sManager.getState();
+          if (sState !== "online" && sState !== "warming") {
+            void sManager.ensureStarted().then(() => this.refresh());
+          }
+        }
+      } catch (err: any) {
+        this.isValidatingAccount = false;
+        this.setStatusMessage(theme.red(`✗ Erro de verificação: ${err?.message || String(err)}`));
+      }
+      return;
+    }
+
     const password = this.addPasswordInput.trim();
-    if (!email || !password) {
+    if (!password) {
       this.setStatusMessage(theme.yellow("[!] E-mail e senha são obrigatórios"));
       return;
     }
@@ -160,11 +272,7 @@ export class AccountsView implements TuiView {
     if (process.env.NODE_TEST_CONTEXT) {
       try {
         const newAcc = addAccount(email, password);
-        this.isAddModalOpen = false;
-        this.addEmailInput = "";
-        this.addPasswordInput = "";
-        this.addEmailCursor = 0;
-        this.addPasswordCursor = 0;
+        this.resetAddModalState();
         await this.refresh();
         this.setStatusMessage(theme.green(`✓ Conta ${email} salva! Conectando...`));
       } catch (err: any) {
@@ -196,11 +304,7 @@ export class AccountsView implements TuiView {
       }
 
       const newAcc = addAccount(email, password, tempId);
-      this.isAddModalOpen = false;
-      this.addEmailInput = "";
-      this.addPasswordInput = "";
-      this.addEmailCursor = 0;
-      this.addPasswordCursor = 0;
+      this.resetAddModalState();
       await this.refresh();
       this.setStatusMessage(theme.green(`✓ Conta ${email} validada e salva! Conectando...`));
 
@@ -491,12 +595,26 @@ export class AccountsView implements TuiView {
 
     // 1. Add Account Modal Active
     if (this.isAddModalOpen) {
-      if (this.isValidatingAccount) return true;
+      if (this.isValidatingAccount || this.isOtpRequesting) return true;
       if (key.name === "escape") {
-        this.isAddModalOpen = false;
-        this.addEmailInput = "";
-        this.addPasswordInput = "";
+        this.resetAddModalState();
         return true;
+      }
+
+      // Switch mode with Tab (when code has not been sent yet)
+      if (key.name === "tab") {
+        if (!this.isOtpCodeSent) {
+          this.addLoginMode = this.addLoginMode === "password" ? "otp" : "password";
+          this.addActiveField = "email";
+          this.setStatusMessage(
+            theme.cyan(
+              `Modo alterado para: ${
+                this.addLoginMode === "password" ? "Senha" : "Código E-mail (Sem Senha)"
+              }`,
+            ),
+          );
+          return true;
+        }
       }
 
       // Mouse hover in Add Account modal
@@ -504,18 +622,19 @@ export class AccountsView implements TuiView {
         const { row, col } = key.mouse;
         const leftPad = this.lastModalLeftPad || 0;
         const relCol = col - leftPad;
-        if (row === 5 || row === 6) {
+        if (row === 6) {
           if (this.modalHoveredField !== "email") {
             this.modalHoveredField = "email";
             return true;
           }
-        } else if (row === 7 || row === 8) {
-          if (this.modalHoveredField !== "password") {
-            this.modalHoveredField = "password";
+        } else if (row === 7) {
+          const field = this.addLoginMode === "password" ? "password" : "code";
+          if (this.modalHoveredField !== field) {
+            this.modalHoveredField = field;
             return true;
           }
         } else if (row === 9) {
-          const btn = relCol <= 24 ? "save" : "cancel";
+          const btn = relCol <= 28 ? "save" : relCol <= 49 ? "cancel" : "mode";
           if (this.modalHoveredField !== btn) {
             this.modalHoveredField = btn;
             return true;
@@ -531,34 +650,52 @@ export class AccountsView implements TuiView {
         const { row, col } = key.mouse;
         const leftPad = this.lastModalLeftPad || 0;
         const relCol = col - leftPad;
-        // Click on email field row (rows 5 and 6)
-        if (row === 5 || row === 6) {
+        // Click on email field row (row 6)
+        if (row === 6) {
           this.addActiveField = "email";
           return true;
         }
-        // Click on password field row (rows 7 and 8)
-        if (row === 7 || row === 8) {
-          this.addActiveField = "password";
+        // Click on second field row (row 7)
+        if (row === 7) {
+          if (this.addLoginMode === "password") {
+            this.addActiveField = "password";
+          } else if (this.isOtpCodeSent) {
+            this.addActiveField = "code";
+          }
           return true;
         }
         // Click on buttons row (row 9)
         if (row === 9) {
-          if (relCol <= 24) {
+          if (relCol <= 28) {
             await this.saveModalAccount();
             return true;
-          } else {
-            this.isAddModalOpen = false;
-            this.addEmailInput = "";
-            this.addPasswordInput = "";
-            this.addEmailCursor = 0;
-            this.addPasswordCursor = 0;
+          } else if (relCol <= 49) {
+            this.resetAddModalState();
             return true;
+          } else {
+            // Clicked mode toggle button
+            if (!this.isOtpCodeSent) {
+              this.addLoginMode = this.addLoginMode === "password" ? "otp" : "password";
+              this.addActiveField = "email";
+              this.setStatusMessage(
+                theme.cyan(
+                  `Modo alterado para: ${
+                    this.addLoginMode === "password" ? "Senha" : "Código E-mail (Sem Senha)"
+                  }`,
+                ),
+              );
+              return true;
+            }
           }
         }
       }
       // Switch field with Up / Down arrow keys
       if (key.name === "up" || key.name === "down") {
-        this.addActiveField = this.addActiveField === "email" ? "password" : "email";
+        if (this.addLoginMode === "password") {
+          this.addActiveField = this.addActiveField === "email" ? "password" : "email";
+        } else if (this.isOtpCodeSent) {
+          this.addActiveField = this.addActiveField === "email" ? "code" : "email";
+        }
         return true;
       }
 
@@ -566,27 +703,33 @@ export class AccountsView implements TuiView {
       if (key.name === "left") {
         if (this.addActiveField === "email") {
           this.addEmailCursor = Math.max(0, this.addEmailCursor - 1);
-        } else {
+        } else if (this.addActiveField === "password") {
           this.addPasswordCursor = Math.max(0, this.addPasswordCursor - 1);
+        } else {
+          this.addOtpCodeCursor = Math.max(0, this.addOtpCodeCursor - 1);
         }
         return true;
       }
       if (key.name === "right") {
         if (this.addActiveField === "email") {
           this.addEmailCursor = Math.min(this.addEmailInput.length, this.addEmailCursor + 1);
-        } else {
+        } else if (this.addActiveField === "password") {
           this.addPasswordCursor = Math.min(this.addPasswordInput.length, this.addPasswordCursor + 1);
+        } else {
+          this.addOtpCodeCursor = Math.min(this.addOtpCodeInput.length, this.addOtpCodeCursor + 1);
         }
         return true;
       }
       if (key.name === "home") {
         if (this.addActiveField === "email") this.addEmailCursor = 0;
-        else this.addPasswordCursor = 0;
+        else if (this.addActiveField === "password") this.addPasswordCursor = 0;
+        else this.addOtpCodeCursor = 0;
         return true;
       }
       if (key.name === "end") {
         if (this.addActiveField === "email") this.addEmailCursor = this.addEmailInput.length;
-        else this.addPasswordCursor = this.addPasswordInput.length;
+        else if (this.addActiveField === "password") this.addPasswordCursor = this.addPasswordInput.length;
+        else this.addOtpCodeCursor = this.addOtpCodeInput.length;
         return true;
       }
 
@@ -600,12 +743,18 @@ export class AccountsView implements TuiView {
               pasted +
               this.addEmailInput.slice(this.addEmailCursor);
             this.addEmailCursor += pasted.length;
-          } else {
+          } else if (this.addActiveField === "password") {
             this.addPasswordInput =
               this.addPasswordInput.slice(0, this.addPasswordCursor) +
               pasted +
               this.addPasswordInput.slice(this.addPasswordCursor);
             this.addPasswordCursor += pasted.length;
+          } else {
+            this.addOtpCodeInput =
+              this.addOtpCodeInput.slice(0, this.addOtpCodeCursor) +
+              pasted +
+              this.addOtpCodeInput.slice(this.addOtpCodeCursor);
+            this.addOtpCodeCursor += pasted.length;
           }
           return true;
         }
@@ -615,9 +764,12 @@ export class AccountsView implements TuiView {
         if (this.addActiveField === "email") {
           this.addEmailInput = "";
           this.addEmailCursor = 0;
-        } else {
+        } else if (this.addActiveField === "password") {
           this.addPasswordInput = "";
           this.addPasswordCursor = 0;
+        } else {
+          this.addOtpCodeInput = "";
+          this.addOtpCodeCursor = 0;
         }
         return true;
       }
@@ -631,12 +783,19 @@ export class AccountsView implements TuiView {
               this.addEmailInput.slice(this.addEmailCursor);
             this.addEmailCursor--;
           }
-        } else {
+        } else if (this.addActiveField === "password") {
           if (this.addPasswordCursor > 0) {
             this.addPasswordInput =
               this.addPasswordInput.slice(0, this.addPasswordCursor - 1) +
               this.addPasswordInput.slice(this.addPasswordCursor);
             this.addPasswordCursor--;
+          }
+        } else {
+          if (this.addOtpCodeCursor > 0) {
+            this.addOtpCodeInput =
+              this.addOtpCodeInput.slice(0, this.addOtpCodeCursor - 1) +
+              this.addOtpCodeInput.slice(this.addOtpCodeCursor);
+            this.addOtpCodeCursor--;
           }
         }
         return true;
@@ -650,11 +809,17 @@ export class AccountsView implements TuiView {
               this.addEmailInput.slice(0, this.addEmailCursor) +
               this.addEmailInput.slice(this.addEmailCursor + 1);
           }
-        } else {
+        } else if (this.addActiveField === "password") {
           if (this.addPasswordCursor < this.addPasswordInput.length) {
             this.addPasswordInput =
               this.addPasswordInput.slice(0, this.addPasswordCursor) +
               this.addPasswordInput.slice(this.addPasswordCursor + 1);
+          }
+        } else {
+          if (this.addOtpCodeCursor < this.addOtpCodeInput.length) {
+            this.addOtpCodeInput =
+              this.addOtpCodeInput.slice(0, this.addOtpCodeCursor) +
+              this.addOtpCodeInput.slice(this.addOtpCodeCursor + 1);
           }
         }
         return true;
@@ -665,7 +830,6 @@ export class AccountsView implements TuiView {
         await this.saveModalAccount();
         return true;
       }
-      // Type character into active field
       // Type character into active field at cursor position
       if (key.char && !key.ctrl && !key.meta && key.name !== "tab") {
         if (key.char >= " ") {
@@ -675,12 +839,20 @@ export class AccountsView implements TuiView {
               key.char +
               this.addEmailInput.slice(this.addEmailCursor);
             this.addEmailCursor += key.char.length;
-          } else {
+          } else if (this.addActiveField === "password") {
             this.addPasswordInput =
               this.addPasswordInput.slice(0, this.addPasswordCursor) +
               key.char +
               this.addPasswordInput.slice(this.addPasswordCursor);
             this.addPasswordCursor += key.char.length;
+          } else if (this.addActiveField === "code") {
+            if (this.addOtpCodeInput.length < 10) {
+              this.addOtpCodeInput =
+                this.addOtpCodeInput.slice(0, this.addOtpCodeCursor) +
+                key.char +
+                this.addOtpCodeInput.slice(this.addOtpCodeCursor);
+              this.addOtpCodeCursor += key.char.length;
+            }
           }
           return true;
         }
@@ -807,15 +979,15 @@ export class AccountsView implements TuiView {
         return true;
       }
 
-      // Right panel action buttons hover (rows 15 to 20)
+      // Right panel action buttons hover (rows 16 to 21)
       if (col >= leftW) {
-        if (row === 15) {
-          const actionRow = col < leftW + 18 ? 15 : 21;
+        if (row === 16) {
+          const actionRow = col < leftW + 18 ? 16 : 22;
           if (this.hoveredActionRow !== actionRow) {
             this.hoveredActionRow = actionRow;
             return true;
           }
-        } else if (row >= 16 && row <= 20) {
+        } else if (row >= 17 && row <= 21) {
           if (this.hoveredActionRow !== row) {
             this.hoveredActionRow = row;
             return true;
@@ -843,9 +1015,9 @@ export class AccountsView implements TuiView {
           return true;
         }
       }
-      // Right panel action buttons click (rows 15, 16, 17, 18, 19, 20)
+      // Right panel action buttons click (rows 16 to 21)
       if (col >= leftW) {
-        if (row === 15) {
+        if (row === 16) {
           if (col < leftW + 18) {
             await this.handleKey({ name: "a", ctrl: false, shift: false, meta: false });
           } else {
@@ -853,23 +1025,23 @@ export class AccountsView implements TuiView {
           }
           return true;
         }
-        if (row === 16) {
+        if (row === 17) {
           await this.handleKey({ name: "d", ctrl: false, shift: false, meta: false });
           return true;
         }
-        if (row === 17) {
+        if (row === 18) {
           await this.handleKey({ name: "c", ctrl: false, shift: false, meta: false });
           return true;
         }
-        if (row === 18) {
+        if (row === 19) {
           await this.handleKey({ name: "z", ctrl: false, shift: false, meta: false });
           return true;
         }
-        if (row === 19) {
+        if (row === 20) {
           await this.handleKey({ name: "x", ctrl: false, shift: false, meta: false });
           return true;
         }
-        if (row === 20) {
+        if (row === 21) {
           await this.handleKey({ name: "l", ctrl: false, shift: false, meta: false });
           return true;
         }
@@ -938,9 +1110,11 @@ export class AccountsView implements TuiView {
     }
 
     // Left Panel: Accounts List Table
+    const showUsageCol = leftW >= 48;
+    const headerUsage = showUsageCol ? "Uso%  " : "";
     const leftContent: string[] = [
       "",
-      `  ${theme.dim("#   Conta                 Status")}`,
+      `  ${theme.dim(`#   Conta                 ${headerUsage}Status`)}`,
       `  ${theme.dim("───────────────────────────────────────")}`,
     ];
 
@@ -997,7 +1171,14 @@ export class AccountsView implements TuiView {
             : theme.muted(`○ Standby     `);
         }
 
-        const line = `${pointer}${num}${name}${status}`;
+        const usagePct = acc.dailyUsagePercent ?? 0;
+        const usagePctStr = showUsageCol
+          ? (usagePct > 0
+              ? (usagePct >= 80 ? theme.red(pad(`${usagePct}%`, 5)) : usagePct >= 40 ? theme.yellow(pad(`${usagePct}%`, 5)) : theme.cyan(pad(`${usagePct}%`, 5)))
+              : theme.dim(pad("0%", 5))) + " "
+          : "";
+
+        const line = `${pointer}${num}${name}${usagePctStr}${status}`;
         if (isHovered) {
           leftContent.push(theme.bgHover(line));
         } else if (isFocused) {
@@ -1036,15 +1217,23 @@ export class AccountsView implements TuiView {
       rightContent.push("");
       rightContent.push("");
       rightContent.push("");
+      rightContent.push("");
       rightContent.push(`  ${theme.dim("─────────────────────────────────")}`);
-      const btnA = this.hoveredActionRow === 15 ? theme.bgHover(` ${theme.cyan("[ A ] Adicionar")} `) : `${theme.cyan("[ A ]")} Adicionar`;
-      const btnB = this.hoveredActionRow === 21 ? theme.bgHover(` ${theme.cyan("[ B ] Em Lote")} `) : `${theme.cyan("[ B ]")} Em Lote`;
+      const btnA = this.hoveredActionRow === 16 ? theme.bgHover(` ${theme.cyan("[ A ] Adicionar")} `) : ` ${theme.cyan("[ A ]")} Adicionar `;
+      const btnB = this.hoveredActionRow === 22 ? theme.bgHover(` ${theme.cyan("[ B ] Em Lote")} `) : ` ${theme.cyan("[ B ]")} Em Lote `;
       rightContent.push(`  ${btnA}   ${btnB}`);
     } else {
       const email = truncate(selected.emailOrName, 18);
       rightContent.push(`  ${theme.bold("Conta:")}      ${theme.cyan(email)}`);
       rightContent.push(`  ${theme.bold("Sistema ID:")} ${theme.muted(selected.id.slice(0, 14))}`);
       rightContent.push(`  ${theme.bold("Nível:")}      ${selected.priority}`);
+
+      const usagePct = selected.dailyUsagePercent ?? 0;
+      const usageTokens = selected.dailyTokens ?? 0;
+      const usageTurns = selected.dailyTurns ?? 0;
+      const usageColor = usagePct >= 80 ? theme.red : usagePct >= 40 ? theme.yellow : theme.cyan;
+      const usageBar = renderProgressBar(usagePct, 6, usageColor);
+      rightContent.push(`  ${theme.bold("Cota Hoje:")}  [${usageBar}] ${usageColor(`${usagePct}%`)} ${theme.dim(`(~${Math.round(usageTokens / 1000)}k / ${usageTurns} reqs)`)}`);
 
       const cdStatus = selected.onCooldown
         ? theme.yellow(`[!] Cooldown ${Math.round(selected.remainingCooldownMs / 60000)}m`)
@@ -1065,14 +1254,14 @@ export class AccountsView implements TuiView {
         rightContent.push("");
       }
       rightContent.push(`  ${theme.dim("─────────────────────────────────")}`);
-      const btnA = this.hoveredActionRow === 15 ? theme.bgHover(` ${theme.cyan("[ A ] Adicionar")} `) : `${theme.cyan("[ A ]")} Adicionar`;
-      const btnB = this.hoveredActionRow === 21 ? theme.bgHover(` ${theme.cyan("[ B ] Em Lote")} `) : `${theme.cyan("[ B ]")} Em Lote`;
+      const btnA = this.hoveredActionRow === 16 ? theme.bgHover(` ${theme.cyan("[ A ] Adicionar")} `) : ` ${theme.cyan("[ A ]")} Adicionar `;
+      const btnB = this.hoveredActionRow === 22 ? theme.bgHover(` ${theme.cyan("[ B ] Em Lote")} `) : ` ${theme.cyan("[ B ]")} Em Lote `;
       rightContent.push(`  ${btnA}   ${btnB}`);
-      rightContent.push(`  ${this.hoveredActionRow === 16 ? theme.bgHover(` ${theme.red("[ D ] Remover Conta")} `) : `${theme.red("[ D ]")} Remover Conta`}`);
-      rightContent.push(`  ${this.hoveredActionRow === 17 ? theme.bgHover(` ${theme.yellow("[ C ] Zerar Cooldown")} `) : `${theme.yellow("[ C ]")} Zerar Cooldown`}`);
-      rightContent.push(`  ${this.hoveredActionRow === 18 ? theme.bgHover(` ${theme.green("[ Z ] Zerar Todas")} `) : `${theme.green("[ Z ]")} Zerar Todas`}`);
-      rightContent.push(`  ${this.hoveredActionRow === 19 ? theme.bgHover(` ${theme.peach("[ X ] Limpar Chats (Conta)")} `) : `${theme.peach("[ X ]")} Limpar Chats (Conta)`}`);
-      rightContent.push(`  ${this.hoveredActionRow === 20 ? theme.bgHover(` ${theme.red("[ L ] Limpar Todos os Chats")} `) : `${theme.red("[ L ]")} Limpar Todos os Chats`}`);
+      rightContent.push(`  ${this.hoveredActionRow === 17 ? theme.bgHover(` ${theme.red("[ D ] Remover Conta")} `) : ` ${theme.red("[ D ]")} Remover Conta `}`);
+      rightContent.push(`  ${this.hoveredActionRow === 18 ? theme.bgHover(` ${theme.yellow("[ C ] Zerar Cooldown")} `) : ` ${theme.yellow("[ C ]")} Zerar Cooldown `}`);
+      rightContent.push(`  ${this.hoveredActionRow === 19 ? theme.bgHover(` ${theme.green("[ Z ] Zerar Todas")} `) : ` ${theme.green("[ Z ]")} Zerar Todas `}`);
+      rightContent.push(`  ${this.hoveredActionRow === 20 ? theme.bgHover(` ${theme.peach("[ X ] Limpar Chats (Conta)")} `) : ` ${theme.peach("[ X ]")} Limpar Chats (Conta) `}`);
+      rightContent.push(`  ${this.hoveredActionRow === 21 ? theme.bgHover(` ${theme.red("[ L ] Limpar Todos os Chats")} `) : ` ${theme.red("[ L ]")} Limpar Todos os Chats `}`);
     }
     const rightBox = drawBox({
       title: "Inspeção de Conta",
@@ -1165,16 +1354,14 @@ export class AccountsView implements TuiView {
       return modalBox.map((line) => padStr + line);
     }
     if (this.isAddModalOpen) {
-      const modalW = Math.min(width - 4, 66);
+      const modalW = Math.min(width - 4, 76);
       this.lastModalLeftPad = Math.max(0, Math.floor((width - modalW) / 2));
 
       const isEmail = this.addActiveField === "email";
       const isPass = this.addActiveField === "password";
+      const isCode = this.addActiveField === "code";
 
-      const emailHover = !isEmail && this.modalHoveredField === "email";
-      const passHover = !isPass && this.modalHoveredField === "password";
-
-      // Render Email field with clean cursor
+      // Render Email field with clean cursor (no white background hover)
       let emailDisplay: string;
       if (isEmail) {
         if (this.addEmailInput.length === 0) {
@@ -1187,47 +1374,94 @@ export class AccountsView implements TuiView {
         }
       } else {
         emailDisplay = this.addEmailInput
-          ? (emailHover ? theme.bgHover(` ${this.addEmailInput} `) : theme.cyan(` ${this.addEmailInput} `))
-          : (emailHover ? theme.bgHover(" (digite o e-mail) ") : theme.muted(" (digite o e-mail) "));
+          ? theme.cyan(this.addEmailInput)
+          : theme.muted("(digite o e-mail)");
       }
 
-      // Render Password field with clean cursor
-      let passDisplay: string;
-      const maskedPass = "•".repeat(this.addPasswordInput.length);
-      if (isPass) {
-        if (this.addPasswordInput.length === 0) {
-          passDisplay = `${theme.inverse(" ")} ${theme.dim("(digite a senha)")}`;
+      // Render Password or Code field with clean cursor
+      let secondFieldLabel: string;
+      let secondFieldDisplay: string;
+
+      if (this.addLoginMode === "password") {
+        secondFieldLabel = "Senha:";
+        const maskedPass = "•".repeat(this.addPasswordInput.length);
+        if (isPass) {
+          if (this.addPasswordInput.length === 0) {
+            secondFieldDisplay = `${theme.inverse(" ")} ${theme.dim("(digite a senha)")}`;
+          } else {
+            const before = maskedPass.slice(0, this.addPasswordCursor);
+            const at = maskedPass[this.addPasswordCursor] || " ";
+            const after = maskedPass.slice(this.addPasswordCursor + 1);
+            secondFieldDisplay = `${theme.cyan(before)}${theme.inverse(at)}${theme.cyan(after)}`;
+          }
         } else {
-          const before = maskedPass.slice(0, this.addPasswordCursor);
-          const at = maskedPass[this.addPasswordCursor] || " ";
-          const after = maskedPass.slice(this.addPasswordCursor + 1);
-          passDisplay = `${theme.cyan(before)}${theme.inverse(at)}${theme.cyan(after)}`;
+          secondFieldDisplay = this.addPasswordInput
+            ? theme.cyan(maskedPass)
+            : theme.muted("(digite a senha)");
         }
       } else {
-        passDisplay = this.addPasswordInput
-          ? (passHover ? theme.bgHover(` ${maskedPass} `) : theme.cyan(` ${maskedPass} `))
-          : (passHover ? theme.bgHover(" (digite a senha) ") : theme.muted(" (digite a senha) "));
+        secondFieldLabel = "Código:";
+        if (!this.isOtpCodeSent) {
+          secondFieldDisplay = theme.dim("(será enviado p/ seu e-mail)");
+        } else if (isCode) {
+          if (this.addOtpCodeInput.length === 0) {
+            secondFieldDisplay = `${theme.inverse(" ")} ${theme.dim("(digite o código de 6 dígitos)")}`;
+          } else {
+            const before = this.addOtpCodeInput.slice(0, this.addOtpCodeCursor);
+            const at = this.addOtpCodeInput[this.addOtpCodeCursor] || " ";
+            const after = this.addOtpCodeInput.slice(this.addOtpCodeCursor + 1);
+            secondFieldDisplay = `${theme.cyan(before)}${theme.inverse(at)}${theme.cyan(after)}`;
+          }
+        } else {
+          secondFieldDisplay = this.addOtpCodeInput
+            ? theme.cyan(this.addOtpCodeInput)
+            : theme.muted("(digite o código de 6 dígitos)");
+        }
       }
-      const saveBtn = this.isValidatingAccount
-        ? theme.yellow(" [ Validando... ] ")
+
+      let saveBtnText: string;
+      if (this.addLoginMode === "password") {
+        saveBtnText = "[ Enter ] Salvar";
+      } else if (!this.isOtpCodeSent) {
+        saveBtnText = "[ Enter ] Enviar Código";
+      } else {
+        saveBtnText = "[ Enter ] Confirmar Código";
+      }
+
+      const saveBtn = (this.isValidatingAccount || this.isOtpRequesting)
+        ? theme.yellow(" [ Aguarde... ] ")
         : this.modalHoveredField === "save"
-          ? theme.bgHover(theme.green(" [ Enter ] Salvar "))
-          : theme.green("[ Enter ] Salvar");
+          ? theme.bgHover(` ${saveBtnText} `)
+          : ` ${theme.green(saveBtnText)} `;
 
       const cancelBtn =
         this.modalHoveredField === "cancel"
-          ? theme.bgHover(theme.red(" [ Esc ] Cancelar "))
-          : theme.muted("[ Esc ] Cancelar");
+          ? theme.bgHover(" [ Esc ] Cancelar ")
+          : ` ${theme.muted("[ Esc ] Cancelar")} `;
+
+      const modeBtnText = this.addLoginMode === "password"
+        ? "[ Tab ] Sem Senha (OTP)"
+        : "[ Tab ] Modo Senha";
+
+      const modeBtn =
+        this.modalHoveredField === "mode"
+          ? theme.bgHover(` ${modeBtnText} `)
+          : ` ${theme.cyan(modeBtnText)} `;
+
       const modalContent = [
         "",
-        `  ${theme.bold("E-mail:")}  ${emailDisplay}`,
-        `  ${theme.bold("Senha:")}   ${passDisplay}`,
+        `  ${theme.bold("E-mail:")}  ${emailDisplay}${this.isOtpCodeSent ? ` ${theme.green("✓ Código Enviado")}` : ""}`,
+        `  ${theme.bold(secondFieldLabel)}   ${secondFieldDisplay}`,
         "",
-        `  ${saveBtn}   ${cancelBtn}   ${theme.dim("(↑↓/mouse alternar)")}`,
+        `  ${saveBtn}  ${cancelBtn}  ${modeBtn}`,
       ];
 
+      const modalTitle = this.addLoginMode === "password"
+        ? "Adicionar Nova Conta Qwen (Login com Senha)"
+        : "Adicionar Nova Conta Qwen (Login sem Senha - OTP)";
+
       const modalBox = drawBox({
-        title: "Adicionar Nova Conta Qwen (Login)",
+        title: modalTitle,
         width: modalW,
         height: Math.min(contentH, 11),
         borderColor: theme.borderActive,

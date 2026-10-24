@@ -93,6 +93,9 @@ process.on('unhandledRejection', async (reason: unknown) => {
   }
   console.error('❌ [Process] Unhandled Rejection:', reason);
 });
+
+import { installProcessTeardownGuards } from "./core/process-guard.ts";
+installProcessTeardownGuards("Playwright");
 const isTui = process.argv.includes('--tui') || process.env.QWEN_TUI === 'true'
 
 if (isTui) {

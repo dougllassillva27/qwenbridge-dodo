@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from "uuid";
 import { qwenUrl, qwenOrigin } from "./qwen-url.ts";
 import { config } from "../core/config.js";
 import { getChromeMajor, getSystemLocale } from "./fingerprint.ts";
+import { formatAsciiTimezone } from "../utils/timezone.ts";
 
 export function getSystemAcceptLanguage(customLocale?: string): string {
   const locale = customLocale || getSystemLocale();
@@ -101,8 +102,8 @@ export function buildQwenRequestHeaders(
     "bx-v": opts.bxV || "2.5.37",
     source: "web",
     version: opts.version || getQwenWebVersion(),
-    timezone: opts.extra?.timezone || opts.extra?.Timezone || new Date().toString().split(" (")[0],
-    Timezone: opts.extra?.Timezone || opts.extra?.timezone || new Date().toString().split(" (")[0],
+    timezone: opts.extra?.timezone || opts.extra?.Timezone || formatAsciiTimezone(),
+    Timezone: opts.extra?.Timezone || opts.extra?.timezone || formatAsciiTimezone(),
     // Use the real browser client-hints when captured (anti-hardcoded); fall
     // back to the static fingerprint otherwise.
     "sec-ch-ua":
@@ -120,8 +121,13 @@ export function buildQwenRequestHeaders(
     }
   }
 
-  if (opts.bxUa) headers["bx-ua"] = opts.bxUa;
-  if (opts.bxUmidtoken) headers["bx-umidtoken"] = opts.bxUmidtoken;
+  // The real chat.qwen.ai client sends ONLY bx-v on API requests — the WAF
+  // carries bx-ua/bx-umidtoken as browser cookies, not headers. Match that
+  // unless QWEN_SEND_BX_UA=true restores the legacy injection.
+  if (config.qwen.sendBxUa) {
+    if (opts.bxUa) headers["bx-ua"] = opts.bxUa;
+    if (opts.bxUmidtoken) headers["bx-umidtoken"] = opts.bxUmidtoken;
+  }
 
   return headers;
 }

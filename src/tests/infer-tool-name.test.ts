@@ -78,3 +78,70 @@ test("StreamingToolParser: recovers tool call with flattened command argument wi
     command: "git status",
   });
 });
+
+test("StreamingToolParser: fuzzy matches tool name across casing and delimiters (bash -> Bash, read_file -> readFile)", () => {
+  const claudeTools = [
+    {
+      type: "function" as const,
+      function: {
+        name: "Bash",
+        description: "Run shell command",
+        parameters: {
+          type: "object",
+          properties: { command: { type: "string" } },
+          required: ["command"],
+        },
+      },
+    },
+    {
+      type: "function" as const,
+      function: {
+        name: "readFile",
+        description: "Read file",
+        parameters: {
+          type: "object",
+          properties: { path: { type: "string" } },
+          required: ["path"],
+        },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(claudeTools);
+  const chunk1 = '<tool_call>{"name": "bash", "arguments": {"command": "npm test"}}</tool_call>';
+  const res1 = parser.feed(chunk1);
+  parser.flush();
+
+  assert.strictEqual(res1.toolCalls.length, 1);
+  assert.strictEqual(res1.toolCalls[0].name, "Bash", "Must normalize casing to declared Bash");
+  assert.strictEqual(parser.getSuccessfulToolCallCount(), 1);
+
+  const chunk2 = '<tool_call>{"name": "read_file", "arguments": {"path": "foo.txt"}}</tool_call>';
+  const res2 = parser.feed(chunk2);
+  parser.flush();
+
+  assert.strictEqual(res2.toolCalls.length, 1);
+  assert.strictEqual(res2.toolCalls[0].name, "readFile", "Must normalize snake_case to declared readFile");
+});
+
+test("StreamingToolParser: getSuccessfulToolCallCount remains 0 when tool is completely undeclared", () => {
+  const customTools = [
+    {
+      type: "function" as const,
+      function: {
+        name: "get_weather",
+        parameters: { type: "object", properties: { city: { type: "string" } } },
+      },
+    },
+  ];
+
+  const parser = new StreamingToolParser(customTools);
+  const chunk = '<tool_call>{"name": "totally_random_fake_tool", "arguments": {}}</tool_call>';
+  const res = parser.feed(chunk);
+  parser.flush();
+
+  assert.strictEqual(res.toolCalls.length, 0);
+  assert.strictEqual(parser.getSuccessfulToolCallCount(), 0, "Undeclared tool must NOT increment successful count");
+  assert.strictEqual(parser.getMalformedToolCalls().length, 1, "Must record as malformed/undeclared call");
+});
+

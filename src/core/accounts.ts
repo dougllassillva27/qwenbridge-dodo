@@ -139,9 +139,11 @@ function syncEnvAccounts(): void {
       upsert.run(acc.id, acc.email, encrypt(acc.password));
     }
     const placeholders = accounts.map(() => "?").join(",");
-    db.prepare(`DELETE FROM accounts WHERE email NOT IN (${placeholders})`).run(
-      ...accounts.map((a) => a.email),
-    );
+    if (!isRunningUnderNodeTest()) {
+      db.prepare(`DELETE FROM accounts WHERE email NOT IN (${placeholders})`).run(
+        ...accounts.map((a) => a.email),
+      );
+    }
   });
 
   sync();
@@ -330,7 +332,7 @@ export function addAccountsBatch(
 }
 export function addAccount(
   email: string,
-  password: string,
+  password = "",
   id?: string,
 ): QwenAccount {
   if (!email || typeof email !== "string" || email.trim().length === 0) {

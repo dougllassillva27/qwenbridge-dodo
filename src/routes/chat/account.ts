@@ -86,8 +86,8 @@ const MAX_ANTI_BOT_ROTATIONS = 1;
  * a stuck account page (closed context / WAF) can otherwise hold each browser
  * op for 60s and keep the personalization mutex blocked for minutes.
  */
-export const PERSONALIZATION_SYNC_DEADLINE_MS = 15_000;
-export const COLD_ACCOUNT_PERSONALIZATION_SYNC_DEADLINE_MS = 25_000;
+export const PERSONALIZATION_SYNC_DEADLINE_MS = 90_000;
+export const COLD_ACCOUNT_PERSONALIZATION_SYNC_DEADLINE_MS = 120_000;
 
 export function computePersonalizationDeadlineMs(
 	accountId: string | undefined,
@@ -275,8 +275,13 @@ export function resolveInitialAccount(
 
 		// Explicit preferred account (sticky / same-account retry)
 		if (typeof preferredAccountId === "string" && preferredAccountId) {
+			const needle = preferredAccountId.toLowerCase();
 			const preferred = configuredAccounts.find(
-				(candidate) => candidate.id === preferredAccountId,
+				(candidate) =>
+					candidate.id === preferredAccountId ||
+					candidate.id.toLowerCase().startsWith(needle) ||
+					candidate.email.toLowerCase() === needle ||
+					candidate.email.toLowerCase().includes(needle),
 			);
 			if (preferred && !getAccountCooldownInfo(preferred.id)) {
 				return { account: preferred, configuredAccounts };
@@ -975,7 +980,12 @@ async function tryCreateStreamWithRetry(
 	accountEmail: string,
 ): Promise<CreateStreamSuccess | CreateStreamFailure> {
 	const maxAttempts = Math.max(1, config.retry.maxAttempts);
-	const maxAccountSwitches = Math.max(0, config.retry.maxAccountSwitches);
+	const accounts = loadAccounts();
+	const configuredAccountCount = accounts.length;
+	const maxAccountSwitches = Math.max(
+		config.retry.maxAccountSwitches,
+		Math.min(configuredAccountCount - 1, 6),
+	);
 	let attemptsLeft = maxAttempts;
 	let retryDelay = config.retry.baseDelayMs;
 	let attempt = 0;
@@ -992,7 +1002,6 @@ async function tryCreateStreamWithRetry(
 	let chatInProgressOriginAccountEmail: string | null = null;
 	let lastAttemptError: any = null;
 	let invalidInputSameAccountRetried = false;
-	const accounts = loadAccounts();
 	const isSingleAccount = accounts.length <= 1;
 	let currentAccountId = accountId;
 	let currentAccountEmail = accountEmail;
@@ -1302,7 +1311,25 @@ async function tryCreateStreamWithRetry(
 				const acquireDeadlineMs = config.concurrency.acquireDeadlineMs;
 				let acquireDeadlineTimer: NodeJS.Timeout | undefined;
 				const acquireDeadline = new Promise<never>((_, reject) => {
-					acquireDeadlineTimer = setTimeout(() => {
+					const checkDeadline = async () => {
+						try {
+							const { isCaptchaRecoveryActive } = await import(
+								"../../services/captcha-coordinator.ts"
+							);
+							const { isPlaywrightInitializing } = await import(
+								"../../services/playwright.ts"
+							);
+							if (
+								currentAccountId &&
+								(isCaptchaRecoveryActive(currentAccountId) ||
+									isPlaywrightInitializing(currentAccountId))
+							) {
+								// Captcha solver is actively solving puzzle or browser is launching/initializing; extend deadline by 30s
+								acquireDeadlineTimer = setTimeout(checkDeadline, 30_000);
+								acquireDeadlineTimer.unref?.();
+								return;
+							}
+						} catch {}
 						// Abort the losing createQwenStream (it is still queued on the
 						// stream lock or mid-create); the post-lock signal re-check in
 						// createQwenStream then throws instead of letting the orphan
@@ -1313,7 +1340,8 @@ async function tryCreateStreamWithRetry(
 						) as Error & { code?: string };
 						err.code = "acquire_deadline";
 						reject(err);
-					}, acquireDeadlineMs);
+					};
+					acquireDeadlineTimer = setTimeout(checkDeadline, acquireDeadlineMs);
 					acquireDeadlineTimer.unref?.();
 				});
 				result = await Promise.race([
@@ -1522,19 +1550,24 @@ async function tryCreateStreamWithRetry(
 			};
 		}
 
-		if (
+		const isSessionExpired =
 			err instanceof QwenSessionExpiredError ||
-			err.name === "QwenSessionExpiredError"
-		) {
+			err?.name === "QwenSessionExpiredError" ||
+			(err instanceof Error &&
+				(err.message.toLowerCase().includes("token has expired") ||
+					err.message.toLowerCase().includes("session expired") ||
+					err.message.toLowerCase().includes("401 não autorizado") ||
+					err.message.toLowerCase().includes("unauthorized")));
+
+		if (isSessionExpired) {
 			console.warn(
-				`🔄 [Chat] Session expired for ${currentAccountEmail} (${currentAccountId}). Attempting re-login...`,
+				`🔄 [Chat] Session expired for ${currentAccountEmail} (${currentAccountId}). Attempting silent token refresh/re-login...`,
 			);
 			const reLoginOk = await attemptRelogin(
 				currentAccountId,
 				currentAccountEmail,
 			);
 			if (reLoginOk) continue;
-			return { success: false, error: err };
 		}
 
 
@@ -1771,6 +1804,13 @@ async function tryCreateStreamWithRetry(
 				currentAccountId = nextAccount.id;
 				currentAccountEmail = maskEmail(nextAccount.email);
 				accountSwitches++;
+				const isRealQuotaError =
+					policy.reason === "quota_or_rate_limit" &&
+					(policy.accountCooldownReason === "RateLimited" ||
+						policy.accountCooldownReason === "QuotaExceeded");
+				if (isRealQuotaError) {
+					attemptsLeft = Math.max(attemptsLeft, 1);
+				}
 
 				// Account switch always rebuilds a fresh upstream chat with full history.
 				// Do NOT persist sticky binding until create succeeds — premature empty

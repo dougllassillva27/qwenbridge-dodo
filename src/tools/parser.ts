@@ -1865,6 +1865,7 @@ export class StreamingToolParser {
   private currentOpenTag = TOOL_START_LITERAL;
   private currentCloseTag = TOOL_END;
   private emittedToolCallCount = 0;
+  private successfulToolCallsCount = 0;
   private pendingLeadIn = "";
   private tools: ToolDefinitionLike[] = [];
   private declaredToolNames: string[] = [];
@@ -2160,6 +2161,7 @@ export class StreamingToolParser {
       // or the arguments would be appended twice and corrupted.
       this.flushPendingToolCallDeltas(result);
       this.emittedToolCallCount++;
+      this.successfulToolCallsCount++;
       this.pendingLeadIn = "";
       incremental.startEmitted = false;
       incremental.disabled = true;
@@ -2169,6 +2171,7 @@ export class StreamingToolParser {
     this.flushPendingToolCallDeltas(result);
     result.toolCalls.push(tc);
     this.emittedToolCallCount++;
+    this.successfulToolCallsCount++;
     this.pendingLeadIn = "";
   }
 
@@ -2880,6 +2883,10 @@ export class StreamingToolParser {
 
   getEmittedToolCallCount(): number {
     return this.emittedToolCallCount;
+  }
+
+  getSuccessfulToolCallCount(): number {
+    return this.successfulToolCallsCount;
   }
 
   isInsideTool(): boolean {
