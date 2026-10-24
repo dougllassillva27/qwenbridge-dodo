@@ -18,6 +18,7 @@ import {
   setToolCapNotice,
 } from "../../services/qwen.ts";
 import { acquireUpstreamStream } from "./account.ts";
+import { loadAccounts } from "../../core/accounts.ts";
 import { markAccountRateLimited, computeQuotaCooldownMs } from "../../core/account-manager.ts";
 import {
   clearTemporaryBusy,
@@ -32,6 +33,10 @@ import {
 import type { Message, OpenAIRequest, Usage } from "../../utils/types.ts";
 import { touchChatLock } from "./account.ts";
 import { StreamingToolParser } from "../../tools/parser.ts";
+import {
+  decideMissingToolCallRetry,
+  type MissingToolCallReason,
+} from "../../tools/tool-call-heuristics.ts";
 import {
   getStream,
   markStreamEmitted,
@@ -60,6 +65,7 @@ import {
   logTokenEstimationSample,
   type TokenEstimationContext,
 } from "../../services/token-estimation-metrics.ts";
+import { recordTurnUsage } from "../../core/daily-usage.ts";
 import {
   enrichUsageWithContextMeter,
   getContextMeterHeaders,
@@ -77,6 +83,7 @@ import {
   applyUpstreamUsage,
   buildUsage,
 } from "./helpers.ts";
+import { isOverloadMessage, OVERLOAD_COOLDOWN_MS } from "../../utils/overload-detector.ts";
 
 function firstString(...values: unknown[]): string | null {
   for (const value of values) {
@@ -475,6 +482,19 @@ export async function processNonStreamingResponse(
               isThinkingChunk = false;
               if (delta.content !== undefined) {
                 const newContent = delta.content || "";
+                if (isOverloadMessage(newContent)) {
+                  throw toRetryableStreamError(
+                    "server_overloaded",
+                    newContent,
+                    {
+                      switchAccount: true,
+                      forceNewChat: true,
+                      reason: "server_busy",
+                      accountCooldownMs: OVERLOAD_COOLDOWN_MS,
+                      accountCooldownReason: "ServerOverloaded",
+                    },
+                  );
+                }
                 const result = getIncrementalDelta(
                   lastRawContent,
                   newContent,
@@ -593,8 +613,17 @@ export async function processNonStreamingResponse(
 
     const finishReason = toolCallsOut.length ? "tool_calls" : "stop";
 
-    // Auto-retry if all tool calls were malformed (no successful tool calls)
-    const allToolsFailed = toolParser && toolParser.getMalformedToolCalls().length > 0 && toolCallsOut.length === 0;
+    // Auto-retry if all tool calls were malformed or model hesitated with missing call
+    const retryDecision = toolParser
+      ? decideMissingToolCallRetry({
+          declaredToolCount: declaredTools.length,
+          successfulToolCallCount: toolParser.getSuccessfulToolCallCount(),
+          malformedToolCallCount: toolParser.getMalformedToolCalls().length,
+          emittedToolCallCount: toolParser.getEmittedToolCallCount(),
+          text: finalContent,
+        })
+      : { retry: false, reason: null as MissingToolCallReason };
+    const allToolsFailed = retryDecision.retry;
     const malformedRetryCount = midStreamRetry?.malformedRetryCount ?? 0;
     if (
       allToolsFailed &&
@@ -602,7 +631,7 @@ export async function processNonStreamingResponse(
       midStreamRetry &&
       malformedRetryCount < config.retry.autoRetryMalformedToolsMax
     ) {
-      const malformedCalls = toolParser.getMalformedToolCalls();
+      const malformedCalls = toolParser?.getMalformedToolCalls() ?? [];
       const malformedCount = malformedCalls.length;
 
       // Build detailed error message with available tools list
@@ -618,7 +647,9 @@ export async function processNonStreamingResponse(
         : "";
 
       let errorMessage: string;
-      if (undeclaredNames.length > 0) {
+      if (retryDecision.reason === "no_call") {
+        errorMessage = `You did not emit any tool call. Respond with a single tool-call block using one of the declared tools.${toolsHint}`;
+      } else if (undeclaredNames.length > 0) {
         errorMessage = `Your previous ${malformedCount} tool call(s) used undeclared tool names: ${undeclaredNames.join(", ")}. Only declared tools can be executed. Please retry with valid tool names.${toolsHint}`;
       } else {
         const previews = malformedCalls
@@ -703,7 +734,7 @@ export async function processNonStreamingResponse(
         );
       }
 
-      console.log(`🔄 [Chat] Auto-retry (${malformedRetryCount + 1}/${config.retry.autoRetryMalformedToolsMax}) | ${newStreamResult.activeAccountLabel} | ${body.model} | chat=${newStreamResult.uiSessionId.substring(0, 12)} | reason=malformed_tool_calls`);
+      console.log(`🔄 [Chat] Auto-retry (${malformedRetryCount + 1}/${config.retry.autoRetryMalformedToolsMax}) | ${newStreamResult.activeAccountLabel} | ${body.model} | chat=${newStreamResult.uiSessionId.substring(0, 12)} | reason=${retryDecision.reason === "no_call" ? "missing_tool_call" : "malformed_tool_calls"}`);
 
       // Process the new stream. Propagate the retry context with an incremented
       // counter so a subsequent malformed response can retry again up to
@@ -780,6 +811,10 @@ export async function processNonStreamingResponse(
       mode: "non-stream",
       context: currentTokenEstimationContext,
     });
+
+    if (activeAccountId && usage) {
+      recordTurnUsage(activeAccountId, usage, body.model);
+    }
 
     // The response was fully processed: persist the next-turn parent.
     if (pendingParentId) {
@@ -900,6 +935,9 @@ export async function processStreamingResponse(
     let activeReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
     let invalidInputSameAccountRetries = 0;
     let chatInProgressSameAccountRetries = 0;
+    let antiBotSameAccountRetries = 0;
+    const totalConfiguredAccounts = loadAccounts().length;
+    let quotaRotationsLeft = Math.max(1, totalConfiguredAccounts - 1);
     // Set when the terminal [DONE] reached the client. The `| recovered`
     // suffix on Stream done must only appear for attempts that COMPLETED after
     // a mid-stream retry, not for failed attempts that consumed retries.
@@ -1372,7 +1410,6 @@ export async function processStreamingResponse(
           !normalizedError ||
           (clientDisconnected && !gracePending) ||
           c.req.raw.signal.aborted ||
-          retryContext.retriesLeft <= 0 ||
           !midStreamRetry ||
           emittedModelOutput
         ) {
@@ -1383,6 +1420,19 @@ export async function processStreamingResponse(
           requestAborted: c.req.raw.signal.aborted,
         });
         if (!policy.retryable) return false;
+
+        const isRealQuotaError =
+          policy.reason === "quota_or_rate_limit" &&
+          (policy.accountCooldownReason === "RateLimited" ||
+            policy.accountCooldownReason === "QuotaExceeded");
+
+        const hasBudget = isRealQuotaError
+          ? quotaRotationsLeft > 0
+          : retryContext.retriesLeft > 0;
+
+        if (!hasBudget) {
+          return false;
+        }
 
         // Full recovery decision — same rationale as the create-path policy
         // log: the failure line shows the error, this line shows WHY the
@@ -1397,9 +1447,13 @@ export async function processStreamingResponse(
           invalidateLogicalThreadParent(midStreamRetry.sessionId);
         }
 
-        retryContext.retriesLeft--;
+        if (isRealQuotaError) {
+          quotaRotationsLeft--;
+        } else {
+          retryContext.retriesLeft--;
+        }
         console.warn(
-          `🔄 [Chat] Stream recovery | account=${currentAccountId} | reason=${policy.reason} | error=${normalizedError.message.substring(0, 150)} | retries_left=${retryContext.retriesLeft}`,
+          `🔄 [Chat] Stream recovery | account=${currentAccountId} | reason=${policy.reason} | error=${normalizedError.message.substring(0, 150)} | retries_left=${isRealQuotaError ? quotaRotationsLeft : retryContext.retriesLeft}`,
         );
 
         const retryInvalidInputOnSameAccount =
@@ -1432,8 +1486,18 @@ export async function processStreamingResponse(
           );
           return false;
         }
-        const switchAccount =
+        let switchAccount =
           policy.switchAccount && !retryInvalidInputOnSameAccount;
+
+        if (policy.reason === "anti_bot") {
+          if (antiBotSameAccountRetries === 0) {
+            antiBotSameAccountRetries++;
+            switchAccount = false;
+          } else {
+            switchAccount = true;
+            markAccountRateLimited(currentAccountId, 60_000, "AntiBotWafChallenge");
+          }
+        }
 
         if (
           switchAccount &&
@@ -1450,6 +1514,35 @@ export async function processStreamingResponse(
           import("../../services/playwright.ts")
             .then(({ refreshAccountToken }) => refreshAccountToken(currentAccountId))
             .catch(() => {});
+        }
+
+        // Preventative stop: signal Qwen to stop generating on the backend before switching
+        if (currentUiSessionId && targetResponseId) {
+          const streamData = getStream(completionId);
+          const stopHeaders = streamData?.headers;
+          if (stopHeaders?.cookie && stopHeaders["user-agent"]) {
+            void requestQwenTextInBrowser(
+              currentAccountId,
+              "POST",
+              `/api/v2/chat/completions/stop?chat_id=${encodeURIComponent(currentUiSessionId)}`,
+              buildQwenRequestHeaders({
+                cookie: stopHeaders.cookie,
+                userAgent: stopHeaders["user-agent"],
+                bxUa: stopHeaders["bx-ua"],
+                bxUmidtoken: stopHeaders["bx-umidtoken"],
+                bxV: stopHeaders["bx-v"],
+                chatSessionId: currentUiSessionId,
+              }),
+              JSON.stringify({
+                chat_id: currentUiSessionId,
+                response_id: targetResponseId,
+              }),
+              {
+                referrer: qwenUrl(`/c/${encodeURIComponent(currentUiSessionId)}`),
+                noMutexRecovery: true,
+              },
+            ).catch(() => undefined);
+          }
         }
 
         retryContext.releaseAccountLease?.();
@@ -1811,6 +1904,19 @@ export async function processStreamingResponse(
                 isThinkingChunk = false;
                 if (delta.content !== undefined) {
                   const newContent = delta.content || "";
+                  if (!emittedModelOutput && isOverloadMessage(newContent)) {
+                    throw toRetryableStreamError(
+                      "server_overloaded",
+                      newContent,
+                      {
+                        switchAccount: true,
+                        forceNewChat: true,
+                        reason: "server_busy",
+                        accountCooldownMs: OVERLOAD_COOLDOWN_MS,
+                        accountCooldownReason: "ServerOverloaded",
+                      },
+                    );
+                  }
                   const result = getIncrementalDelta(
                     lastRawContent,
                     newContent,
@@ -2073,9 +2179,14 @@ export async function processStreamingResponse(
 
         while (malformedRetryCount < maxMalformedRetries) {
           if (!toolParser) break;
-          const allToolsFailed =
-            toolParser.getMalformedToolCalls().length > 0 &&
-            toolParser.getEmittedToolCallCount() === 0;
+          const retryDecision = decideMissingToolCallRetry({
+            declaredToolCount: declaredTools.length,
+            successfulToolCallCount: toolParser.getSuccessfulToolCallCount(),
+            malformedToolCallCount: toolParser.getMalformedToolCalls().length,
+            emittedToolCallCount: toolParser.getEmittedToolCallCount(),
+            text: finalContent,
+          });
+          const allToolsFailed = retryDecision.retry;
           if (!allToolsFailed) break;
 
           const malformedCalls = toolParser.getMalformedToolCalls();
@@ -2094,7 +2205,9 @@ export async function processStreamingResponse(
               : "";
 
           let errorMessage: string;
-          if (undeclaredNames.length > 0) {
+          if (retryDecision.reason === "no_call") {
+            errorMessage = `You did not emit any tool call. Respond with a single tool-call block using one of the declared tools.${toolsHint}`;
+          } else if (undeclaredNames.length > 0) {
             errorMessage = `Your previous ${malformedCount} tool call(s) used undeclared tool names: ${undeclaredNames.join(", ")}. Only declared tools can be executed. Please retry with valid tool names.${toolsHint}`;
           } else {
             const previews = malformedCalls
@@ -2179,7 +2292,7 @@ export async function processStreamingResponse(
           }
 
           console.log(
-            `🔄 [Chat] Auto-retry (${malformedRetryCount + 1}/${maxMalformedRetries}) | ${newStreamResult.activeAccountLabel} | ${body.model} | chat=${newStreamResult.uiSessionId.substring(0, 12)} | reason=malformed_tool_calls`,
+            `🔄 [Chat] Auto-retry (${malformedRetryCount + 1}/${maxMalformedRetries}) | ${newStreamResult.activeAccountLabel} | ${body.model} | chat=${newStreamResult.uiSessionId.substring(0, 12)} | reason=${retryDecision.reason === "no_call" ? "missing_tool_call" : "malformed_tool_calls"}`,
           );
 
           // Transfer the retry's stream registry entry to the original
@@ -2566,6 +2679,10 @@ export async function processStreamingResponse(
           mode: "stream",
           context: currentTokenEstimationContext,
         });
+
+        if (activeAccountId && usage) {
+          recordTurnUsage(activeAccountId, usage, body.model);
+        }
       } else {
         if (isToolcallDebugEnabled()) {
           logger.debug(
@@ -2702,7 +2819,7 @@ export async function processStreamingResponse(
       completionId,
     };
 
-    if (retryable) {
+    if (retryable || isNetworkLikeError(err) || isAbortError(err)) {
       if (activeAccountId && isNetworkLikeError(err)) {
         noteMidStreamNetworkFailure(activeAccountId);
       }
@@ -2714,28 +2831,41 @@ export async function processStreamingResponse(
       logger.error("[Chat] Stream callback error", errorDetails);
     }
     // The HTTP response is already committed at this point.
-    // 1. Emit an explicit assistant message delta so CLI/TUI clients that only
-    //    listen for choices[].delta.content (e.g. OpenCode, Claude Code, etc.)
-    //    render the error visibly in the chat instead of appearing blank/frozen.
-    // 2. Emit a terminal OpenAI-compatible SSE error event + [DONE].
+    // 1. Emit an explicit assistant message delta ONLY if this was an upstream content moderation /
+    //    policy violation (with finish_reason: "content_filter"), so the user understands why the
+    //    prompt was blocked.
+    // 2. For network/transient/quota errors, NEVER emit fake assistant content with finish_reason: "stop".
+    //    Doing so masks network failures as successful AI answers, preventing client agent retries and
+    //    poisoning chat history with error banners.
+    // 3. Emit a terminal OpenAI-compatible SSE error event + [DONE].
     try {
-      const userFriendlyNotice = `\n\n⚠️ **[Qwen Security / Erro]** ${err.message || "A resposta foi interrompida pelo Qwen."}\n\n`;
-      const errorDelta = {
-        id: completionId,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model: body.model,
-        choices: [
-          {
-            index: 0,
-            delta: { content: userFriendlyNotice },
-            logprobs: null,
-            finish_reason: "stop",
-          },
-        ],
-      };
+      const isNetwork = isNetworkLikeError(err);
+      const isModeration =
+        normalizedErrorCode === "data_inspection_failed" ||
+        normalizedErrorCode === "fail_sys_user_validate" ||
+        err.message?.toLowerCase().includes("content moderation") ||
+        err.message?.toLowerCase().includes("security verification");
 
-      await errorStream.write(`data: ${JSON.stringify(errorDelta)}\n\n`);
+      if (!isNetwork && isModeration) {
+        const userFriendlyNotice = `\n\n⚠️ **[Qwen Moderação / Segurança]** ${err.message || "A resposta foi interrompida pelas políticas de segurança do Qwen."}\n\n`;
+        const errorDelta = {
+          id: completionId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [
+            {
+              index: 0,
+              delta: { content: userFriendlyNotice },
+              logprobs: null,
+              finish_reason: "content_filter",
+            },
+          ],
+        };
+
+        await errorStream.write(`data: ${JSON.stringify(errorDelta)}\n\n`);
+      }
+
       await errorStream.write(
         `data: ${JSON.stringify({
           error: {

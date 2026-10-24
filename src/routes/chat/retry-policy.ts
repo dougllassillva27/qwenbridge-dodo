@@ -22,6 +22,7 @@ import {
   ValidationError,
 } from "../../core/errors.ts";
 import { isAbortError } from "./helpers.ts";
+import { isOverloadMessage, OVERLOAD_COOLDOWN_MS } from "../../utils/overload-detector.ts";
 
 export type RetryAction = {
   /** Outer/create-stream layer should retry this failure */
@@ -50,6 +51,9 @@ export type RetryableStreamError = RetryableQwenStreamError & {
   retryWithFullPrompt?: boolean;
   switchAccount?: boolean;
   dropFiles?: boolean;
+  accountCooldownMs?: number;
+  accountCooldownReason?: string;
+  reason?: string;
 };
 
 function errMessage(err: unknown): string {
@@ -231,10 +235,11 @@ export function isAccountInitializationError(err: unknown): boolean {
 }
 
 export function isQuotaLikeError(err: unknown): boolean {
-  // Chat-not-exist / invalid attachment must never look like quota.
+  // Chat-not-exist / invalid attachment / explicit overload must never look like quota.
   if (isChatNotExistError(err) || isInvalidInputError(err)) return false;
-
   const code = errCode(err).toLowerCase();
+  if (code === "server_overloaded" || code === "overload") return false;
+
   const message = errMessage(err).toLowerCase();
 
   // Note: RetryableQwenStreamError inherits OpenAI-style code "rate_limit_exceeded".
@@ -385,7 +390,9 @@ export function isNetworkLikeError(err: unknown): boolean {
     message.includes("socket hang up") ||
     message.includes("econnreset") ||
     message.includes("econnrefused") ||
-    message.includes("etimedout")
+    message.includes("etimedout") ||
+    message.includes("stream ended before response headers") ||
+    message.includes("timed out waiting for response headers")
   );
 }
 
@@ -402,6 +409,46 @@ export function isCorruptedChatHistoryError(err: unknown): boolean {
     message.includes("must not assistant message") ||
     message.includes("must not be assistant")
   );
+}
+
+/**
+ * Qwen upstream internal or server-busy errors.
+ * Transient server-side failures requiring a fresh chat and account switch.
+ */
+export function isInternalServerError(err: unknown): boolean {
+  const code = errCode(err).toLowerCase();
+  const message = errMessage(err).toLowerCase();
+  return (
+    code === "internal_error" ||
+    code === "internal_server_error" ||
+    code === "server_error" ||
+    code === "server_busy" ||
+    code === "busy" ||
+    message.includes("internal_error") ||
+    message.includes("ocorreu um erro inesperado") ||
+    message.includes("unexpected error") ||
+    message.includes("internal server error")
+  );
+}
+
+/**
+ * Detects in-band plain text overload messages from Qwen.
+ */
+export function isOverloadError(err: unknown): boolean {
+  const code = errCode(err).toLowerCase();
+  if (
+    code === "quota_limit" ||
+    code === "ratelimited" ||
+    code === "rate_limit" ||
+    code === "rate_limit_exceeded" ||
+    code === "membership_limit" ||
+    code === "internal_error" ||
+    code === "internal_server_error"
+  ) {
+    return false;
+  }
+  if (code === "server_overloaded" || code === "overload") return true;
+  return !code && isOverloadMessage(errMessage(err));
 }
 
 /**
@@ -454,6 +501,21 @@ export function classifyRetryAction(
     return makeRetryAction("terminal_local", { retryable: false });
   }
 
+  // Agent instructions ride ONLY the account-level personalization. An
+  // unconfirmed sync means this account cannot serve the request as-is —
+  // rotate to another account (each attempt re-syncs on its own account).
+  // Do NOT park the account with a 300s cooldown: rotation across accounts
+  // is already guarded by triedAccounts, preventing pool collapse.
+  if (err instanceof PersonalizationSyncError) {
+    return makeRetryAction("personalization_sync_failed", {
+      switchAccount: true,
+      forceNewChat: true,
+      retryAfterMs: baseDelayMs,
+      accountCooldownMs: 0,
+      accountCooldownReason: "PersonalizationFailed",
+    });
+  }
+
   const message = errMessage(err).toLowerCase();
   const code = errCode(err).toLowerCase();
   if (isAccountInitializationError(err)) {
@@ -473,21 +535,6 @@ export function classifyRetryAction(
     return makeRetryAction("account_busy", {
       switchAccount: true,
       retryAfterMs: Math.min(baseDelayMs, 1_000),
-    });
-  }
-
-  // Agent instructions ride ONLY the account-level personalization. An
-  // unconfirmed sync means this account cannot serve the request as-is —
-  // rotate to another account (each attempt re-syncs on its own account).
-  // Do NOT park the account with a 300s cooldown: rotation across accounts
-  // is already guarded by triedAccounts, preventing pool collapse.
-  if (err instanceof PersonalizationSyncError) {
-    return makeRetryAction("personalization_sync_failed", {
-      switchAccount: true,
-      forceNewChat: true,
-      retryAfterMs: baseDelayMs,
-      accountCooldownMs: 0,
-      accountCooldownReason: "PersonalizationFailed",
     });
   }
 
@@ -590,6 +637,28 @@ export function classifyRetryAction(
       });
     }
 
+    if (isOverloadError(err)) {
+      const typed = err as RetryableStreamError;
+      return makeRetryAction("server_busy", {
+        switchAccount: true,
+        forceNewChat: true,
+        retryWithFullPrompt: true,
+        retryAfterMs: typed.retryAfterMs ?? 3_000,
+        accountCooldownMs: OVERLOAD_COOLDOWN_MS,
+        accountCooldownReason: "ServerOverloaded",
+      });
+    }
+
+    if (isInternalServerError(err) && !(err instanceof QwenUpstreamError)) {
+      const typed = err as RetryableStreamError;
+      return makeRetryAction("upstream_internal_error", {
+        switchAccount: typed.switchAccount !== false,
+        forceNewChat: true,
+        retryWithFullPrompt: true,
+        retryAfterMs: typed.retryAfterMs ?? Math.min(baseDelayMs * 2, 3000),
+      });
+    }
+
     if (
         isNetworkLikeError(err) ||
         err instanceof QwenUpstreamUnavailableError ||
@@ -624,11 +693,13 @@ export function classifyRetryAction(
     if (err instanceof RetryableQwenStreamError) {
       const typed = err as RetryableStreamError;
       // Default switch unless caller explicitly set switchAccount=false
-      return makeRetryAction("explicit_retryable", {
+      return makeRetryAction(typed.reason || "explicit_retryable", {
         switchAccount: typed.switchAccount !== false,
         forceNewChat: typed.forceNewChat === true,
         retryWithFullPrompt: typed.retryWithFullPrompt === true,
         retryAfterMs: typed.retryAfterMs ?? baseDelayMs,
+        accountCooldownMs: typed.accountCooldownMs,
+        accountCooldownReason: typed.accountCooldownReason,
       });
     }
 
@@ -672,6 +743,9 @@ export function toRetryableStreamError(
   error.retryWithFullPrompt = merged.retryWithFullPrompt;
   error.switchAccount = merged.switchAccount;
   error.dropFiles = merged.dropFiles;
+  error.accountCooldownMs = merged.accountCooldownMs;
+  error.accountCooldownReason = merged.accountCooldownReason;
+  error.reason = merged.reason;
   return error;
 }
 

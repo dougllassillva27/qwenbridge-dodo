@@ -76,6 +76,7 @@ const envSchema = z
     // own context while serving. Accounts in cooldown (rate-limited) sit idle,
     // drop out of the warm set and get evicted.
     PLAYWRIGHT_MAX_ACTIVE_CONTEXTS: z.string().default("2"),
+    PLAYWRIGHT_STARTUP_WARM_ACCOUNTS: z.string().default("4"),
     PLAYWRIGHT_PREPARE_ALL_ON_STARTUP: z.string().default("false"),
     CAPTCHA_SOLVER_ENABLED: z.string().default("true"),
     CAPTCHA_SOLVER_MAX_ATTEMPTS: z.string().default("3"),
@@ -101,11 +102,11 @@ const envSchema = z
     // nothing in this window is dead and should fail fast, retryable).
     QWEN_FIRST_CHUNK_TIMEOUT: z.string().default("60000"),
     TOTAL_REQUEST_TIMEOUT: z.string().default("600000"),
-    // Mid-stream silence window for thinking models: 3 min with ZERO upstream
+    // Mid-stream silence window for thinking models: 5 min with ZERO upstream
     // bytes is a dead stream (WAF swallow / dropped connection) — fail fast and
     // let the retry policy rotate accounts. Flowing reasoning chunks RESET this
     // timer, so legitimate slow thinking is never cut; only total silence is.
-    REASONING_MODEL_TIMEOUT: z.string().default("180000"),
+    REASONING_MODEL_TIMEOUT: z.string().default("300000"),
     CACHE_TTL: z.string().default("3600"),
     RESPONSE_TTL: z.string().default("1800"),
     CACHE_COMPRESSION_ENABLED: z.string().default("true"),
@@ -235,6 +236,7 @@ export const config = {
     jsHeapMb: Math.max(64, parseInt(env.PLAYWRIGHT_JS_HEAP_MB)),
     lowMemoryFlags: env.PLAYWRIGHT_LOW_MEMORY_FLAGS !== "false",
     maxActiveContexts: Math.max(0, parseInt(env.PLAYWRIGHT_MAX_ACTIVE_CONTEXTS)),
+    startupWarmAccounts: Math.max(1, parseInt(env.PLAYWRIGHT_STARTUP_WARM_ACCOUNTS)),
     prepareAllOnStartup: env.PLAYWRIGHT_PREPARE_ALL_ON_STARTUP !== "false",
   },
   captcha: {

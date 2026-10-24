@@ -170,7 +170,27 @@ function runMigrations(db: Database.Database): void {
       instruction_hash TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS account_daily_usage (
+      account_id TEXT NOT NULL,
+      date_utc TEXT NOT NULL,
+      prompt_tokens INTEGER NOT NULL DEFAULT 0,
+      completion_tokens INTEGER NOT NULL DEFAULT 0,
+      weighted_tokens REAL NOT NULL DEFAULT 0,
+      total_tokens INTEGER NOT NULL DEFAULT 0,
+      turns_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (account_id, date_utc)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_daily_usage_date ON account_daily_usage(date_utc);
   `);
+
+  try {
+    db.exec(`ALTER TABLE account_daily_usage ADD COLUMN weighted_tokens REAL DEFAULT 0;`);
+  } catch (err) {
+    if (!isDuplicateColumnError(err)) throw err;
+  }
 
   // Cooldown persistence columns — wrapped in try-catch because
   // SQLite doesn't support IF NOT EXISTS for ALTER TABLE ADD COLUMN.
@@ -341,7 +361,11 @@ export function saveAuthSession(
     ) VALUES (
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
-      ?, ?, ?, ?, datetime('now')
+      COALESCE(?, (SELECT user_id FROM qwen_auth_sessions WHERE account_id = ?)),
+      ?,
+      COALESCE(?, (SELECT refresh_token FROM qwen_auth_sessions WHERE account_id = ?)),
+      ?,
+      datetime('now')
     )
   `);
   stmt.run(
@@ -356,8 +380,10 @@ export function saveAuthSession(
     session.secChUaPlatform || null,
     session.version || null,
     session.userId || null,
+    accountId,
     session.tokenExpiresAt || null,
     session.refreshToken || null,
+    accountId,
     session.capturedAt ?? Date.now(),
   );
 }
