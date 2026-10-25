@@ -382,6 +382,15 @@ async function attemptRelogin(
 		: (loadAccounts().find((a) => a.id === accountId)?.email || accountEmail);
 	try {
 		await refreshHeaders(accountId, config.timeouts.headers, true);
+		const { getHeaderCache, hasValidAuthToken } = await import("../../services/playwright.ts");
+		const currentCache = getHeaderCache(accountId);
+		const currentCookie = currentCache?.headers?.cookie || "";
+		if (!hasValidAuthToken(currentCookie)) {
+			console.warn(
+				`⚠️  [Chat] Headers refreshed for ${maskEmail(displayEmail)} but auth token is still invalid. Refusing retry on dead session.`,
+			);
+			return false;
+		}
 		console.log(
 			`✅ [Chat] Playwright headers refreshed for ${maskEmail(displayEmail)}. Retrying...`,
 		);

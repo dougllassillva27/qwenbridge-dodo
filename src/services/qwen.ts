@@ -33,6 +33,7 @@ import { recoverBaxiaCaptcha } from "./captcha-coordinator.ts";
 import { startBaxiaCaptchaWatcher } from "./captcha-solver.ts";
 import { isAccountBusy } from "../core/account-concurrency.ts";
 import { formatAsciiTimezone, sanitizeHeaderForFetch } from "../utils/timezone.ts";
+import { parseJwtExpiry } from "../utils/jwt.ts";
 
 // Re-exported from extracted modules for backward compatibility
 export {
@@ -931,7 +932,16 @@ export function getBrowserFetchHeaders(
 
   const result: Record<string, string> = {};
   for (const [name, value] of Object.entries(headers)) {
-    if (browserAllowedHeaders.has(name.toLowerCase())) {
+    const lowerName = name.toLowerCase();
+    if (browserAllowedHeaders.has(lowerName)) {
+      if (lowerName === "authorization") {
+        const val = String(value ?? "");
+        const tokenVal = val.replace(/^Bearer\s+/i, "").trim();
+        const exp = parseJwtExpiry(tokenVal);
+        if (typeof exp === "number" && exp <= Math.floor(Date.now() / 1000) + 30) {
+          continue;
+        }
+      }
       result[name] = sanitizeHeaderForFetch(String(value ?? ""));
     }
   }

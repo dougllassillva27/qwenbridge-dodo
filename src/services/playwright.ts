@@ -485,7 +485,19 @@ export async function isPageLoggedIn(
       .evaluate(async () => {
         try {
           try { localStorage.removeItem("qwen_token_logged_out_marker"); } catch {}
-          if (!localStorage.getItem("token")) return false;
+          const rawToken = localStorage.getItem("token") || "";
+          if (!rawToken) return false;
+          try {
+            const segs = rawToken.split(".");
+            if (segs.length === 3 && segs[1]) {
+              const b64 = segs[1].replace(/-/g, "+").replace(/_/g, "/");
+              const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+              const p = JSON.parse(atob(b64 + pad));
+              if (typeof p.exp === "number" && p.exp <= Math.floor(Date.now() / 1000) + 30) {
+                return false;
+              }
+            }
+          } catch {}
 
           const res = await fetch("/api/v1/auths/", { method: "GET" });
           if (res.status !== 200) return false;
@@ -547,7 +559,9 @@ export async function isPageLoggedIn(
                 code.includes("unauthenticated") ||
                 details.includes("401") ||
                 details.includes("revogado") ||
-                details.includes("revoked")
+                details.includes("revoked") ||
+                details.includes("expired") ||
+                details.includes("token has expired")
               ) {
                 return false;
               }
@@ -1386,7 +1400,7 @@ export function getStealthScript(profile: FingerprintProfile): string {
   `;
 }
 
-function getHeaderCache(accountId: string): AccountHeaderCache {
+export function getHeaderCache(accountId: string): AccountHeaderCache {
   let cache = headerCaches.get(accountId);
   if (!cache) {
     cache = {
@@ -1538,6 +1552,25 @@ export async function getBasicHeaders(accountId: string): Promise<{
     const resolveAuthorization = async (): Promise<string> => {
       const cacheRef = getHeaderCache(accountId);
       let auth = cacheRef.headers["authorization"] || cacheRef.headers["Authorization"] || "";
+      if (auth) {
+        const rawToken = auth.replace(/^Bearer\s+/i, "").trim();
+        const exp = parseJwtExpiry(rawToken);
+        if (typeof exp === "number" && exp <= Math.floor(Date.now() / 1000) + 30) {
+          auth = "";
+        }
+      }
+      if (!auth) {
+        const cookie = cacheRef.headers["cookie"] || "";
+        const match = cookie.match(/(?:^|;\s*)token=([^;]+)/);
+        if (match && match[1]) {
+          const cookieToken = decodeURIComponent(match[1].trim());
+          const exp = parseJwtExpiry(cookieToken);
+          if (exp === null || exp > Math.floor(Date.now() / 1000) + 30) {
+            auth = cookieToken.startsWith("Bearer ") ? cookieToken : `Bearer ${cookieToken}`;
+            cacheRef.headers["authorization"] = auth;
+          }
+        }
+      }
       if (!auth && page && !page.isClosed()) {
         try {
           const lsToken = await page.evaluate(async () => {
@@ -2167,17 +2200,25 @@ export async function initPlaywrightForAccount(
               console.log(
                 `⚡ [Playwright] Silently refreshed expired token restored from DB for ${maskEmail(account.email)}`,
               );
+            } else {
+              console.warn(
+                `⚠️  [Playwright] Proactive token refresh failed for ${maskEmail(account.email)}, invalidating restored session...`,
+              );
+              restoredFromDb = false;
             }
           } catch (err: any) {
             console.warn(
               `⚠️  [Playwright] Failed to proactively refresh expired token from DB for ${maskEmail(account.email)}: ${err?.message || err}`,
             );
+            restoredFromDb = false;
           }
         }
 
-        const stillLoggedIn = await isPageLoggedIn(acctPage, 5000);
-        if (stillLoggedIn) {
-          return;
+        if (restoredFromDb) {
+          const stillLoggedIn = await isPageLoggedIn(acctPage, 5000);
+          if (stillLoggedIn) {
+            return;
+          }
         }
         console.warn(
           `⚠️  [Playwright] Restored session from database for ${maskEmail(account.email)} is no longer logged in upstream. Invalidating...`,
@@ -3697,6 +3738,8 @@ export async function refreshAccountToken(
           const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
           const cache = getHeaderCache(accountId);
           cache.headers.cookie = cookieStr;
+          cache.headers.authorization = `Bearer ${newAccessToken}`;
+          cache.headers.Authorization = `Bearer ${newAccessToken}`;
           cache.lastRefresh = Date.now();
           cookieCaches.set(accountId, { cookie: cookieStr, timestamp: Date.now() });
           markAccountHeadersReady(accountId);
@@ -3736,6 +3779,8 @@ export async function refreshAccountToken(
         const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
         const cache = getHeaderCache(accountId);
         cache.headers.cookie = cookieStr;
+        cache.headers.authorization = `Bearer ${tokenCookie.value}`;
+        cache.headers.Authorization = `Bearer ${tokenCookie.value}`;
         cache.lastRefresh = Date.now();
         cookieCaches.set(accountId, { cookie: cookieStr, timestamp: Date.now() });
         markAccountHeadersReady(accountId);
@@ -3847,6 +3892,7 @@ export async function captureQwenHeaders(
             headersCaptured = true;
             if (timeout) clearTimeout(timeout);
             void (async () => {
+              cache.headers = capturedHeaders;
               if (!cache.headers["authorization"] && !page.isClosed()) {
                 try {
                   const tok = await page.evaluate(async () => {
@@ -4605,7 +4651,12 @@ async function refreshHeadersInternal(
   const boundedTimeoutMs = Math.max(1_000, timeoutMs);
   try {
     // Check if session is expired before capturing headers
-    const page = accountPages.get(accountId);
+    let page = accountPages.get(accountId);
+    if (!page || page.isClosed()) {
+      try {
+        page = await ensureAccountPageAvailable(accountId);
+      } catch {}
+    }
     let reauthExecuted = false;
     if (page) {
       const executeReauth = async () => {
@@ -4680,6 +4731,11 @@ async function refreshHeadersInternal(
         if (liveCookies.some((c) => c.name === "token")) {
           const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
           cache.headers.cookie = cookieStr;
+          const tokenCookie = liveCookies.find((c) => c.name === "token");
+          if (tokenCookie) {
+            cache.headers.authorization = `Bearer ${tokenCookie.value}`;
+            cache.headers.Authorization = `Bearer ${tokenCookie.value}`;
+          }
           cache.lastRefresh = Date.now();
           markAccountHeadersReady(accountId);
           try {
