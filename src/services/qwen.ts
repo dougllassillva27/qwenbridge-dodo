@@ -10,7 +10,7 @@ import {
   UpstreamRateLimit,
   ClientAbortedError,
 } from "../core/errors.ts";
-import { buildQwenRequestHeaders } from "./qwen-headers.ts";
+import { buildQwenRequestHeaders, getQwenWebVersion } from "./qwen-headers.ts";
 import { qwenOrigin, qwenUrl } from "./qwen-url.ts";
 import { uploadLargePromptAsFile } from "../routes/upload.ts";
 import { config, type ChatMode, isLocalChatMode } from "../core/config.ts";
@@ -1233,7 +1233,6 @@ async function requestQwenPersonalizationInBrowser(
     headers,
     payload === undefined ? undefined : JSON.stringify(payload),
     {
-      settingsPage: true,
       referrer: qwenUrl("/settings/personalization"),
       noMutexRecovery: true,
     },
@@ -1374,9 +1373,19 @@ async function createQwenBrowserResponse(
         if (typeof (page as any).on === "function") {
           const onFrameNavigated = (frame: any) => {
             if (!settled && typeof (page as any).mainFrame === "function" && frame === (page as any).mainFrame()) {
+              const url = typeof frame.url === "function" ? frame.url() : String(frame.url || "");
+              // Safe SPA in-app routing within Qwen Web (e.g. /c/<id>, /#) must NEVER abort active streams
+              if (
+                url.startsWith(qwenOrigin()) &&
+                !url.includes("/auth") &&
+                !url.includes("_____tmd_____") &&
+                !url.includes("/punish")
+              ) {
+                return;
+              }
               handleBrowserStreamEvent(requestId, {
                 type: "error",
-                message: "Qwen browser page navigated during stream (session interrupted)",
+                message: "Qwen browser page navigated away during stream",
                 errorName: "AbortError",
               });
             }
@@ -2097,7 +2106,6 @@ export async function disableNativeTools(accountId?: string): Promise<void> {
           requestHeaders,
           JSON.stringify(payload),
           {
-            settingsPage: true,
             referrer: qwenUrl("/settings/personalization"),
           },
         );
@@ -2345,7 +2353,7 @@ export async function deleteSingleQwenChat(
 
   const requestHeaders: Record<string, string> = {
     source: "web",
-    version: "0.2.89",
+    version: getQwenWebVersion() || "0.3.26",
     timezone: formatAsciiTimezone(),
     "x-request-id": crypto.randomUUID(),
     Referer: qwenUrl(`/c/${encodeURIComponent(chatId)}`),
@@ -2398,7 +2406,7 @@ export async function fetchRemoteQwenChats(
   }
 
   const requestHeaders: Record<string, string> = {
-    version: "0.2.89",
+    version: getQwenWebVersion() || "0.3.26",
     timezone: formatAsciiTimezone(),
     "x-request-id": crypto.randomUUID(),
     Referer: qwenUrl("/settings/chats"),
